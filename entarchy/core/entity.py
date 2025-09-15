@@ -11,12 +11,19 @@ class Entity(object):
     """Base class for all entities in the Entarchy system.
     This class can be extended to create specific types of entities.
     """
-
+    # Setup attributes
     _child_entity_types: list[Type[Entity]] = None
+
+    # Runtime attributes
     _is_in_context: bool = False
 
-    def __init__(self, _entarchy: Entarchy,
-                 _analysis: Analysis = None, _uuid: str = None, _id: str = None, _parent: Entity = None):
+    def __init__(self,
+                 _entarchy: Entarchy,
+                 _analysis: Analysis = None,
+                 _uuid: str = None,
+                 _id: str = None,
+                 _parent: Entity = None):
+
         self._entarchy = _entarchy
         self._analysis = _analysis
         self._uuid = _uuid
@@ -24,18 +31,54 @@ class Entity(object):
         self._parent = _parent
 
         if self._uuid is None and self._id is None:
-            raise ValueError("Need to provide either _pk or _id")
+            raise ValueError("Need to provide either _id or _uuid")
 
         # Create PK if not provided
         if self._uuid is None:
             self._uuid = uuid.uuid4()
 
-        # Set up attribute cachse
+        # Set up attribute cache
         self._attribute_cache: dict[str, Any] = {}
         self._attributes_to_update: list[str] = []
 
         # Add entity to entarchy object
         self._entarchy.add_existing_entity(self)
+
+    def __new__(cls, _entarchy, _analysis=None, _uuid=None, _id=None, _parent=None):
+
+        if _uuid is not None and _uuid in _entarchy:
+            return _entarchy.get_entity_by_uuid(_uuid)
+
+        return super().__new__(cls)
+
+    def __contains__(self, item: Union[str, list[str]]) -> bool:
+        """Check if the entity has a dynamic attribute.
+
+        Dynamic attribute keys must always be strings.
+        Using a list or tuple of strings will check if all attributes exist.
+
+        Args:
+            item (str or list/tuple of str): The key(s) for the attribute(s) to check.
+
+        Raises:
+            TypeError: If item is not a string or list/tuple of strings.
+
+        Returns:
+            bool: True if the attribute(s) exist, False otherwise.
+        """
+
+        # TODO: also refer to cache
+
+        if not isinstance(item, (str, list, tuple)):
+            raise TypeError('Item must be a string or list or tuple of strings.')
+
+        if isinstance(item, (list, tuple)):
+            if not all(isinstance(k, str) for k in item):
+                raise TypeError('List or tuple of items must contain only strings.')
+
+            return self._entarchy.backend.has_multiple_attributes(self._entarchy, self._analysis, self._uuid, item)
+
+        return self._entarchy.backend.has_single_attribute(self._entarchy, self._analysis, self._uuid, item)
 
     def __enter__(self):
         # Set context flag
@@ -48,54 +91,8 @@ class Entity(object):
         # Reset context flag
         self._is_in_context = False
 
-    def __repr__(self):
-        return f'{self.__class__.__name__}(id="{self.id}" uuid="{self.uuid}")'
-
-    def __setitem__(self, key: Union[str, list[str], tuple[str, ...]] , value: Any):
-        """Set a dynamic attribute on the entity.
-
-        Dynamic attribute keys must always be strings.
-        Using a list or tuple of strings will expect the values to be a list or tuple of the same length.
-
-        Args:
-            key (str or list of str): The key(s) for the attribute(s) to set.
-            value (Any or list/tuple of Any): The value(s) for the attribute(s) to set.
-
-        Raises:
-            TypeError: If key is not a string or list of strings.
-            TypeError: If value is not a list when key is a list/tuple.
-            ValueError: If lengths of key and value lists do not match.
-
-        """
-
-        if not isinstance(key, (str, list, tuple)):
-            raise TypeError('Key must be a string or list or tuple of strings.')
-
-        if isinstance(key, (list, tuple)):
-            if not all(isinstance(k, str) for k in key):
-                raise TypeError('List or tuple of keys must contain only strings.')
-
-            if not isinstance(value, (list, tuple)):
-                raise TypeError('Value must be a list or tuple when key is a list or tuple.')
-
-            if len(key) != len(value):
-                raise ValueError('Length of key list/tuple must match length of value list/tuple.')
-
-        else:
-            key = [key]
-            value = [value]
-
-        # Update attribute(s) in cache and mark for update
-        for k, v in zip(key, value):
-            self._attribute_cache[k] = v
-            if k not in self._attributes_to_update:
-                self._attributes_to_update.append(k)
-
-        self._entarchy.add_entity_for_update(self)
-
-        # If not in context, update immediately
-        if not self._is_in_context:
-            self.commit()
+    def __hash__(self):
+        return self.uuid
 
     def __getitem__(self, key: Union[str, list[str]]) -> Union[Any, tuple[Any, ...]]:
         """Get a dynamic attribute from the entity.
@@ -147,34 +144,54 @@ class Entity(object):
             return res
         return res[0]
 
-    def __contains__(self, item: Union[str, list[str]]) -> bool:
-        """Check if the entity has a dynamic attribute.
+    def __repr__(self):
+        return f'{self.__class__.__name__}(id=\'{self.id}\' uuid=\'{self.uuid}\')'
+
+    def __setitem__(self, key: Union[str, list[str], tuple[str, ...]] , value: Any):
+        """Set a dynamic attribute on the entity.
 
         Dynamic attribute keys must always be strings.
-        Using a list or tuple of strings will check if all attributes exist.
+        Using a list or tuple of strings will expect the values to be a list or tuple of the same length.
 
         Args:
-            item (str or list/tuple of str): The key(s) for the attribute(s) to check.
+            key (str or list of str): The key(s) for the attribute(s) to set.
+            value (Any or list/tuple of Any): The value(s) for the attribute(s) to set.
 
         Raises:
-            TypeError: If item is not a string or list/tuple of strings.
+            TypeError: If key is not a string or list of strings.
+            TypeError: If value is not a list when key is a list/tuple.
+            ValueError: If lengths of key and value lists do not match.
 
-        Returns:
-            bool: True if the attribute(s) exist, False otherwise.
         """
 
-        # TODO: also refer to cache
+        if not isinstance(key, (str, list, tuple)):
+            raise TypeError('Key must be a string or list or tuple of strings.')
 
-        if not isinstance(item, (str, list, tuple)):
-            raise TypeError('Item must be a string or list or tuple of strings.')
+        if isinstance(key, (list, tuple)):
+            if not all(isinstance(k, str) for k in key):
+                raise TypeError('List or tuple of keys must contain only strings.')
 
-        if isinstance(item, (list, tuple)):
-            if not all(isinstance(k, str) for k in item):
-                raise TypeError('List or tuple of items must contain only strings.')
+            if not isinstance(value, (list, tuple)):
+                raise TypeError('Value must be a list or tuple when key is a list or tuple.')
 
-            return self._entarchy.backend.has_multiple_attributes(self._entarchy, self._analysis, self._uuid, item)
+            if len(key) != len(value):
+                raise ValueError('Length of key list/tuple must match length of value list/tuple.')
 
-        return self._entarchy.backend.has_single_attribute(self._entarchy, self._analysis, self._uuid, item)
+        else:
+            key = [key]
+            value = [value]
+
+        # Update attribute(s) in cache and mark for update
+        for k, v in zip(key, value):
+            self._attribute_cache[k] = v
+            if k not in self._attributes_to_update:
+                self._attributes_to_update.append(k)
+
+        self._entarchy.add_entity_for_update(self)
+
+        # If not in context, update immediately
+        if not self.is_in_context and not self._entarchy.is_in_context:
+            self.commit()
 
     @classmethod
     def add_child_entity_type(cls, entity_type):
@@ -204,6 +221,15 @@ class Entity(object):
             str: The ID of the entity.
         """
         return self._id
+
+    @property
+    def is_in_context(self) -> bool:
+        """Check if the entity is in a context manager.
+
+        Returns:
+            bool: True if the entity is in a context manager, False otherwise.
+        """
+        return self._is_in_context
 
     @property
     def uuid(self) -> str:
@@ -247,4 +273,29 @@ class Entity(object):
 class Collection(object):
     """Base class for collections of entities
     """
-    pass
+
+    _as_tree = None
+
+    def __init__(self,
+                 entity_type: Type[Entity],
+                 _entarchy: Entarchy,
+                 _query: Any = None):
+        self._entity_type = entity_type
+        self._entarchy = _entarchy
+        self._as_tree = _query
+
+    def __len__(self):
+        return self._entarchy.backend.get_entity_count_of_collection(self._entarchy, self.entity_type.__name__, self.as_tree)
+
+    def __repr__(self):
+        return f'Collection(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
+
+    @property
+    def as_tree(self) -> dict[str, ...]:
+        """Return the abstract syntax tree dictionary
+        """
+        return self._as_tree.copy()
+
+    @property
+    def entity_type(self):
+        return self._entity_type

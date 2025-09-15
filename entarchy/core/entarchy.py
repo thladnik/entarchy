@@ -10,13 +10,15 @@ from typing import Any, Type, TYPE_CHECKING
 
 import yaml
 
+from . import query
+from .entity import Collection, Entity
+
 if TYPE_CHECKING:
-    from .entity import Entity
     from ..backend.backend import Backend
 
 
 class Entarchy:
-    """Entarchy is a class that represents a system of hiarchically organized entities.
+    """Entarchy is a class that represents a system of hierarchically organized entities.
     """
     _base_version: str = '0.1'
     _implementation_version: str
@@ -25,9 +27,11 @@ class Entarchy:
 
     _backend: Backend = None
     _config: dict[str, Any] = None
+    _is_in_context: bool = False
 
-    def __init__(self, path: str):
-        self._path = path
+    def __init__(self, path: str, debug: bool = False):
+        self._path = pathlib.Path(path).absolute().as_posix()
+        self._debug = debug
 
         # Load configuration from path
         self._config = yaml.safe_load(open(os.path.join(path, 'entarchy.yaml'), 'r'))
@@ -36,7 +40,7 @@ class Entarchy:
         _backend_path = self._config['backend']
         _backend_path_parts = _backend_path.split('.')
         _backend_cls = getattr(importlib.import_module('.'.join(_backend_path_parts[:-1])), _backend_path_parts[-1])
-        self._backend = _backend_cls(**self._config['backend_config'])
+        self._backend = _backend_cls(**self._config['backend_config'], debug=self._debug)
 
         # Set up entities objects
         self._entities: dict[str, Entity] = {}
@@ -44,12 +48,52 @@ class Entarchy:
         self._entities_to_update: list[str] = []
         self._dirty_entities: list[str] = []
 
+    def __contains__(self, item):
+        if isinstance(item, Entity):
+            return item.uuid in self._entities
+        elif isinstance(item, str):
+            return item in self._entities
+        return False
+
+    def __enter__(self):
+        self._is_in_context = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.commit()
+        self._is_in_context = False
+
     def __hash__(self):
         return hash(self.path)
+
+    def __repr__(self):
+        return f'Entarchy(\'{self.path}\')'
 
     @property
     def backend(self) -> Backend:
         return self._backend
+
+    @property
+    def debug(self) -> bool:
+        """Get the debug mode for the entarchy and its backend.
+        """
+        return self._debug
+
+    @debug.setter
+    def debug(self, value: bool) -> None:
+        """Set the debug mode for the entarchy and its backend.
+        """
+        self._debug = value
+        self._backend.debug = value
+
+    @property
+    def is_in_context(self) -> bool:
+        """Check if the entarchy is in a context manager.
+
+        Returns:
+            bool: True if the entarchy is in a context manager, False otherwise.
+        """
+        return self._is_in_context
 
     @property
     def path(self) -> str:
@@ -59,7 +103,7 @@ class Entarchy:
         return self._config.copy()
 
     @classmethod
-    def create(cls, path: str, _backend: Backend) -> Entarchy:
+    def create(cls, path: str, _backend: Backend, *args, **kwargs) -> Entarchy:
         """Factory function to create an Entarchy instance from a given path.
 
         Args:
@@ -106,7 +150,7 @@ class Entarchy:
             yaml.safe_dump(_config, f)
 
         # Create instance
-        entarchy = cls(path)
+        entarchy = cls(path, *args, **kwargs)
 
         # Create backend
         res = entarchy.backend.create()
@@ -171,6 +215,9 @@ class Entarchy:
             raise RuntimeError('Failed to add new entities to backend.')
 
         self._entities_to_add = []
+
+        for _uuid in self._entities_to_update:
+            self._entities[_uuid].commit()
 
     def delete(self):
 
@@ -246,10 +293,51 @@ class Entarchy:
 
         return entity.uuid in self._dirty_entities
 
-    def get(self, entity_type: Type[Entity]) -> list[Entity]:
-        _uuids = self.backend.get_entity_data_of_type(self, None, entity_type.__name__)
+    def get(self, entity_type: Type[Entity], *_string_expressions: str, **_equalities) -> Collection:
+        """Get a collection of entities of a given type.
 
-        return [entity_type(_uuid=_uuid, _id=_id, _entarchy=self) for _uuid, _id in _uuids]
+        Args:
+            entity_type (Type[Entity]): The type of entities to get.
+            *_string_expressions (str): Optional filter expressions to filter the entities
+                                            (strings are concatenated with AND).
+            **_equalities: Optional equality filters to filter the entities
+                                            (equalities are concatenated with AND).
+
+        Returns:
+            Collection: A collection of entities of the given type.
+
+        """
+
+        # Add equality filters to filter expressions
+        for k, v in _equalities.items():
+
+            # Add quotes to string
+            if isinstance(v, str):
+                v = f'"{v}"'
+
+            _string_expressions = _string_expressions + (f'{k} == {v}',)
+
+        # Concat expression
+        _expression = ' AND '.join(_string_expressions)
+
+        # Parse to get dictionary representation
+        _parsed_query = query.parse_boolean_expression(_expression)
+        if _parsed_query is None:
+            _parsed_query = {}
+
+        return Collection(entity_type=entity_type, _entarchy=self, _query=_parsed_query)
+
+        # entity_data = self.backend.get_entity_data_of_type(self, None, entity_type.__name__)
+        #
+        # return [entity_type(_uuid=_uuid, _id=_id, _entarchy=self) for _uuid, _id in entity_data]
+
+    def get_entity_by_uuid(self, _uuid: str) -> Entity:
+
+        if _uuid in self._entities:
+            return self._entities[_uuid]
+        else:
+            entity_data = self.backend.get_entity_data_by_uuid(self, _uuid)
+            return Entity(_entarchy=self, _uuid=entity_data[0], _id=entity_data[1])
 
     def remove_entity_from_update(self, entity: Entity) -> None:
         """Unmark an entity for update in the backend.

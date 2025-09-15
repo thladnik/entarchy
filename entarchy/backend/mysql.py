@@ -1,6 +1,9 @@
+import io
 import math
+import operator
 import pickle
 import pprint
+import time
 from datetime import date, datetime
 from typing import Any, List, Union
 
@@ -25,7 +28,8 @@ class EntityTypeTable(Base):
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     parent_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), nullable=True)
     parent: Mapped['EntityTypeTable'] = relationship('EntityTypeTable', back_populates='children', remote_side=[pk])
-    children: Mapped[List['EntityTypeTable']] = relationship('EntityTypeTable', back_populates='parent', remote_side=[parent_pk])
+    children: Mapped[List['EntityTypeTable']] = relationship('EntityTypeTable', back_populates='parent',
+                                                             remote_side=[parent_pk])
 
     name: Mapped[str] = mapped_column(String(500), unique=True)
 
@@ -46,7 +50,8 @@ class EntityTable(Base):
     parent: Mapped['EntityTable'] = relationship('EntityTable', back_populates='children', remote_side=[uuid])
 
     # One-to-Many
-    children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent', remote_side=[parent_uuid])
+    children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent',
+                                                         remote_side=[parent_uuid])
     attributes: Mapped[List['AttributeTable']] = relationship('AttributeTable', back_populates='entity')
 
     __table_args__ = (
@@ -72,6 +77,7 @@ class AttributeTable(Base):
     value_date: Mapped[date] = mapped_column(nullable=True)
     value_datetime: Mapped[datetime] = mapped_column(nullable=True)
     value_blob: Mapped[bytes] = mapped_column(LONGBLOB, nullable=True)
+    blob_format: Mapped[str] = mapped_column(String(500), nullable=True)
     data_type: Mapped[str] = mapped_column(String(20), nullable=True)
 
     is_persistent: Mapped[bool] = mapped_column(nullable=True)
@@ -84,11 +90,87 @@ class AttributeTable(Base):
         return f"<Attribute({self.name}, {self.entity})>"
 
 
-class MySQLBackend(Backend):
+def _build_query_from_as_tree(entity_type_name: str,
+                              session: sqlalchemy.orm.Session,
+                              as_tree: dict[str, ...]) -> sqlalchemy.orm.Query:
+    # Create base query
+    query = session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
 
+    # Apply filters generated from the abstract syntax tree
+    filters = _generate_attribute_filters(entity_type_name, session, as_tree)
+    query = query.filter(filters)
+
+    return query
+
+
+def _generate_attribute_filters(entity_type_name: str,
+                                session: sqlalchemy.orm.Session,
+                                as_tree: dict[str, ...]) -> Any:
+    _operator = as_tree['operator'].upper()
+
+    # Handle connectives
+    if _operator in ('AND', 'OR'):
+        _op_fun = {'AND': sqlalchemy.and_, 'OR': sqlalchemy.or_}[_operator]
+        return _op_fun(_generate_attribute_filters(entity_type_name, session, as_tree['left_operand']),
+                       _generate_attribute_filters(entity_type_name, session, as_tree['right_operand']))
+
+    # Handle comparisons
+    elif _operator in ('IN', '<=', '<', '==', '>', '>='):
+
+        name = as_tree['left_operand']
+        value = as_tree['right_operand']
+
+        if _operator == 'IN':
+            raise NotImplementedError('IN operator not implemented yet')
+            # if not isinstance(value, list):
+            #     raise ValueError('Operand after IN statement should be a list of values')
+            #
+            # attribute_value_col = getattr(AttributeTable, f'value_{value[0].__class__.__name__}')
+            #
+            # comparison = attribute_value_col.in_(value)
+        else:
+            # Determine the correct column based on value type
+            attribute_value_col = getattr(AttributeTable, f'value_{value.__class__.__name__}')
+
+            _op_fun = {
+                '<': operator.lt,
+                '<=': operator.le,
+                '==': operator.eq,
+                '>=': operator.ge,
+                '>': operator.gt
+            }[_operator]
+
+            comparison = _op_fun(attribute_value_col, value)
+
+        # Build the subquery to filter entities matching the comparison
+        subquery = (session.query(AttributeTable.entity_uuid)
+                    .filter(AttributeTable.name == name, comparison)
+                    .join(EntityTable)
+                    .join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
+                    .subquery())
+
+    # Handle unary operators
+    elif _operator == 'EXIST':
+        subquery = (session.query(AttributeTable.entity_uuid)
+                    .filter(AttributeTable.name == as_tree['right_operand'])
+                    .subquery())
+
+    elif _operator == 'NOT':
+        return sqlalchemy.not_(_generate_attribute_filters(entity_type_name, session, as_tree['right_operand']))
+
+    # Fallback
+    else:
+        print(f'Unknown unary operator: {_operator}', as_tree)
+        raise ValueError('Unexpected operator in the expression tree')
+
+    # Return the `IN` filter to apply to the main query
+    return EntityTable.uuid.in_(session.query(subquery.c.entity_uuid))
+
+
+class MySQLBackend(Backend):
     _sql_engine = None
 
-    def __init__(self, dbname: str, dbhost: str, dbuser: str, dbpassword: str = None, echo: bool = False):
+    def __init__(self, dbname: str, dbhost: str, dbuser: str, dbpassword: str = None, debug: bool = False):
 
         # Get connection parameters
         if dbhost is None:
@@ -105,7 +187,7 @@ class MySQLBackend(Backend):
                     break
 
         if dbuser is None:
-            dbuser = input(f'User name for database schema "{dbname}" [default: caload_user]: ')
+            dbuser = input(f'User name for database schema "{dbname}" [default: entarchy_user]: ')
             if dbuser == '':
                 dbuser = 'entarchy_user'
 
@@ -119,6 +201,8 @@ class MySQLBackend(Backend):
             'dbuser': dbuser,
             'dbpassword': dbpassword,
         }
+
+        self.debug = debug
 
     @property
     def dbhost(self) -> str:
@@ -136,13 +220,63 @@ class MySQLBackend(Backend):
     def dbpassword(self) -> str:
         return self._config['dbpassword']
 
+    @Backend.debug.setter
+    def debug(self, value: bool) -> None:
+        self._debug = value
+        if self._sql_engine is not None:
+            self._sql_engine.echo = value
+
     @property
     def sql_engine(self):
         if self._sql_engine is None:
             self._sql_engine = create_engine(f'mysql+pymysql://'
                                              f'{self.dbuser}:{self.dbpassword}'
-                                             f'@{self.dbhost}/{self.dbname}')
+                                             f'@{self.dbhost}/{self.dbname}',
+                                             echo=self.debug)
         return self._sql_engine
+
+    def create(self) -> bool:
+
+        # Create schema
+        print(f'> Create database {self.dbname}')
+        engine = create_engine(f'mysql+pymysql://{self.dbuser}:{self.dbpassword}@{self.dbhost}', echo=self.debug)
+        with engine.connect() as connection:
+            connection.execute(sqlalchemy.text(f'CREATE SCHEMA IF NOT EXISTS {self.dbname}'))
+        engine.dispose()
+
+        # Create tables
+        print('> Create tables')
+        Base.metadata.create_all(self.sql_engine)
+
+        return True
+
+    def create_type_hierarchy(self, _hierarchy: dict[str, ...]) -> bool:
+
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+            def _create_entity_type(_hierarchy: dict[str, ...], parent_row: Union[EntityTypeTable, None]):
+                for name, children in _hierarchy.items():
+                    row = EntityTypeTable(name=name, parent=parent_row)
+                    session.add(row)
+                    _create_entity_type(children, row)
+
+            # Add custom types
+            _create_entity_type(_hierarchy, None)
+            session.commit()
+
+        return True
+
+    def delete(self, confirm: bool = False):
+
+        if not confirm:
+            return
+
+        print('> Drop schema')
+        engine = create_engine(f'mysql+pymysql://{self.dbuser}:{self.dbpassword}@{self.dbhost}')
+        with engine.connect() as connection:
+            connection.execute(sqlalchemy.text(f'DROP SCHEMA IF EXISTS {self.dbname}'))
+            connection.commit()
+
+    # Entity related methods
 
     def add_entities(self, _entities: list[Entity]) -> bool:
 
@@ -170,54 +304,37 @@ class MySQLBackend(Backend):
 
         return True
 
-    def create(self) -> bool:
-
-        # Create schema
-        print(f'> Create database {self.dbname}')
-        engine = create_engine(f'mysql+pymysql://{self.dbuser}:{self.dbpassword}@{self.dbhost}')
-        with engine.connect() as connection:
-            connection.execute(sqlalchemy.text(f'CREATE SCHEMA IF NOT EXISTS {self.dbname}'))
-        engine.dispose()
-
-        # Create tables
-        print('> Create tables')
-        Base.metadata.create_all(self.sql_engine)
-
-        return True
-
-    def create_type_hierarchy(self, _hierarchy: dict[str, ...]) -> bool:
+    def get_entity_data_by_query(self, _entarchy: Entarchy, entity_type_name: str, _query: dict[str, ...]) -> list[tuple[str, str]]:
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
-            def _create_entity_type(_hierarchy: dict[str,  ...], parent_row: Union[EntityTypeTable, None]):
-                for name, children in _hierarchy.items():
-                    row = EntityTypeTable(name=name, parent=parent_row)
-                    session.add(row)
-                    _create_entity_type(children, row)
+            query = _build_query_from_as_tree(entity_type_name, session, _query)
 
-            # Add custom types
-            _create_entity_type(_hierarchy, None)
-            session.commit()
+        return [(row.uuid, row.id) for row in query.all()]
 
-        return True
-
-    def delete(self, confirm: bool = False):
-
-        if not confirm:
-            return
-
-        print('> Drop schema')
-        engine = create_engine(f'mysql+pymysql://{self.dbuser}:{self.dbpassword}@{self.dbhost}')
-        with engine.connect() as connection:
-            connection.execute(sqlalchemy.text(f'DROP SCHEMA IF EXISTS {self.dbname}'))
-            connection.commit()
-
-    def get_entity_data_of_type(self, _entarchy: Entarchy, _analysis: Analysis, entity_type: str) -> list[tuple[str, str]]:
+    def get_entity_data_by_uuid(self, _entarchy: Entarchy, _uuid: str) -> tuple[str, str]:
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
+            query = session.query(EntityTable).filter(EntityTable.uuid == _uuid)
+
+            count = query.count()
+            if count == 0:
+                raise KeyError(f'Entity with UUID {_uuid} not found in database.')
+            elif count > 1:
+                raise RuntimeError(f'Multiple entities with UUID {_uuid} found in database.')
+
+            row = query.one()
+
+        return row.uuid, row.id
+
+    def get_entity_data_of_type(self, _entarchy: Entarchy, entity_type: str) -> list[tuple[str, str]]:
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
             query = (session.query(EntityTable)
-                     .join(EntityTypeTable)
-                     .filter(EntityTypeTable.name == entity_type)
                      .order_by(getattr(EntityTable.uuid, 'asc')()))
+
+            # Filter by entity type if provided
+            if entity_type is not None:
+                query = (query.join(EntityTypeTable)
+                         .filter(EntityTypeTable.name == entity_type))
 
             return [(row.uuid, row.id) for row in query.all()]
 
@@ -246,7 +363,8 @@ class MySQLBackend(Backend):
     def get_single_attribute_of_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid: str, name: str):
         return self.get_multiple_attributes_of_entity(_entarchy, _analysis, _uuid, [name])[0]
 
-    def set_multiple_attributes_on_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid, names: list[str], values: list[Any]) -> tuple[bool, str]:
+    def set_multiple_attributes_on_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid, names: list[str],
+                                          values: list[Any]) -> tuple[bool, str]:
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
@@ -264,9 +382,7 @@ class MySQLBackend(Backend):
                 v = values[names.index(n)]
 
                 # Set old value to None
-                _attr_n = f'value_{row.data_type}'
-                print(f'Reset {_attr_n}')
-                row.__setattr__(_attr_n, None)
+                row.__setattr__(f'value_{row.data_type}', None)
 
                 # Write new value
                 self._write_data_to_attribute_row(row, v)
@@ -301,7 +417,15 @@ class MySQLBackend(Backend):
 
         # Load blob
         if row.data_type == 'blob':
-            return pickle.loads(row.value_blob)
+            if row.blob_format == 'npy':
+                with io.BytesIO(row.value_blob) as buffer:
+                    buffer.seek(0)
+                    return np.lib.format.read_array(buffer)
+
+            elif row.blob_format == 'pickle':
+                return pickle.loads(row.value_blob)
+            else:
+                raise ValueError(f'Unknown blob format "{row.blob_format}".')
 
         # Otherwise load from this row based on data type
         return getattr(row, f'value_{row.data_type}')
@@ -313,7 +437,7 @@ class MySQLBackend(Backend):
         if isinstance(data, np.generic):
             data = data.item()
 
-        # Handle scalars
+        # Handle scalars and datetime values
         if type(data) in (str, float, int, bool, date, datetime):
 
             # Set value type
@@ -324,12 +448,37 @@ class MySQLBackend(Backend):
             # Some SQL dialects don't support inf float values
             if value_type == 'float' and math.isinf(data):
                 value_type = 'blob'
+            else:
+                # Remove possible previous blob format data if this is a scalar now
+                row.blob_format = None
         else:
             value_type = 'blob'
 
-        # Set value on coresponding column basd on type
+        # Set value on corresponding column based on type
         if value_type == 'blob':
-            data = pickle.dumps(data)
+            if isinstance(data, np.ndarray):
+                row.blob_format = 'npy'
+                with io.BytesIO() as buffer:
+                    np.lib.format.write_array(buffer, data)
+                    buffer.seek(0)
+                    data = buffer.read()
+            else:
+                row.blob_format = 'pickle'
+                data = pickle.dumps(data)
 
         row.data_type = value_type
         row.__setattr__(f'value_{value_type}', data)
+
+    # Collection related methods
+
+    def get_entity_count_of_collection(self, _entarchy: Entarchy, entity_type_name: str, as_tree: dict[str, ...] = None) -> int:
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+            t1 = time.perf_counter()
+            query = _build_query_from_as_tree(entity_type_name, session, as_tree)
+            print(f'Query build time: {time.perf_counter() - t1:.4f} s')
+
+            t1 = time.perf_counter()
+            res = query.count()
+            print(f'Query execution time: {time.perf_counter() - t1:.4f} s')
+
+            return res
