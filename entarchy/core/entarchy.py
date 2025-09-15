@@ -4,6 +4,7 @@ import abc
 import importlib
 import os
 import pathlib
+import pprint
 import sys
 from typing import Any, Type, TYPE_CHECKING
 
@@ -88,7 +89,10 @@ class Entarchy:
             raise FileExistsError(f'Path {path} already exists.')
         os.makedirs(path, exist_ok=False)
 
-        print(f'Create new entity hierarchy {cls.__name__}: ', _hierarchy)
+        print('---')
+        print('Create entity type hierarchy:')
+        pprint.pprint(_hierarchy)
+        print('---')
 
         _config = {
             'base_version': cls._base_version,
@@ -195,7 +199,6 @@ class Entarchy:
         self.backend.delete(True)
 
         print('> Remove directories and files')
-
         # Use pathlib recursive unlinker by mitch from https://stackoverflow.com/a/49782093
         def rmdir(directory, counter):
             directory = pathlib.Path(directory)
@@ -244,9 +247,9 @@ class Entarchy:
         return entity.uuid in self._dirty_entities
 
     def get(self, entity_type: Type[Entity]) -> list[Entity]:
-        _uuids = self.backend.get_entity_uuids_of_type(self, None, entity_type.__name__)
+        _uuids = self.backend.get_entity_data_of_type(self, None, entity_type.__name__)
 
-        return [entity_type(_uuid=_uuid, _entarchy=self) for _uuid in _uuids]
+        return [entity_type(_uuid=_uuid, _id=_id, _entarchy=self) for _uuid, _id in _uuids]
 
     def remove_entity_from_update(self, entity: Entity) -> None:
         """Unmark an entity for update in the backend.

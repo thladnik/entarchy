@@ -19,8 +19,6 @@ class Base(DeclarativeBase):
     pass
 
 
-# Entities
-
 class EntityTypeTable(Base):
     __tablename__ = 'entity_types'
 
@@ -59,8 +57,6 @@ class EntityTable(Base):
         return f"<{self.entity_type.name}Row(id={self.id}, parent={self.parent})>"
 
 
-# Attributes
-
 class AttributeTable(Base):
     __tablename__ = 'attributes'
 
@@ -85,35 +81,7 @@ class AttributeTable(Base):
     )
 
     def __repr__(self):
-        return f"<Attribute({self.name}, {self.value}, {self.entity})>"
-
-    @property
-    def value(self):
-
-        if self.data_type is None:
-            return None
-
-        # If blob, load from associated row in AttributeBlobTable
-        if self.data_type == 'blob':
-            return pickle.loads(self.value_blob)
-
-        # Otherwise load from this row based on column_str
-        return getattr(self, f'value_{self.data_type}')
-
-    @value.setter
-    def value(self, value):
-
-        # If blob, dump to associated row in AttributeBlobTable
-        if self.data_type == 'blob':
-            self.value_blob = pickle.dumps(value)
-            return
-
-        # Make NaN's compatible
-        if self.data_type == 'float' and np.isnan(value):
-            value = None
-
-        # Otherwise write directly
-        setattr(self, f'value_{self.data_type}', value)
+        return f"<Attribute({self.name}, {self.entity})>"
 
 
 class MySQLBackend(Backend):
@@ -219,11 +187,6 @@ class MySQLBackend(Backend):
 
     def create_type_hierarchy(self, _hierarchy: dict[str, ...]) -> bool:
 
-        print('---')
-        print('Create entity type hierarchy:')
-        pprint.pprint(_hierarchy)
-        print('---')
-
         with sqlalchemy.orm.Session(self.sql_engine) as session:
             def _create_entity_type(_hierarchy: dict[str,  ...], parent_row: Union[EntityTypeTable, None]):
                 for name, children in _hierarchy.items():
@@ -248,14 +211,40 @@ class MySQLBackend(Backend):
             connection.execute(sqlalchemy.text(f'DROP SCHEMA IF EXISTS {self.dbname}'))
             connection.commit()
 
-    def get_entity_uuids_of_type(self, _entarchy: Entarchy, _analysis: Analysis, entity_type: str) -> list[str]:
+    def get_entity_data_of_type(self, _entarchy: Entarchy, _analysis: Analysis, entity_type: str) -> list[tuple[str, str]]:
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
             query = (session.query(EntityTable)
                      .join(EntityTypeTable)
-                     .filter(EntityTypeTable.name == entity_type))
+                     .filter(EntityTypeTable.name == entity_type)
+                     .order_by(getattr(EntityTable.uuid, 'asc')()))
 
-            return [row.uuid for row in query.all()]
+            return [(row.uuid, row.id) for row in query.all()]
+
+    def get_multiple_attributes_of_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid: str, names: list[str]):
+
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            query = session.query(AttributeTable).filter(AttributeTable.entity_uuid == _uuid)
+            conditions = []
+            for n in names:
+                conditions.append(AttributeTable.name == n)
+
+            query = query.filter(sqlalchemy.or_(*conditions))
+
+            rows = {row.name: row for row in query.all()}
+
+        # Read values in order of names
+        values = []
+        for n in names:
+            if n not in rows:
+                raise AttributeError(f'Attribute "{n}" not found for entity with UUID {_uuid}.')
+            values.append(self._read_data_from_attribute_row(rows[n]))
+
+        return values
+
+    def get_single_attribute_of_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid: str, name: str):
+        return self.get_multiple_attributes_of_entity(_entarchy, _analysis, _uuid, [name])[0]
 
     def set_multiple_attributes_on_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid, names: list[str], values: list[Any]) -> tuple[bool, str]:
 
@@ -275,10 +264,12 @@ class MySQLBackend(Backend):
                 v = values[names.index(n)]
 
                 # Set old value to None
-                row.__setattr__(f'value_{row.data_type}', None)
+                _attr_n = f'value_{row.data_type}'
+                print(f'Reset {_attr_n}')
+                row.__setattr__(_attr_n, None)
 
                 # Write new value
-                self._write_value_to_row(row, v)
+                self._write_data_to_attribute_row(row, v)
 
             # Add new attributes
             for n in list(set(names) - set(list(existing_rows.keys()))):
@@ -289,38 +280,12 @@ class MySQLBackend(Backend):
                 session.add(new_row)
 
                 # Write data to row
-                self._write_value_to_row(new_row, v)
+                self._write_data_to_attribute_row(new_row, v)
 
             # Commit changes
             session.commit()
 
             return True, ''
-
-    def _write_value_to_row(self, row: AttributeTable, value: Any):
-
-        # Get corresponding builtin python scalar type for numpy scalars
-        if isinstance(value, np.generic):
-            value = value.item()
-
-        # Handle scalars
-        if type(value) in (str, float, int, bool, date, datetime):
-
-            # Set value type
-            value_type_map = {str: 'str', float: 'float', int: 'int',
-                              bool: 'bool', date: 'date', datetime: 'datetime'}
-            value_type = value_type_map.get(type(value))
-
-            # Some SQL dialects don't support inf float values
-            if value_type == 'float' and math.isinf(value):
-                value_type = 'blob'
-        else:
-            value_type = 'blob'
-
-        # Set value on coresponding column basd on type
-        if value_type == 'blob':
-            value = pickle.dumps(value)
-
-        row.__setattr__(f'value_{value_type}', value)
 
     def set_single_attribute_on_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid, key: str, value: Any):
 
@@ -328,84 +293,43 @@ class MySQLBackend(Backend):
 
         return True, ''
 
-        attribute_row = None
-        pre_data_type_str = ''
+    @staticmethod
+    def _read_data_from_attribute_row(row: AttributeTable):
+
+        if row.data_type is None:
+            raise ValueError('Attribute data type is None.')
+
+        # Load blob
+        if row.data_type == 'blob':
+            return pickle.loads(row.value_blob)
+
+        # Otherwise load from this row based on data type
+        return getattr(row, f'value_{row.data_type}')
+
+    @staticmethod
+    def _write_data_to_attribute_row(row: AttributeTable, data: Any):
 
         # Get corresponding builtin python scalar type for numpy scalars
-        if isinstance(value, np.generic):
-            value = value.item()
+        if isinstance(data, np.generic):
+            data = data.item()
 
-        # Query attribute row if not in create mode
-        if not self.analysis.is_create_mode:
-            # Build query
-            attribute_query = (self.analysis.session.query(AttributeTable)
-                               .filter(AttributeTable.name == key)
-                               .filter(AttributeTable.entity_pk == self.row.pk))
-
-            # Evaluate
-            if attribute_query.count() == 1:
-                attribute_row = attribute_query.one()
-                pre_data_type_str = attribute_row.data_type
-
-            elif attribute_query.count() > 1:
-                raise ValueError('Wait a minute...')
-
-        # Create row if it doesn't exist yet
-        if attribute_row is None:
-            attribute_row = AttributeTable(entity=self.row, name=key, is_persistent=self.analysis.is_create_mode)
-            self.analysis.session.add(attribute_row)
-
-        # Determine data type of new value
-
-        # Scalars
-        if type(value) in (str, float, int, bool, date, datetime):
+        # Handle scalars
+        if type(data) in (str, float, int, bool, date, datetime):
 
             # Set value type
             value_type_map = {str: 'str', float: 'float', int: 'int',
                               bool: 'bool', date: 'date', datetime: 'datetime'}
-            value_type = value_type_map.get(type(value))
+            value_type = value_type_map.get(type(data))
 
             # Some SQL dialects don't support inf float values
-            if value_type == 'float' and math.isinf(value):
+            if value_type == 'float' and math.isinf(data):
                 value_type = 'blob'
-
-            # Set column string
-            new_data_type_str = value_type
-
-        # Small objects
-        # NOTE: there is no universal way to get the byte number of objects
-        # Builtin object have __sizeof__(), but this only returns the overhead for some numpy.ndarrays
-        # For numpy arrays it's numpy.ndarray.nbytes
-        elif (not isinstance(value, np.ndarray) and value.__sizeof__() < self.analysis.max_blob_size) \
-                or (isinstance(value, np.ndarray) and value.nbytes < self.analysis.max_blob_size):
-
-            new_data_type_str = 'blob'
-
-        # Large objects or object of unkown type
         else:
-            new_data_type_str = 'path'
+            value_type = 'blob'
 
-        # Handle deletion of old values
-        if new_data_type_str != pre_data_type_str:
-            # Set old value to None
-            attribute_row.value = None
+        # Set value on coresponding column basd on type
+        if value_type == 'blob':
+            data = pickle.dumps(data)
 
-        # Handle path types
-        if new_data_type_str == 'path':
-
-            # Get previous path (if available)
-            data_path = attribute_row.value
-
-            # If no data_path is set yet, generate it
-            if data_path is None:
-                if isinstance(value, np.ndarray):
-                    data_path = f'hdf5:{self.path}/data.hdf5:{key}'
-                else:
-                    data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
-
-            # Set value to data_path to write to database
-            value = data_path
-
-        # Set row type and value
-        attribute_row.data_type = new_data_type_str
-        attribute_row.value = value
+        row.data_type = value_type
+        row.__setattr__(f'value_{value_type}', data)

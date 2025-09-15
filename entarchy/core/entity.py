@@ -49,7 +49,7 @@ class Entity(object):
         self._is_in_context = False
 
     def __repr__(self):
-        return f'{self.__class__.__name__}(id="{self.id}" parent="{self.parent}")'
+        return f'{self.__class__.__name__}(id="{self.id}" uuid="{self.uuid}")'
 
     def __setitem__(self, key: Union[str, list[str], tuple[str, ...]] , value: Any):
         """Set a dynamic attribute on the entity.
@@ -58,13 +58,13 @@ class Entity(object):
         Using a list or tuple of strings will expect the values to be a list or tuple of the same length.
 
         Args:
-            key (str or list/tuple of str): The key(s) for the attribute(s) to set.
+            key (str or list of str): The key(s) for the attribute(s) to set.
             value (Any or list/tuple of Any): The value(s) for the attribute(s) to set.
 
         Raises:
-            TypeError: If key is not a string or list/tuple of strings.
-            TypeError: If value is not a list/tuple when key is a list/tuple.
-            ValueError: If lengths of key and value lists/tuples do not match.
+            TypeError: If key is not a string or list of strings.
+            TypeError: If value is not a list when key is a list/tuple.
+            ValueError: If lengths of key and value lists do not match.
 
         """
 
@@ -104,7 +104,7 @@ class Entity(object):
         Using a list or tuple of strings will return a list or tuple of the same length.
 
         Args:
-            key (str or list/tuple of str): The key(s) for the attribute(s) to get.
+            key (str or list of str): The key(s) for the attribute(s) to get.
 
         Raises:
             TypeError: If key is not a string or list/tuple of strings.
@@ -128,17 +128,24 @@ class Entity(object):
             self._attribute_cache = {}
 
         # Load missing attributes from backend
-        keys_to_load = [k for k in key if k not in self._attribute_cache]
-        if len(keys_to_load) > 1:
-            values = self._entarchy.backend.get_multiple_attributes_of_entity(self._entarchy, self._analysis, self._uuid, keys_to_load)
-        else:
-            values = [self._entarchy.backend.get_single_attribute_of_entity(self._entarchy, self._analysis, self._uuid, keys_to_load[0])]
+        keys_to_load = list(set(key) - set(self._attribute_cache.keys()))
+        if len(keys_to_load) > 0:
+            if len(keys_to_load) == 1:
+                values = [self._entarchy.backend.get_single_attribute_of_entity(self._entarchy, self._analysis, self.uuid, keys_to_load[0])]
+            else:
+                values = self._entarchy.backend.get_multiple_attributes_of_entity(self._entarchy, self._analysis, self.uuid, keys_to_load)
 
-        # Update cache
-        for k, v in zip(keys_to_load, values):
-            self._attribute_cache[k] = v
+            # Update cache
+            for k, v in zip(keys_to_load, values):
+                self._attribute_cache[k] = v
 
-        return (self._attribute_cache[k] for k in key)
+        # Retrieve in order
+        res = tuple(self._attribute_cache[k] for k in key)
+
+        # Return
+        if len(res) > 1:
+            return res
+        return res[0]
 
     def __contains__(self, item: Union[str, list[str]]) -> bool:
         """Check if the entity has a dynamic attribute.
@@ -224,9 +231,9 @@ class Entity(object):
         names = self._attributes_to_update
         values = [self._attribute_cache[n] for n in names]
         if len(names) > 1:
-            res = self._entarchy.backend.set_multiple_attributes_on_entity(self._entarchy, self._analysis, self._uuid, names, values)
+            res = self._entarchy.backend.set_multiple_attributes_on_entity(self._entarchy, self._analysis, self.uuid, names, values)
         else:
-            res = self._entarchy.backend.set_single_attribute_on_entity(self._entarchy, self._analysis, self._uuid, names[0], values[0])
+            res = self._entarchy.backend.set_single_attribute_on_entity(self._entarchy, self._analysis, self.uuid, names[0], values[0])
 
         if not res:
             raise RuntimeError(f'Failed to update entity attributes {names} in backend.')

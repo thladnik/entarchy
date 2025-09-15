@@ -27,7 +27,7 @@ class Backend(object):
     def delete(self, confirm: bool = False):
         return NotImplementedError('')
 
-    def get_entity_uuids_of_type(self, _entarchy: Entarchy, _analysis: Analysis, entity_type: str) -> list[str]:
+    def get_entity_data_of_type(self, _entarchy: Entarchy, _analysis: Analysis, entity_type: str) -> list[str]:
         raise NotImplementedError('')
 
     def get_multiple_attributes_of_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid: str, names: list[str]):
