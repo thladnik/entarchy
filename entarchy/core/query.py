@@ -2,7 +2,7 @@ from __future__ import annotations
 import re
 import datetime
 import operator
-
+from typing import Union
 
 
 def tokenize(expression):
@@ -152,6 +152,58 @@ def parse_boolean_expression(expression):
     tokens = tokenize(expression)
     return parse_expression(tokens)
 
+
+def combine_trees(_set_operation: str,
+                  left_tree: dict[str, ...],
+                  right_tree: Union[dict[str, ...], None] = None):
+
+    _set_operation = _set_operation.upper()
+
+    if _set_operation == 'UNION':
+        return {
+            'left_operand': left_tree,
+            'operator': 'OR',
+            'right_operand': right_tree
+        }
+    elif _set_operation == 'INTERSECTION':
+        return {
+            'left_operand': left_tree,
+            'operator': 'AND',
+            'right_operand': right_tree
+        }
+    elif _set_operation == 'DIFFERENCE':
+        return {
+            'left_operand': left_tree,
+            'operator': 'AND',
+            'right_operand': {
+                'operator': 'NOT',
+                'right_operand': right_tree
+            }
+        }
+    elif _set_operation == 'SYMMETRIC_DIFFERENCE':  # XOR
+        return {
+            'left_operand': {
+                'left_operand': left_tree,
+                'operator': 'OR',
+                'right_operand': right_tree
+            },
+            'operator': 'AND',
+            'right_operand': {
+                'operator': 'NOT',
+                'right_operand': {
+                    'left_operand': left_tree,
+                    'operator': 'AND',
+                    'right_operand': right_tree
+                }
+            }
+        }
+    elif _set_operation == 'COMPLEMENT':
+        return {
+            'operator': 'NOT',
+            'right_operand': left_tree
+        }
+    else:
+        raise ValueError(f'Unknown set operation: {_set_operation}')
 
 
 # Object based filters don't work yet, there are many issues...

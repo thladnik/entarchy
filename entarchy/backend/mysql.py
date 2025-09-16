@@ -8,6 +8,7 @@ from datetime import date, datetime
 from typing import Any, List, Union
 
 import numpy as np
+import pandas as pd
 import sqlalchemy
 from sqlalchemy import Index, ForeignKey, String, create_engine
 from sqlalchemy.dialects.mysql import LONGBLOB
@@ -50,9 +51,11 @@ class EntityTable(Base):
     parent: Mapped['EntityTable'] = relationship('EntityTable', back_populates='children', remote_side=[uuid])
 
     # One-to-Many
-    children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent',
-                                                         remote_side=[parent_uuid])
+    children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent', remote_side=[parent_uuid])
     attributes: Mapped[List['AttributeTable']] = relationship('AttributeTable', back_populates='entity')
+
+    created: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    modified: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
 
     __table_args__ = (
         Index('ix_unique_id_per_parent_uuid', 'parent_uuid', 'id', unique=True),
@@ -77,9 +80,10 @@ class AttributeTable(Base):
     value_date: Mapped[date] = mapped_column(nullable=True)
     value_datetime: Mapped[datetime] = mapped_column(nullable=True)
     value_blob: Mapped[bytes] = mapped_column(LONGBLOB, nullable=True)
-    blob_format: Mapped[str] = mapped_column(String(500), nullable=True)
-    data_type: Mapped[str] = mapped_column(String(20), nullable=True)
+    data_type: Mapped[str] = mapped_column(String(500), nullable=True)
 
+    created: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    modified: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
     is_persistent: Mapped[bool] = mapped_column(nullable=True)
 
     __table_args__ = (
@@ -94,13 +98,15 @@ def _build_query_from_as_tree(entity_type_name: str,
                               session: sqlalchemy.orm.Session,
                               as_tree: dict[str, ...]) -> sqlalchemy.orm.Query:
     # Create base query
-    query = session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
+    _query = session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
 
     # Apply filters generated from the abstract syntax tree
-    filters = _generate_attribute_filters(entity_type_name, session, as_tree)
-    query = query.filter(filters)
+    if len(as_tree) == 0:
+        return _query
 
-    return query
+    filters = _generate_attribute_filters(entity_type_name, session, as_tree)
+
+    return _query.filter(filters)
 
 
 def _generate_attribute_filters(entity_type_name: str,
@@ -110,6 +116,8 @@ def _generate_attribute_filters(entity_type_name: str,
 
     # Handle connectives
     if _operator in ('AND', 'OR'):
+        # TODO: implement XOR? Very costly to do like this in SQL // see entarchy.core.query.combine_trees
+        #        Requires at least OR + 2xAND + NOT
         _op_fun = {'AND': sqlalchemy.and_, 'OR': sqlalchemy.or_}[_operator]
         return _op_fun(_generate_attribute_filters(entity_type_name, session, as_tree['left_operand']),
                        _generate_attribute_filters(entity_type_name, session, as_tree['right_operand']))
@@ -121,7 +129,7 @@ def _generate_attribute_filters(entity_type_name: str,
         value = as_tree['right_operand']
 
         if _operator == 'IN':
-            raise NotImplementedError('IN operator not implemented yet')
+            raise NotImplementedError(f'IN operator not implemented for MySQL backend yet')
             # if not isinstance(value, list):
             #     raise ValueError('Operand after IN statement should be a list of values')
             #
@@ -150,6 +158,7 @@ def _generate_attribute_filters(entity_type_name: str,
                     .subquery())
 
     # Handle unary operators
+
     elif _operator == 'EXIST':
         subquery = (session.query(AttributeTable.entity_uuid)
                     .filter(AttributeTable.name == as_tree['right_operand'])
@@ -165,6 +174,74 @@ def _generate_attribute_filters(entity_type_name: str,
 
     # Return the `IN` filter to apply to the main query
     return EntityTable.uuid.in_(session.query(subquery.c.entity_uuid))
+
+
+def _read_data_from_attribute_row(row: AttributeTable):
+    if row.data_type is None:
+        raise ValueError('Attribute data type is None.')
+
+    # Load blob
+    if row.data_type.startswith('blob'):
+        _, _format = row.data_type.split('::')
+
+        return _deserialize(row.value_blob, _format)
+
+    # Otherwise load from this row based on data type
+    return getattr(row, f'value_{row.data_type}')
+
+
+def _write_data_to_attribute_row(row: AttributeTable, data: Any):
+    # Get corresponding builtin python scalar type for numpy scalars
+    if isinstance(data, np.generic):
+        data = data.item()
+
+    # Handle scalars and datetime values
+    if type(data) in (str, float, int, bool, date, datetime):
+
+        # Set value type
+        data_type_map = {str: 'str', float: 'float', int: 'int',
+                         bool: 'bool', date: 'date', datetime: 'datetime'}
+        data_type = data_type_map.get(type(data))
+
+        # Some SQL dialects don't support inf float values
+        if data_type == 'float' and math.isinf(data):
+            data_type = 'blob'
+    else:
+        data_type = 'blob'
+
+    # Set value on corresponding column based on type
+    if data_type == 'blob':
+        data, _format = _serialize(data)
+        row.data_type = f'{data_type}::{_format}'
+    else:
+        row.data_type = data_type
+
+    row.__setattr__(f'value_{data_type}', data)
+
+
+def _serialize(data: Any) -> tuple[bytes, str]:
+    if isinstance(data, np.ndarray):
+        _format = 'npy'
+        with io.BytesIO() as buffer:
+            np.lib.format.write_array(buffer, data)
+            buffer.seek(0)
+            _bytes = buffer.read()
+    else:
+        _format = 'pickle'
+        _bytes = pickle.dumps(data)
+
+    return _bytes, _format
+
+
+def _deserialize(data: bytes, _format: str) -> Any:
+    if _format == 'npy':
+        with io.BytesIO(data) as buffer:
+            buffer.seek(0)
+            return np.lib.format.read_array(buffer)
+    elif _format == 'pickle':
+        return pickle.loads(data)
+    else:
+        raise ValueError(f'Unknown blob format "{_format}".')
 
 
 class MySQLBackend(Backend):
@@ -248,6 +325,38 @@ class MySQLBackend(Backend):
         print('> Create tables')
         Base.metadata.create_all(self.sql_engine)
 
+        print('> Create triggers')
+
+        with self.sql_engine.connect() as connection:
+
+            connection.execute(
+                sqlalchemy.text("""
+                    CREATE TRIGGER attributes_touch_entities_ai
+                    AFTER INSERT ON attributes FOR EACH ROW
+                      UPDATE entities
+                      SET modified = UTC_TIMESTAMP(6)
+                      WHERE entities.uuid = NEW.entity_uuid
+                """)
+            )
+            connection.execute(
+                sqlalchemy.text("""
+                    CREATE TRIGGER attributes_touch_entities_au
+                    AFTER UPDATE ON attributes FOR EACH ROW
+                      UPDATE entities
+                      SET modified = UTC_TIMESTAMP(6)
+                      WHERE entities.uuid = NEW.entity_uuid
+                """)
+            )
+            connection.execute(
+                sqlalchemy.text("""
+                    CREATE TRIGGER attributes_touch_entities_ad
+                    AFTER DELETE ON attributes FOR EACH ROW
+                      UPDATE entities
+                      SET modified = UTC_TIMESTAMP(6)
+                      WHERE entities.uuid = OLD.entity_uuid
+                            """)
+            )
+
         return True
 
     def create_type_hierarchy(self, _hierarchy: dict[str, ...]) -> bool:
@@ -304,14 +413,14 @@ class MySQLBackend(Backend):
 
         return True
 
-    def get_entity_data_by_query(self, _entarchy: Entarchy, entity_type_name: str, _query: dict[str, ...]) -> list[tuple[str, str]]:
+    # def get_entity_by_query(self, _entarchy: Entarchy, entity_type_name: str, _query: dict[str, ...]) -> list[tuple[str, str]]:
+    #
+    #     with sqlalchemy.orm.Session(self.sql_engine) as session:
+    #         query = _build_query_from_as_tree(entity_type_name, session, _query)
+    #
+    #     return [(row.uuid, row.id) for row in query.all()]
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
-            query = _build_query_from_as_tree(entity_type_name, session, _query)
-
-        return [(row.uuid, row.id) for row in query.all()]
-
-    def get_entity_data_by_uuid(self, _entarchy: Entarchy, _uuid: str) -> tuple[str, str]:
+    def get_entity_by_uuid(self, _entarchy: Entarchy, _uuid: str) -> tuple[str, str]:
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
             query = session.query(EntityTable).filter(EntityTable.uuid == _uuid)
@@ -326,7 +435,22 @@ class MySQLBackend(Backend):
 
         return row.uuid, row.id
 
-    def get_entity_data_of_type(self, _entarchy: Entarchy, entity_type: str) -> list[tuple[str, str]]:
+    def get_entity_last_time_modified(self, _entarchy: Entarchy, _uuid: str) -> datetime:
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            query = session.query(EntityTable).filter(EntityTable.uuid == _uuid)
+
+            count = query.count()
+            if count == 0:
+                raise KeyError(f'Entity with UUID {_uuid} not found in database.')
+            elif count > 1:
+                raise RuntimeError(f'Multiple entities with UUID {_uuid} found in database.')
+
+            row = query.one()
+
+        return row.modified
+
+    def get_entity_of_type(self, _entarchy: Entarchy, entity_type: str) -> list[tuple[str, str]]:
         with sqlalchemy.orm.Session(self.sql_engine) as session:
             query = (session.query(EntityTable)
                      .order_by(getattr(EntityTable.uuid, 'asc')()))
@@ -356,7 +480,7 @@ class MySQLBackend(Backend):
         for n in names:
             if n not in rows:
                 raise AttributeError(f'Attribute "{n}" not found for entity with UUID {_uuid}.')
-            values.append(self._read_data_from_attribute_row(rows[n]))
+            values.append(_read_data_from_attribute_row(rows[n]))
 
         return values
 
@@ -385,7 +509,7 @@ class MySQLBackend(Backend):
                 row.__setattr__(f'value_{row.data_type}', None)
 
                 # Write new value
-                self._write_data_to_attribute_row(row, v)
+                _write_data_to_attribute_row(row, v)
 
             # Add new attributes
             for n in list(set(names) - set(list(existing_rows.keys()))):
@@ -396,7 +520,7 @@ class MySQLBackend(Backend):
                 session.add(new_row)
 
                 # Write data to row
-                self._write_data_to_attribute_row(new_row, v)
+                _write_data_to_attribute_row(new_row, v)
 
             # Commit changes
             session.commit()
@@ -409,76 +533,154 @@ class MySQLBackend(Backend):
 
         return True, ''
 
-    @staticmethod
-    def _read_data_from_attribute_row(row: AttributeTable):
-
-        if row.data_type is None:
-            raise ValueError('Attribute data type is None.')
-
-        # Load blob
-        if row.data_type == 'blob':
-            if row.blob_format == 'npy':
-                with io.BytesIO(row.value_blob) as buffer:
-                    buffer.seek(0)
-                    return np.lib.format.read_array(buffer)
-
-            elif row.blob_format == 'pickle':
-                return pickle.loads(row.value_blob)
-            else:
-                raise ValueError(f'Unknown blob format "{row.blob_format}".')
-
-        # Otherwise load from this row based on data type
-        return getattr(row, f'value_{row.data_type}')
-
-    @staticmethod
-    def _write_data_to_attribute_row(row: AttributeTable, data: Any):
-
-        # Get corresponding builtin python scalar type for numpy scalars
-        if isinstance(data, np.generic):
-            data = data.item()
-
-        # Handle scalars and datetime values
-        if type(data) in (str, float, int, bool, date, datetime):
-
-            # Set value type
-            value_type_map = {str: 'str', float: 'float', int: 'int',
-                              bool: 'bool', date: 'date', datetime: 'datetime'}
-            value_type = value_type_map.get(type(data))
-
-            # Some SQL dialects don't support inf float values
-            if value_type == 'float' and math.isinf(data):
-                value_type = 'blob'
-            else:
-                # Remove possible previous blob format data if this is a scalar now
-                row.blob_format = None
-        else:
-            value_type = 'blob'
-
-        # Set value on corresponding column based on type
-        if value_type == 'blob':
-            if isinstance(data, np.ndarray):
-                row.blob_format = 'npy'
-                with io.BytesIO() as buffer:
-                    np.lib.format.write_array(buffer, data)
-                    buffer.seek(0)
-                    data = buffer.read()
-            else:
-                row.blob_format = 'pickle'
-                data = pickle.dumps(data)
-
-        row.data_type = value_type
-        row.__setattr__(f'value_{value_type}', data)
-
     # Collection related methods
 
-    def get_entity_count_of_collection(self, _entarchy: Entarchy, entity_type_name: str, as_tree: dict[str, ...] = None) -> int:
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
-            t1 = time.perf_counter()
-            query = _build_query_from_as_tree(entity_type_name, session, as_tree)
-            print(f'Query build time: {time.perf_counter() - t1:.4f} s')
+    def get_entity_count_of_collection(self,
+                                       _entarchy: Entarchy,
+                                       entity_type_name: str,
+                                       as_tree: dict[str, ...]
+                                       ) -> int:
 
-            t1 = time.perf_counter()
+        # Fetch result
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+            query = _build_query_from_as_tree(entity_type_name, session, as_tree)
+
             res = query.count()
-            print(f'Query execution time: {time.perf_counter() - t1:.4f} s')
 
             return res
+
+    def get_entity_of_collection_by_index(self,
+                                          _entarchy: Entarchy,
+                                          entity_type_name: str,
+                                          as_tree: dict[str, ...],
+                                          index: int
+                                          ) -> tuple[str, str]:
+
+        # Fetch result
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+            query = _build_query_from_as_tree(entity_type_name, session, as_tree)
+
+            res = query.order_by(EntityTable.uuid).offset(index).limit(1).one()
+
+        return res.uuid, res.id
+
+    def get_entity_of_collection_by_slice(self,
+                                          _entarchy: Entarchy,
+                                          entity_type_name: str,
+                                          as_tree: dict[str, ...],
+                                          _slice: slice
+                                          ) -> list[tuple[str, str]]:
+
+        # Calculate indices
+        count = self.get_entity_count_of_collection(_entarchy, entity_type_name, as_tree)
+        start, stop, step = _slice.indices(count)
+
+        # Fetch result
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+            query = _build_query_from_as_tree(entity_type_name, session, as_tree)
+
+            res = query.order_by(EntityTable.uuid).offset(start).limit(stop - start).all()
+
+        # TODO: there should be a way to directly query the n-th row using 'ROW_NUMBER() % n'
+        #        but it's not clear how is would work in SQLAlchemy ORM; figure out later
+        return [(r.uuid, r.id) for r in res[::step]]
+
+    def get_multiple_attributes_of_collection(self,
+                                              _entarchy: Entarchy,
+                                              entity_type_name: str,
+                                              _analysis: Analysis,
+                                              as_tree: dict[str, ...],
+                                              names: list[str]
+                                              ) -> pd.DataFrame:
+
+        # Fetch result
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            # Get entity query for collection
+            entity_query = _build_query_from_as_tree(entity_type_name, session, as_tree)
+
+            # Get attribute types for requested names
+            attribute_types = {}
+            distinct_attribute_query = (session.query(AttributeTable.name, AttributeTable.data_type)
+                                        .join(EntityTable)
+                                        .filter(EntityTable.uuid.in_(entity_query.subquery().primary_key))
+                                        .join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
+                                        .distinct())
+
+            for row in distinct_attribute_query.all():
+                if row.name in attribute_types:
+                    if attribute_types[row.name] != row.data_type:
+                        # TODO: add runtime resolution of problem
+                        #        option: always use scalars where available
+                        RuntimeWarning(f'Attribute "{row.name}" has multiple data types in the selected collection. '
+                                       f'Using {row.data_type} (not {attribute_types[row.name]}.')
+
+                attribute_types[row.name] = row.data_type
+
+            # Construct query to fetch attributes
+            #  Build cases which return correct value field based on attr_name's data_type
+            cases = []
+            for n in names:
+                # Get data type
+                data_type = attribute_types[n]
+
+                # Leave out blob format substring
+                if data_type.startswith('blob'):
+                    data_type, _ = data_type.split('::')
+
+                # Use the appropriate column for the data_type
+                cases.append(
+                    sqlalchemy.func.max(sqlalchemy.case(
+                        (AttributeTable.name == n, getattr(AttributeTable, f'value_{data_type}')),
+                        else_=None)).label(n)
+                )
+
+            # Construct query
+            attribute_query = (
+                session.query(
+                    EntityTable.uuid,
+                    *cases
+                )
+                .join(AttributeTable, EntityTable.uuid == AttributeTable.entity_uuid)
+                .filter(EntityTable.uuid.in_(entity_query.subquery().primary_key))
+                .group_by(EntityTable.uuid, EntityTable.id)
+            )
+
+        # Create DataFrame from query result
+        df = pd.DataFrame(columns=['uuid', *names], data=attribute_query.all())
+
+        # Convert all types correctly (default result will likely contain bytestring values
+        for n in names:
+
+            # Get type
+            data_type = attribute_types[n]
+
+            # Cast to type
+            try:
+                if data_type == 'int':
+                    # TODO: Int conversion regularly throws pandas.errors.IntCastingNaNError
+                    #  because there's no valid value for empty rows (i.e. Nones), ignore for now
+                    df[n] = df[n].astype(int, errors='ignore')
+                elif data_type == 'float':
+                    df[n] = df[n].astype(float)
+                elif data_type == 'str':
+                    df[n] = df[n].astype(str)
+                elif data_type == 'bool':
+                    df[n] = df[n].astype(bool)
+                elif data_type == 'date':
+                    df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode()), format='%Y-%m-%d')
+                elif data_type == 'datetime':
+                    df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode()),
+                                           format='%Y-%m-%d %H:%M:%S')
+                # Load blobs
+                elif data_type.startswith('blob'):
+                    _, _format = data_type.split('::')
+                    df[n] = df[n].apply(lambda s: _deserialize(s, _format) if s is not None else None)
+
+            except ValueError:
+                raise RuntimeWarning(f'Failed to cast attribute {n} to type {data_type}')
+
+        # Set row index to primary key
+        df.set_index('uuid', drop=True, inplace=True)
+
+        return df

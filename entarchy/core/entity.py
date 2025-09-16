@@ -1,6 +1,13 @@
 from __future__ import annotations
+
+import datetime
 import uuid
 from typing import Any, Type, Union, TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+
+from . import query
 
 if TYPE_CHECKING:
     from .analysis import Analysis
@@ -22,7 +29,8 @@ class Entity(object):
                  _analysis: Analysis = None,
                  _uuid: str = None,
                  _id: str = None,
-                 _parent: Entity = None):
+                 _parent: Entity = None,
+                 _init_cache: dict[str, Any] = None):
 
         self._entarchy = _entarchy
         self._analysis = _analysis
@@ -38,16 +46,29 @@ class Entity(object):
             self._uuid = uuid.uuid4()
 
         # Set up attribute cache
+        self._attribute_cache_start_time = datetime.datetime.utcnow()
         self._attribute_cache: dict[str, Any] = {}
         self._attributes_to_update: list[str] = []
 
         # Add entity to entarchy object
         self._entarchy.add_existing_entity(self)
 
-    def __new__(cls, _entarchy, _analysis=None, _uuid=None, _id=None, _parent=None):
+        # Initialize cache if provided
+        if _init_cache is not None:
+            if not isinstance(_init_cache, dict):
+                raise TypeError('_init_cache must be a dictionary of attribute names and values.')
+            self._attribute_cache.update(_init_cache)
+
+    def __new__(cls, _entarchy, _analysis=None, _uuid=None, _id=None, _parent=None, _init_cache=None):
 
         if _uuid is not None and _uuid in _entarchy:
-            return _entarchy.get_entity_by_uuid(_uuid)
+            obj = _entarchy.get_entity_by_uuid(_uuid)
+
+            # Update cache if provided
+            if _init_cache is not None:
+                obj.update_cache(_init_cache)
+
+            return obj
 
         return super().__new__(cls)
 
@@ -120,9 +141,13 @@ class Entity(object):
         else:
             key = [key]
 
-        # Reset attribute cache if entity is dirty
-        if self._entarchy.entity_is_dirty(self):
-            self._attribute_cache = {}
+        # Reset attribute cache if any key is in cache and entity is dirty
+        if any([k in self._attribute_cache for k in key]):
+            modified = self._entarchy.backend.get_entity_last_time_modified(self._entarchy, self.uuid)
+
+            if modified > self._attribute_cache_start_time:
+                self._attribute_cache_start_time = datetime.datetime.utcnow()
+                self._attribute_cache = {}
 
         # Load missing attributes from backend
         keys_to_load = list(set(key) - set(self._attribute_cache.keys()))
@@ -284,11 +309,166 @@ class Collection(object):
         self._entarchy = _entarchy
         self._as_tree = _query
 
+        self._cache = pd.DataFrame()
+        self._pending_changes: dict[str, list[int]] = {}
+
     def __len__(self):
         return self._entarchy.backend.get_entity_count_of_collection(self._entarchy, self.entity_type.__name__, self.as_tree)
 
     def __repr__(self):
         return f'Collection(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
+
+    # Access methods
+
+    def __getitem__(self, item):
+
+        # Return single entity
+        if isinstance(item, (int, np.integer)):
+            if item < 0:
+                item = len(self) + item
+
+            _uuid, _id = self._entarchy.backend.get_entity_of_collection_by_index(self._entarchy, self.entity_type.__name__, self.as_tree, item)
+            return self._get_entity(_uuid=_uuid, _id=_id)
+
+        # Return slice
+        elif isinstance(item, slice):
+
+            # Get data
+            res = self._entarchy.backend.get_entity_of_collection_by_slice(self._entarchy, self.entity_type.__name__, self.as_tree, item)
+
+            result = [self._get_entity(_uuid=_uuid, _id=_id) for _uuid, _id in res]
+
+            return result
+
+        # Return multiple attributes for all entities in collection
+        elif isinstance(item, (str, list)):
+            if isinstance(item, str):
+                item = [item]
+
+            df = self.dataframe_of(attribute_names=item)
+
+            # For single column, return pd.Series
+            if len(df.columns) == 1:
+                return df.iloc[:, 0]
+
+            return df
+
+        raise KeyError(f'Invalid key {item}')
+
+    def __setitem__(self, key, value):
+
+        if key != slice(None, None, None):
+            raise KeyError(f'Invalid key {key}')
+        if not isinstance(value, pd.DataFrame):
+            if not isinstance(value, pd.Series):
+                raise ValueError(f'Invalid value of type {type(value)}. Needs to be pandas.Series or pandas.DataFrame')
+            value = pd.DataFrame(value)
+
+        self.update(value)
+
+    # Set operations
+
+    def __add__(self, other):
+        """Create a new collection that is the union between this collection and another.
+
+        Args:
+            other (Collection): Another collection to add.
+
+        Example:
+            collection_a = Collection(EntityTypeA, entarchy, query_a)
+            collection_b = Collection(EntityTypeA, entarchy, query_b)
+            collection_c = collection_a + collection_b
+        """
+
+        if not isinstance(other, Collection):
+            raise TypeError('Can only add another Collection instance.')
+
+        if self.entity_type != other.entity_type:
+            raise ValueError('Can only add collections of the same entity type.')
+
+        # Combine and return new collection
+        new_tree = query.combine_trees('UNION', self.as_tree, other.as_tree)
+        return Collection(self.entity_type, self._entarchy, new_tree)
+
+    def __and__(self, other):
+        """Create a new collection that is the intersection between this collection and another.
+
+        Args:
+            other (Collection): Another collection to intersect.
+
+        Example:
+            collection_a = Collection(EntityTypeA, entarchy, query_a)
+            collection_b = Collection(EntityTypeA, entarchy, query_b)
+            collection_c = collection_a & collection_b
+        """
+
+        if not isinstance(other, Collection):
+            raise TypeError('Can only intersect with another Collection instance.')
+
+        if self.entity_type != other.entity_type:
+            raise ValueError('Can only intersect collections of the same entity type.')
+
+        # Combine and return new collection
+        new_tree = query.combine_trees('INTERSECTION', self.as_tree, other.as_tree)
+        return Collection(self.entity_type, self._entarchy, new_tree)
+
+    def __invert__(self):
+        """Create a new collection that is the complement of this collection.
+
+        Example:
+            collection_a = Collection(EntityTypeA, entarchy, query_a)
+            collection_b = ~collection_a
+        """
+
+        # Invert and return new collection
+        new_tree = query.combine_trees('COMPLEMENT', self.as_tree)
+        return Collection(self.entity_type, self._entarchy, new_tree)
+
+    def __sub__(self, other):
+        """Create a new collection that is the difference between this collection and another.
+
+        Args:
+            other (Collection): Another collection to subtract.
+
+        Example:
+            collection_a = Collection(EntityTypeA, entarchy, query_a)
+            collection_b = Collection(EntityTypeA, entarchy, query_b)
+            collection_c = collection_a - collection_b
+        """
+
+        if not isinstance(other, Collection):
+            raise TypeError('Can only subtract another Collection instance.')
+
+        if self.entity_type != other.entity_type:
+            raise ValueError('Can only subtract collections of the same entity type.')
+
+        # Combine and return new collection
+        new_tree = query.combine_trees('DIFFERENCE', self.as_tree, other.as_tree)
+        return Collection(self.entity_type, self._entarchy, new_tree)
+
+    def __xor__(self, other):
+        """Create a new collection that is the symmetric difference between this collection and another.
+
+        Args:
+            other (Collection): Another collection to xor.
+
+        Example:
+            collection_a = Collection(EntityTypeA, entarchy, query_a)
+            collection_b = Collection(EntityTypeA, entarchy, query_b)
+            collection_c = collection_a ^ collection_b
+        """
+
+        if not isinstance(other, Collection):
+            raise TypeError('Can only xor with another Collection instance.')
+
+        if self.entity_type != other.entity_type:
+            raise ValueError('Can only xor collections of the same entity type.')
+
+        # Combine and return new collection
+        new_tree = query.combine_trees('SYMMETRIC_DIFFERENCE', self.as_tree, other.as_tree)
+        return Collection(self.entity_type, self._entarchy, new_tree)
+
+    # Properties
 
     @property
     def as_tree(self) -> dict[str, ...]:
@@ -299,3 +479,50 @@ class Collection(object):
     @property
     def entity_type(self):
         return self._entity_type
+
+    def _get_entity(self, _uuid: str, _id: str) -> Entity:
+
+        _init_cache = None
+        if _uuid in self._cache.index:
+            _init_cache = self._cache.loc[_uuid].to_dict()
+
+        return self.entity_type(_entarchy=self._entarchy, _uuid=_uuid, _id=_id, _init_cache=_init_cache)
+
+    def _load_attributes(self, attribute_names: list[str]):
+
+        # Load attributes from backend
+        df = self._entarchy.backend.get_multiple_attributes_of_collection(self._entarchy,
+                                                                          self.entity_type.__name__,
+                                                                          None,
+                                                                          self.as_tree,
+                                                                          attribute_names)
+
+        # Update cache
+        self._cache[df.columns] = df
+
+    def dataframe_of(self, attribute_names: list[str] = None, reload_cached: bool = False) -> pd.DataFrame:
+
+        # If all attributes are in cache, return cached result
+        loaded_attributes = set(attribute_names) & set(self._cache.columns.tolist())
+        if reload_cached or (len(loaded_attributes) < len(attribute_names)):
+
+            # Check which attributes to load
+            if not reload_cached:
+                _attributes_cached = list(set(attribute_names) & set(self._cache.columns.tolist()))
+                _attributes_to_fetch = list(set(attribute_names) - set(self._cache.columns.tolist()))
+            else:
+                _attributes_cached = []
+                _attributes_to_fetch = attribute_names
+
+            if self._entarchy.debug:
+                print('Cached attributes:', _attributes_cached)
+                print('Attributes to fetch: ', _attributes_to_fetch)
+
+            # Load attributes from database
+            self._load_attributes(_attributes_to_fetch)
+
+        # Return final DataFrame
+        # if self._query_custom_orderby:
+        #     return self._cache.loc[self._pk_order, attribute_names]
+
+        return self._cache[attribute_names].copy()

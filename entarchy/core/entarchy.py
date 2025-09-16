@@ -46,7 +46,8 @@ class Entarchy:
         self._entities: dict[str, Entity] = {}
         self._entities_to_add: list[str] = []
         self._entities_to_update: list[str] = []
-        self._dirty_entities: list[str] = []
+
+        print(f'{self} opened with backend {_backend_path}')
 
     def __contains__(self, item):
         if isinstance(item, Entity):
@@ -279,19 +280,6 @@ class Entarchy:
             None
         """
         pass
-        # raise NotImplementedError(f'Digest method not implemented for {self.__class__.__name__}')
-
-    def entity_is_dirty(self, entity: Entity) -> bool:
-        """Check if entity is marked as dirty
-
-        Args:
-            entity (Entity): The entity to check.
-
-        Returns:
-            bool: True if the entity is marked for update, False otherwise.
-        """
-
-        return entity.uuid in self._dirty_entities
 
     def get(self, entity_type: Type[Entity], *_string_expressions: str, **_equalities) -> Collection:
         """Get a collection of entities of a given type.
@@ -327,16 +315,12 @@ class Entarchy:
 
         return Collection(entity_type=entity_type, _entarchy=self, _query=_parsed_query)
 
-        # entity_data = self.backend.get_entity_data_of_type(self, None, entity_type.__name__)
-        #
-        # return [entity_type(_uuid=_uuid, _id=_id, _entarchy=self) for _uuid, _id in entity_data]
-
     def get_entity_by_uuid(self, _uuid: str) -> Entity:
 
         if _uuid in self._entities:
             return self._entities[_uuid]
         else:
-            entity_data = self.backend.get_entity_data_by_uuid(self, _uuid)
+            entity_data = self.backend.get_entity_by_uuid(self, _uuid)
             return Entity(_entarchy=self, _uuid=entity_data[0], _id=entity_data[1])
 
     def remove_entity_from_update(self, entity: Entity) -> None:
