@@ -1,7 +1,6 @@
 from __future__ import annotations
 import re
 import datetime
-import operator
 from typing import Union
 
 
@@ -55,95 +54,97 @@ def tokenize(expression):
     return tokens
 
 
+def parse_parentheses(tokens):
+    current_expr = None
+    while tokens:
+        token = tokens.pop(0)
+
+        if token == '(':
+            # Start a new group: recursively parse the sub-expression inside parentheses
+            sub_expr = parse_parentheses(tokens)
+            current_expr = merge_expression(current_expr, sub_expr)
+        elif token == ')':
+            # Close current group: end of the sub-expression
+            break
+        elif token.upper() == 'NOT':
+            # NOT is a unary operator, it should apply to the next operand or expression
+            next_expr = tokens.pop(0)
+            if next_expr == '(':
+                parsed_expr = parse_parentheses(tokens)
+            else:
+                parsed_expr = next_expr
+            current_expr = merge_expression(current_expr, {
+                'operator': 'NOT',
+                'right_operand': parsed_expr
+            })
+        elif token.upper() in ('AND', 'OR', 'XOR', '&', '|', '^'):
+            # Handle AND/OR/XOR operators between expressions
+            current_expr = {
+                'left_operand': current_expr,
+                'operator': token.replace('&', 'AND').replace('|', 'OR').replace('^', 'XOR'),
+                'right_operand': parse_parentheses(tokens)
+            }
+        elif token.upper() == 'EXIST':
+            # Handle the EXIST operator, which acts on the next operand
+            next_operand = tokens.pop(0)
+            if next_operand == '(':
+                next_operand = parse_parentheses(tokens)
+            current_expr = merge_expression(current_expr, {
+                'operator': 'EXIST',
+                'right_operand': next_operand
+            })
+        elif token.upper() == 'IN':
+            # Handle the IN operator, which checks if the left operand is in the right list
+            left_operand = current_expr
+            if tokens[0] == '(':  # Expecting a list enclosed in parentheses
+                tokens.pop(0)  # Remove the '('
+                right_operand = []
+                while tokens[0] != ')':  # Collect all values inside the parentheses
+                    right_operand.append(tokens.pop(0))
+                tokens.pop(0)  # Remove the closing ')'
+            else:
+                right_operand = tokens.pop(0)
+            current_expr = {
+                'left_operand': left_operand,
+                'operator': 'IN',
+                'right_operand': right_operand
+            }
+        else:
+            # Handle comparisons and other binary operations
+            if current_expr:
+                left_operand = current_expr
+                operator = token
+                right_operand = tokens.pop(0)
+                current_expr = {
+                    'left_operand': left_operand,
+                    'operator': operator,
+                    'right_operand': right_operand
+                }
+            else:
+                current_expr = token
+
+    return current_expr
+
+
+def merge_expression(left_expr, right_expr):
+    """
+    Merges two expressions, ensuring they are combined without unnecessary nesting.
+    """
+    if left_expr is None:
+        return right_expr
+    return {
+        'left_operand': left_expr,
+        'operator': 'AND',  # Default to 'AND' if the operator is implicit
+        'right_operand': right_expr
+    }
+
+
 def parse_expression(tokens):
     """
     Recursively parse the tokens into a flattened nested dictionary structure (AST).
     Binary operations have 'left_operand', 'operator', and 'right_operand'.
     Unary operations have 'operator' and 'right_operand'.
     """
-
-    def parse_parentheses(tokens):
-        current_expr = None
-        while tokens:
-            token = tokens.pop(0)
-
-            if token == '(':
-                # Start a new group: recursively parse the sub-expression inside parentheses
-                sub_expr = parse_parentheses(tokens)
-                current_expr = merge_expression(current_expr, sub_expr)
-            elif token == ')':
-                # Close current group: end of the sub-expression
-                break
-            elif token.upper() == 'NOT':
-                # NOT is a unary operator, it should apply to the next operand or expression
-                next_expr = tokens.pop(0)
-                if next_expr == '(':
-                    parsed_expr = parse_parentheses(tokens)
-                else:
-                    parsed_expr = next_expr
-                current_expr = merge_expression(current_expr, {
-                    'operator': 'NOT',
-                    'right_operand': parsed_expr
-                })
-            elif token.upper() in ('AND', 'OR', 'XOR', '&', '|', '^'):
-                # Handle AND/OR/XOR operators between expressions
-                current_expr = {
-                    'left_operand': current_expr,
-                    'operator': token.replace('&', 'AND').replace('|', 'OR').replace('^', 'XOR'),
-                    'right_operand': parse_parentheses(tokens)
-                }
-            elif token.upper() == 'EXIST':
-                # Handle the EXIST operator, which acts on the next operand
-                next_operand = tokens.pop(0)
-                if next_operand == '(':
-                    next_operand = parse_parentheses(tokens)
-                current_expr = merge_expression(current_expr, {
-                    'operator': 'EXIST',
-                    'right_operand': next_operand
-                })
-            elif token.upper() == 'IN':
-                # Handle the IN operator, which checks if the left operand is in the right list
-                left_operand = current_expr
-                if tokens[0] == '(':  # Expecting a list enclosed in parentheses
-                    tokens.pop(0)  # Remove the '('
-                    right_operand = []
-                    while tokens[0] != ')':  # Collect all values inside the parentheses
-                        right_operand.append(tokens.pop(0))
-                    tokens.pop(0)  # Remove the closing ')'
-                else:
-                    right_operand = tokens.pop(0)
-                current_expr = {
-                    'left_operand': left_operand,
-                    'operator': 'IN',
-                    'right_operand': right_operand
-                }
-            else:
-                # Handle comparisons and other binary operations
-                if current_expr:
-                    left_operand = current_expr
-                    operator = token
-                    right_operand = tokens.pop(0)
-                    current_expr = {
-                        'left_operand': left_operand,
-                        'operator': operator,
-                        'right_operand': right_operand
-                    }
-                else:
-                    current_expr = token
-
-        return current_expr
-
-    def merge_expression(left_expr, right_expr):
-        """
-        Merges two expressions, ensuring they are combined without unnecessary nesting.
-        """
-        if left_expr is None:
-            return right_expr
-        return {
-            'left_operand': left_expr,
-            'operator': 'AND',  # Default to 'AND' if the operator is implicit
-            'right_operand': right_expr
-        }
 
     return parse_parentheses(tokens)
 

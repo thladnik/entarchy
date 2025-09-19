@@ -10,13 +10,12 @@ from typing import Any, List, Union
 import numpy as np
 import pandas as pd
 import sqlalchemy
-from sqlalchemy import Index, ForeignKey, String, create_engine
+from sqlalchemy import Index, ForeignKey, String, create_engine, BigInteger, Double
 from sqlalchemy.dialects.mysql import LONGBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .backend import Backend
-from .. import Entarchy, Entity
-from ..core.analysis import Analysis
+from .. import Analysis, Entarchy, Entity
 
 
 class Base(DeclarativeBase):
@@ -69,13 +68,14 @@ class AttributeTable(Base):
     __tablename__ = 'attributes'
 
     entity_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), primary_key=True)
-    entity: Mapped['EntityTable'] = relationship('EntityTable', back_populates='attributes')
+    entity: Mapped['EntityTable'] = relationship('EntityTable', foreign_keys=[entity_uuid], back_populates='attributes')
+    analysis_uuid: Mapped[str] = mapped_column(String(36), nullable=True)
 
     name: Mapped[str] = mapped_column(String(500), primary_key=True, index=True)
 
     value_str: Mapped[str] = mapped_column(String(500), nullable=True)
-    value_int: Mapped[int] = mapped_column(nullable=True)
-    value_float: Mapped[float] = mapped_column(nullable=True)
+    value_int: Mapped[int] = mapped_column(BigInteger(), nullable=True)
+    value_float: Mapped[float] = mapped_column(Double(), nullable=True)
     value_bool: Mapped[bool] = mapped_column(nullable=True)
     value_date: Mapped[date] = mapped_column(nullable=True)
     value_datetime: Mapped[datetime] = mapped_column(nullable=True)
@@ -84,7 +84,6 @@ class AttributeTable(Base):
 
     created: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     modified: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
-    is_persistent: Mapped[bool] = mapped_column(nullable=True)
 
     __table_args__ = (
         Index('ix_unique_name_per_entity_uuid', 'entity_uuid', 'name', unique=True),
@@ -191,6 +190,14 @@ def _read_data_from_attribute_row(row: AttributeTable):
 
 
 def _write_data_to_attribute_row(row: AttributeTable, data: Any):
+
+    # TODO: in future version, information about data type byte number should be included in data_type column
+    #  as part of the _format substring
+    #  This way the exact data type can be restored upon read (e.g. int8, int16, float32, float64, etc.)
+    #  This would mean that python native scalars may be stored as regular 64bit,
+    #  while numpy scalars get variable sizes.
+    #  This won't affect actual storage though, as the database will use the same column types (bigint, double) anyway.
+
     # Get corresponding builtin python scalar type for numpy scalars
     if isinstance(data, np.generic):
         data = data.item()
@@ -245,7 +252,8 @@ def _deserialize(data: bytes, _format: str) -> Any:
 
 
 class MySQLBackend(Backend):
-    _sql_engine = None
+    _sql_engine: sqlalchemy.Engine = None
+    _db_triggers_enabled: bool = False
 
     def __init__(self, dbname: str, dbhost: str, dbuser: str, dbpassword: str = None, debug: bool = False):
 
@@ -310,6 +318,19 @@ class MySQLBackend(Backend):
                                              f'{self.dbuser}:{self.dbpassword}'
                                              f'@{self.dbhost}/{self.dbname}',
                                              echo=self.debug)
+
+            # Check if triggers are enabled
+            with sqlalchemy.Connection(self._sql_engine) as conn:
+                res = conn.execute(
+                    sqlalchemy.text(f'''
+                        SELECT TRIGGER_NAME
+                        FROM information_schema.TRIGGERS
+                        WHERE TRIGGER_SCHEMA = '{self.dbname}'
+                          AND TRIGGER_NAME = 'attributes_touch_entities_ai'
+                    ''')
+                )
+                self._db_triggers_enabled = len(res.fetchall()) > 0
+
         return self._sql_engine
 
     def create(self) -> bool:
@@ -326,36 +347,44 @@ class MySQLBackend(Backend):
         Base.metadata.create_all(self.sql_engine)
 
         print('> Create triggers')
-
         with self.sql_engine.connect() as connection:
-
-            connection.execute(
-                sqlalchemy.text("""
-                    CREATE TRIGGER attributes_touch_entities_ai
-                    AFTER INSERT ON attributes FOR EACH ROW
-                      UPDATE entities
-                      SET modified = UTC_TIMESTAMP(6)
-                      WHERE entities.uuid = NEW.entity_uuid
-                """)
-            )
-            connection.execute(
-                sqlalchemy.text("""
-                    CREATE TRIGGER attributes_touch_entities_au
-                    AFTER UPDATE ON attributes FOR EACH ROW
-                      UPDATE entities
-                      SET modified = UTC_TIMESTAMP(6)
-                      WHERE entities.uuid = NEW.entity_uuid
-                """)
-            )
-            connection.execute(
-                sqlalchemy.text("""
-                    CREATE TRIGGER attributes_touch_entities_ad
-                    AFTER DELETE ON attributes FOR EACH ROW
-                      UPDATE entities
-                      SET modified = UTC_TIMESTAMP(6)
-                      WHERE entities.uuid = OLD.entity_uuid
-                            """)
-            )
+            try:
+                connection.execute(
+                    sqlalchemy.text("""
+                        CREATE TRIGGER attributes_touch_entities_ai
+                        AFTER INSERT ON attributes FOR EACH ROW
+                          UPDATE entities
+                          SET modified = UTC_TIMESTAMP(6)
+                          WHERE entities.uuid = NEW.entity_uuid
+                    """)
+                )
+                connection.execute(
+                    sqlalchemy.text("""
+                        CREATE TRIGGER attributes_touch_entities_au
+                        AFTER UPDATE ON attributes FOR EACH ROW
+                          UPDATE entities
+                          SET modified = UTC_TIMESTAMP(6)
+                          WHERE entities.uuid = NEW.entity_uuid
+                    """)
+                )
+                connection.execute(
+                    sqlalchemy.text("""
+                        CREATE TRIGGER attributes_touch_entities_ad
+                        AFTER DELETE ON attributes FOR EACH ROW
+                          UPDATE entities
+                          SET modified = UTC_TIMESTAMP(6)
+                          WHERE entities.uuid = OLD.entity_uuid
+                                """)
+                )
+            except:
+                # If this fails after successful creation of tables, the most likely reason is detailed here:
+                #  https://stackoverflow.com/a/56390000
+                print('WARNING: Failed to create database triggers. '
+                      'This will decrease performance of attribute updates.')
+                print('          This is likely due to security settings and '
+                      'insufficient privileges of the database user.')
+                print(f'         For better performance give global \'SUPER\' privilege to dbuser \'{self.dbuser}\' '
+                      f'          OR set log-bin-trust-function-creators=1 in MySQL config and restart the server.')
 
         return True
 
@@ -387,7 +416,9 @@ class MySQLBackend(Backend):
 
     # Entity related methods
 
-    def add_entities(self, _entities: list[Entity]) -> bool:
+    def add_entities(self,
+                     _entities: list[Entity]
+                     ) -> bool:
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
@@ -413,14 +444,11 @@ class MySQLBackend(Backend):
 
         return True
 
-    # def get_entity_by_query(self, _entarchy: Entarchy, entity_type_name: str, _query: dict[str, ...]) -> list[tuple[str, str]]:
-    #
-    #     with sqlalchemy.orm.Session(self.sql_engine) as session:
-    #         query = _build_query_from_as_tree(entity_type_name, session, _query)
-    #
-    #     return [(row.uuid, row.id) for row in query.all()]
+    def get_entity_by_uuid(self,
+                           _entarchy: Entarchy,
+                           _uuid: str
+                           ) -> tuple[str, str]:
 
-    def get_entity_by_uuid(self, _entarchy: Entarchy, _uuid: str) -> tuple[str, str]:
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
             query = session.query(EntityTable).filter(EntityTable.uuid == _uuid)
@@ -435,7 +463,11 @@ class MySQLBackend(Backend):
 
         return row.uuid, row.id
 
-    def get_entity_last_time_modified(self, _entarchy: Entarchy, _uuid: str) -> datetime:
+    def get_entity_last_time_modified(self,
+                                      _entarchy: Entarchy,
+                                      _uuid: str
+                                      ) -> datetime:
+
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
             query = session.query(EntityTable).filter(EntityTable.uuid == _uuid)
@@ -450,7 +482,11 @@ class MySQLBackend(Backend):
 
         return row.modified
 
-    def get_entity_of_type(self, _entarchy: Entarchy, entity_type: str) -> list[tuple[str, str]]:
+    def get_entity_of_type(self,
+                           _entarchy: Entarchy,
+                           entity_type: str
+                           ) -> list[tuple[str, str]]:
+
         with sqlalchemy.orm.Session(self.sql_engine) as session:
             query = (session.query(EntityTable)
                      .order_by(getattr(EntityTable.uuid, 'asc')()))
@@ -462,7 +498,11 @@ class MySQLBackend(Backend):
 
             return [(row.uuid, row.id) for row in query.all()]
 
-    def get_multiple_attributes_of_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid: str, names: list[str]):
+    def get_multiple_attributes_of_entity(self,
+                                          _entarchy: Entarchy,
+                                          _uuid: str,
+                                          names: list[str]
+                                          ) -> tuple[Any, ...]:
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
@@ -484,11 +524,24 @@ class MySQLBackend(Backend):
 
         return values
 
-    def get_single_attribute_of_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid: str, name: str):
-        return self.get_multiple_attributes_of_entity(_entarchy, _analysis, _uuid, [name])[0]
+    def get_single_attribute_of_entity(self,
+                                       _entarchy: Entarchy,
+                                       _uuid: str,
+                                       name: str
+                                       ) -> Any:
 
-    def set_multiple_attributes_on_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid, names: list[str],
-                                          values: list[Any]) -> tuple[bool, str]:
+        return self.get_multiple_attributes_of_entity(_entarchy, _uuid, [name])[0]
+
+    def set_multiple_attributes_on_entity(self,
+                                          _entarchy: Entarchy,
+                                          _uuid: str,
+                                          names: list[str],
+                                          values: list[Any]
+                                          ) -> tuple[bool, str]:
+
+        _analysis_uuid = None
+        if _entarchy.current_analysis is not None:
+            _analysis_uuid = _entarchy.current_analysis.uuid
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
@@ -516,7 +569,7 @@ class MySQLBackend(Backend):
                 v = values[names.index(n)]
 
                 # Create new attribute row
-                new_row = AttributeTable(entity_uuid=_uuid, name=n)
+                new_row = AttributeTable(entity_uuid=_uuid, name=n, analysis_uuid=_analysis_uuid)
                 session.add(new_row)
 
                 # Write data to row
@@ -527,9 +580,13 @@ class MySQLBackend(Backend):
 
             return True, ''
 
-    def set_single_attribute_on_entity(self, _entarchy: Entarchy, _analysis: Analysis, _uuid, key: str, value: Any):
+    def set_single_attribute_on_entity(self,
+                                       _entarchy: Entarchy,
+                                       _uuid, key: str,
+                                       value: Any):
 
-        self.set_multiple_attributes_on_entity(_entarchy, _analysis, _uuid, [key], [value])
+        self.set_multiple_attributes_on_entity(_entarchy, _uuid, [key], [value]
+                                               )
 
         return True, ''
 
@@ -588,7 +645,6 @@ class MySQLBackend(Backend):
     def get_multiple_attributes_of_collection(self,
                                               _entarchy: Entarchy,
                                               entity_type_name: str,
-                                              _analysis: Analysis,
                                               as_tree: dict[str, ...],
                                               names: list[str]
                                               ) -> pd.DataFrame:
@@ -657,21 +713,20 @@ class MySQLBackend(Backend):
 
             # Cast to type
             try:
+                # Use pandas extension types.
+                #  This avoids issues with None values in integer columns
                 if data_type == 'int':
-                    # TODO: Int conversion regularly throws pandas.errors.IntCastingNaNError
-                    #  because there's no valid value for empty rows (i.e. Nones), ignore for now
-                    df[n] = df[n].astype(int, errors='ignore')
+                    df[n] = df[n].astype(pd.Int64Dtype())
                 elif data_type == 'float':
-                    df[n] = df[n].astype(float)
+                    df[n] = df[n].astype(pd.Float64Dtype())
                 elif data_type == 'str':
-                    df[n] = df[n].astype(str)
+                    df[n] = df[n].astype(pd.StringDtype())
                 elif data_type == 'bool':
-                    df[n] = df[n].astype(bool)
+                    df[n] = df[n].astype(pd.BooleanDtype())
                 elif data_type == 'date':
                     df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode()), format='%Y-%m-%d')
                 elif data_type == 'datetime':
-                    df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode()),
-                                           format='%Y-%m-%d %H:%M:%S')
+                    df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode()), format='%Y-%m-%d %H:%M:%S')
                 # Load blobs
                 elif data_type.startswith('blob'):
                     _, _format = data_type.split('::')
@@ -684,3 +739,67 @@ class MySQLBackend(Backend):
         df.set_index('uuid', drop=True, inplace=True)
 
         return df
+
+    def set_multiple_attributes_on_collection(self,
+                                              _entarchy: Entarchy,
+                                              entity_type_name: str,
+                                              as_tree: dict[str, ...],
+                                              df: pd.DataFrame
+                                              ) -> None:
+
+        _dtypes = ['str', 'float', 'int', 'date', 'datetime', 'bool', 'blob']
+
+        _analysis_uuid = None
+        if _entarchy.current_analysis is not None:
+            _analysis_uuid = _entarchy.current_analysis.uuid
+
+        # Do an upsert for each attribute to be updated
+        for attr_name in df.columns:
+
+            # Create df for insert
+            df_insert = pd.DataFrame(df[attr_name])
+
+            # Determine data type
+            dtype = str(df_insert[attr_name].dtype).lower()
+            if 'int' in dtype:
+                data_type_str = 'int'
+            elif 'float' in dtype:
+                data_type_str = 'float'
+            elif 'bool' in dtype:
+                data_type_str = 'bool'
+            elif 'object' in dtype:
+
+                # Use first row to determine type
+                _dt = type(df_insert[attr_name].head(1).values[0])
+                if _dt is str:
+                    data_type_str = 'str'
+                elif _dt is date:
+                    data_type_str = 'date'
+                elif _dt is datetime:
+                    data_type_str = 'datetime'
+                else:
+                    data_type_str = 'blob'
+            else:
+                data_type_str = 'blob'
+
+            # Rename value column
+            df_insert.rename(columns={attr_name: f'value_{data_type_str}'}, inplace=True)
+
+            # Add PK set
+            df_insert['entity_uuid'] = df_insert.index
+            df_insert['name'] = attr_name
+            df_insert['data_type'] = data_type_str
+            df_insert['analysis_uuid'] = _analysis_uuid
+
+            # Perform upsert
+            with sqlalchemy.orm.Session(self.sql_engine) as session:
+                insert_attr_data = df_insert.to_dict('records')
+                insert_stmt = sqlalchemy.dialects.mysql.insert(AttributeTable).values(insert_attr_data)
+                update_attr_data = {f'value_{data_type_str}': getattr(insert_stmt.inserted, f'value_{data_type_str}'),
+                                    # On update, reset all other value fields to None:
+                                    **{f'value_{dt}': None for dt in list(set(_dtypes) - {data_type_str})},
+                                    'analysis_uuid': insert_stmt.inserted.analysis_uuid,
+                                    'data_type': data_type_str}
+                upsert_stmt = insert_stmt.on_duplicate_key_update(update_attr_data)
+                session.execute(upsert_stmt)
+                session.commit()

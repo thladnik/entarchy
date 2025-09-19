@@ -6,9 +6,8 @@ from typing import Any, TYPE_CHECKING, Union
 import pandas as pd
 
 if TYPE_CHECKING:
-    from ..core.analysis import Analysis
     from ..core.entarchy import Entarchy
-    from ..core.entity import Entity, Collection
+    from ..core.entity import Analysis, Entity, Collection
 
 
 class Backend(object):
@@ -38,25 +37,31 @@ class Backend(object):
 
     # Entity related methods
 
-    def add_entities(self, _entities: list[Entity]) -> bool:
+    def add_entities(self,
+                     _entities: list[Entity]
+                     ) -> bool:
         raise NotImplementedError('')
 
-    def get_entity_by_uuid(self, _entarchy: Entarchy, _uuid: str) -> tuple[str, str]:
+    def get_entity_by_uuid(self,
+                           _entarchy: Entarchy,
+                           _uuid: str
+                           ) -> tuple[str, str]:
         raise NotImplementedError('')
 
-    def get_entity_last_time_modified(self, _entarchy: Entarchy, _uuid: str) -> datetime.datetime:
+    def get_entity_last_time_modified(self,
+                                      _entarchy: Entarchy,
+                                      _uuid: str
+                                      ) -> datetime.datetime:
         raise NotImplementedError('')
 
     def get_entity_of_type(self,
                            _entarchy: Entarchy,
-                           _analysis: Union[Analysis, None],
                            entity_type: str
                            ) -> list[tuple[str, str]]:
         raise NotImplementedError('')
 
     def get_multiple_attributes_of_entity(self,
                                           _entarchy: Entarchy,
-                                          _analysis: Union[Analysis, None],
                                           _uuid: str,
                                           names: list[str]
                                           ) -> tuple[Any, ...]:
@@ -64,7 +69,6 @@ class Backend(object):
 
     def get_single_attribute_of_entity(self,
                                        _entarchy: Entarchy,
-                                       _analysis: Union[Analysis, None],
                                        _uuid: str,
                                        name: str
                                        ) -> Any:
@@ -72,7 +76,6 @@ class Backend(object):
 
     def set_multiple_attributes_on_entity(self,
                                           _entarchy: Entarchy,
-                                          _analysis: Union[Analysis, None],
                                           _uuid: str,
                                           names: list[str],
                                           value: list[Any]):
@@ -80,7 +83,6 @@ class Backend(object):
 
     def set_single_attribute_on_entity(self,
                                        _entarchy: Entarchy,
-                                       _analysis: Union[Analysis, None],
                                        _uuid: str,
                                        name: str,
                                        value: Any):
@@ -114,8 +116,15 @@ class Backend(object):
     def get_multiple_attributes_of_collection(self,
                                               _entarchy: Entarchy,
                                               entity_type_name: str,
-                                              _analysis: Union[Analysis, None],
                                               as_tree: dict[str, ...],
                                               names: list[str]
                                               ) -> pd.DataFrame:
+        raise NotImplementedError('')
+
+    def set_multiple_attributes_on_collection(self,
+                                              _entarchy: Entarchy,
+                                              entity_type_name: str,
+                                              as_tree: dict[str, ...],
+                                              df: pd.DataFrame
+                                              ) -> None:
         raise NotImplementedError('')

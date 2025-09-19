@@ -10,7 +10,6 @@ import pandas as pd
 from . import query
 
 if TYPE_CHECKING:
-    from .analysis import Analysis
     from .entarchy import Entarchy
 
 
@@ -26,14 +25,12 @@ class Entity(object):
 
     def __init__(self,
                  _entarchy: Entarchy,
-                 _analysis: Analysis = None,
                  _uuid: str = None,
                  _id: str = None,
                  _parent: Entity = None,
                  _init_cache: dict[str, Any] = None):
 
         self._entarchy = _entarchy
-        self._analysis = _analysis
         self._uuid = _uuid
         self._id = _id
         self._parent = _parent
@@ -59,7 +56,7 @@ class Entity(object):
                 raise TypeError('_init_cache must be a dictionary of attribute names and values.')
             self._attribute_cache.update(_init_cache)
 
-    def __new__(cls, _entarchy, _analysis=None, _uuid=None, _id=None, _parent=None, _init_cache=None):
+    def __new__(cls, _entarchy, _uuid=None, _id=None, _parent=None, _init_cache=None):
 
         if _uuid is not None and _uuid in _entarchy:
             obj = _entarchy.get_entity_by_uuid(_uuid)
@@ -97,20 +94,31 @@ class Entity(object):
             if not all(isinstance(k, str) for k in item):
                 raise TypeError('List or tuple of items must contain only strings.')
 
-            return self._entarchy.backend.has_multiple_attributes(self._entarchy, self._analysis, self._uuid, item)
+            return self._entarchy.backend.has_multiple_attributes(self._entarchy, self._uuid, item)
 
-        return self._entarchy.backend.has_single_attribute(self._entarchy, self._analysis, self._uuid, item)
+        return self._entarchy.backend.has_single_attribute(self._entarchy, self._uuid, item)
 
     def __enter__(self):
         # Set context flag
         self._is_in_context = True
+
+        # Set current analysis if applicable
+        if isinstance(self, Analysis):
+            self._prev_analysis = self._entarchy.current_analysis
+            self._entarchy.set_current_analysis(self)
+
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         # Commit any pending changes
         self.commit()
+
         # Reset context flag
         self._is_in_context = False
+
+        # Reset current analysis if applicable
+        self._entarchy.set_current_analysis(self._prev_analysis)
+        self._prev_analysis = None
 
     def __hash__(self):
         return self.uuid
@@ -153,9 +161,10 @@ class Entity(object):
         keys_to_load = list(set(key) - set(self._attribute_cache.keys()))
         if len(keys_to_load) > 0:
             if len(keys_to_load) == 1:
-                values = [self._entarchy.backend.get_single_attribute_of_entity(self._entarchy, self._analysis, self.uuid, keys_to_load[0])]
+                values = [
+                    self._entarchy.backend.get_single_attribute_of_entity(self._entarchy, self.uuid, keys_to_load[0])]
             else:
-                values = self._entarchy.backend.get_multiple_attributes_of_entity(self._entarchy, self._analysis, self.uuid, keys_to_load)
+                values = self._entarchy.backend.get_multiple_attributes_of_entity(self._entarchy, self.uuid, keys_to_load)
 
             # Update cache
             for k, v in zip(keys_to_load, values):
@@ -172,7 +181,7 @@ class Entity(object):
     def __repr__(self):
         return f'{self.__class__.__name__}(id=\'{self.id}\' uuid=\'{self.uuid}\')'
 
-    def __setitem__(self, key: Union[str, list[str], tuple[str, ...]] , value: Any):
+    def __setitem__(self, key: Union[str, list[str], tuple[str, ...]], value: Any):
         """Set a dynamic attribute on the entity.
 
         Dynamic attribute keys must always be strings.
@@ -282,9 +291,15 @@ class Entity(object):
         names = self._attributes_to_update
         values = [self._attribute_cache[n] for n in names]
         if len(names) > 1:
-            res = self._entarchy.backend.set_multiple_attributes_on_entity(self._entarchy, self._analysis, self.uuid, names, values)
+            res = self._entarchy.backend.set_multiple_attributes_on_entity(self._entarchy,
+                                                                           self.uuid,
+                                                                           names,
+                                                                           values)
         else:
-            res = self._entarchy.backend.set_single_attribute_on_entity(self._entarchy, self._analysis, self.uuid, names[0], values[0])
+            res = self._entarchy.backend.set_single_attribute_on_entity(self._entarchy,
+                                                                        self.uuid,
+                                                                        names[0],
+                                                                        values[0])
 
         if not res:
             raise RuntimeError(f'Failed to update entity attributes {names} in backend.')
@@ -293,6 +308,11 @@ class Entity(object):
         self._attributes_to_update = []
         # Remove entity from entarchy update list
         self._entarchy.remove_entity_from_update(self)
+
+
+class Analysis(Entity):
+
+    pass
 
 
 class Collection(object):
@@ -313,7 +333,9 @@ class Collection(object):
         self._pending_changes: dict[str, list[int]] = {}
 
     def __len__(self):
-        return self._entarchy.backend.get_entity_count_of_collection(self._entarchy, self.entity_type.__name__, self.as_tree)
+        return self._entarchy.backend.get_entity_count_of_collection(self._entarchy,
+                                                                     self.entity_type.__name__,
+                                                                     self.as_tree)
 
     def __repr__(self):
         return f'Collection(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
@@ -327,14 +349,19 @@ class Collection(object):
             if item < 0:
                 item = len(self) + item
 
-            _uuid, _id = self._entarchy.backend.get_entity_of_collection_by_index(self._entarchy, self.entity_type.__name__, self.as_tree, item)
+            _uuid, _id = self._entarchy.backend.get_entity_of_collection_by_index(self._entarchy,
+                                                                                  self.entity_type.__name__,
+                                                                                  self.as_tree, item)
             return self._get_entity(_uuid=_uuid, _id=_id)
 
         # Return slice
         elif isinstance(item, slice):
 
             # Get data
-            res = self._entarchy.backend.get_entity_of_collection_by_slice(self._entarchy, self.entity_type.__name__, self.as_tree, item)
+            res = self._entarchy.backend.get_entity_of_collection_by_slice(self._entarchy,
+                                                                           self.entity_type.__name__,
+                                                                           self.as_tree,
+                                                                           item)
 
             result = [self._get_entity(_uuid=_uuid, _id=_id) for _uuid, _id in res]
 
@@ -493,7 +520,6 @@ class Collection(object):
         # Load attributes from backend
         df = self._entarchy.backend.get_multiple_attributes_of_collection(self._entarchy,
                                                                           self.entity_type.__name__,
-                                                                          None,
                                                                           self.as_tree,
                                                                           attribute_names)
 
@@ -526,3 +552,16 @@ class Collection(object):
         #     return self._cache.loc[self._pk_order, attribute_names]
 
         return self._cache[attribute_names].copy()
+
+    def update(self, df: pd.DataFrame):
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError('df must be a pandas DataFrame.')
+
+        # Update cache
+        self._cache.update(df)
+
+        # Send to backend
+        self._entarchy.backend.set_multiple_attributes_on_collection(self._entarchy,
+                                                                     self.entity_type.__name__,
+                                                                     self.as_tree,
+                                                                     df)

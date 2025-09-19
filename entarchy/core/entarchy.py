@@ -6,12 +6,12 @@ import os
 import pathlib
 import pprint
 import sys
-from typing import Any, Type, TYPE_CHECKING
+from typing import Any, Type, TYPE_CHECKING, Union
 
 import yaml
 
 from . import query
-from .entity import Collection, Entity
+from .entity import Analysis, Entity, Collection
 
 if TYPE_CHECKING:
     from ..backend.backend import Backend
@@ -28,6 +28,7 @@ class Entarchy:
     _backend: Backend = None
     _config: dict[str, Any] = None
     _is_in_context: bool = False
+    _current_analysis: Union[Analysis, None] = None
 
     def __init__(self, path: str, debug: bool = False):
         self._path = pathlib.Path(path).absolute().as_posix()
@@ -128,6 +129,7 @@ class Entarchy:
                 _add_to_hierarchy(child_type, parent_dict[entity_type.__name__])
 
         _add_to_hierarchy(cls._hierarchy_root, _hierarchy)
+        _hierarchy['Analysis'] = {}
 
         # Check if path exists, otherwise create
         if os.path.exists(path):
@@ -219,6 +221,15 @@ class Entarchy:
 
         for _uuid in self._entities_to_update:
             self._entities[_uuid].commit()
+
+    @property
+    def current_analysis(self) -> Union[Analysis, None]:
+        """Get the current analysis for the entarchy system.
+
+        Returns:
+            Union[Analysis, None]: The current analysis, or None if no analysis is set.
+        """
+        return self._current_analysis
 
     def delete(self):
 
@@ -322,6 +333,35 @@ class Entarchy:
         else:
             entity_data = self.backend.get_entity_by_uuid(self, _uuid)
             return Entity(_entarchy=self, _uuid=entity_data[0], _id=entity_data[1])
+
+    def set_current_analysis(self, _analysis: Union[Analysis, str]) -> None:
+        """Set the current analysis for the entarchy system.
+
+        Args:
+            _analysis (Union[Analysis, str]): The analysis to set as current, or its UUID.
+
+        Returns:
+            None
+        """
+
+        if isinstance(_analysis, str):
+            res = self.backend.get_entity_of_type(self, 'Analysis')
+
+            # Check string against id
+            existing_data = [r for r in res if r[1] == _analysis]
+
+            if len(existing_data) == 0:
+                _analysis_entity = Analysis(self, _id=_analysis)
+                self.add_new_entity(_analysis_entity)
+                self.commit()
+            else:
+                _analysis_entity = Analysis(self, _id=_analysis)
+        elif isinstance(_analysis, Analysis):
+            _analysis_entity = _analysis
+        else:
+            raise ValueError(f'Invalid analysis type {type(_analysis)}. Must be of type Analysis or str.')
+
+        self._current_analysis = _analysis_entity
 
     def remove_entity_from_update(self, entity: Entity) -> None:
         """Unmark an entity for update in the backend.
