@@ -8,6 +8,7 @@ import pprint
 import sys
 from typing import Any, Type, TYPE_CHECKING, Union
 
+import alive_progress
 import yaml
 
 from . import query
@@ -20,8 +21,10 @@ if TYPE_CHECKING:
 class Entarchy:
     """Entarchy is a class that represents a system of hierarchically organized entities.
     """
-    _base_version: str = '0.1'
-    _implementation_version: str
+    base_version: str = '0.1'
+    base_min_compat_version = '0.1'
+    implementation_version: str
+    implementation_min_compat_version: str
 
     _hierarchy_root: Type[Entity]
 
@@ -48,6 +51,8 @@ class Entarchy:
         self._entities_to_add: list[str] = []
         self._entities_to_update: list[str] = []
 
+        self.roi_count = 0
+        self.roi_attr_update_count = 0
         print(f'{self} opened with backend {_backend_path}')
 
     def __contains__(self, item):
@@ -142,8 +147,8 @@ class Entarchy:
         print('---')
 
         _config = {
-            'base_version': cls._base_version,
-            'implementation_version': cls._implementation_version,
+            'base_version': cls.base_version,
+            'implementation_version': cls.implementation_version,
             'backend': f'{_backend.__module__}.{_backend.__class__.__name__}',
             'backend_config': _backend.get_config(),
             'hierarchy': _hierarchy
@@ -209,18 +214,26 @@ class Entarchy:
         Returns:
             None
         """
-        if len(self._entities_to_add) == 0:
-            return
 
         # Add new entities
-        res = self._backend.add_entities([self._entities[_uuid] for _uuid in self._entities_to_add])
-        if not res:
-            raise RuntimeError('Failed to add new entities to backend.')
+        if len(self._entities_to_add) > 0:
 
-        self._entities_to_add = []
+            res = self._backend.add_entities([self._entities[_uuid] for _uuid in self._entities_to_add])
+            if not res:
+                raise RuntimeError('Failed to add new entities to backend.')
 
-        for _uuid in self._entities_to_update:
-            self._entities[_uuid].commit()
+            # Reset list
+            self._entities_to_add = []
+
+        # Commit updates for entities with attribute changes
+        #  Note to future self: USE COPY, otherwise iterator is going to
+        #  skip entries as the length of the list changes while updated elements are removed
+        _entities_to_update = self._entities_to_update.copy()
+        with alive_progress.alive_bar(monitor=f'| Update {len(_entities_to_update)} entities',
+                                      monitor_end=f'Updated {len(_entities_to_update)} entities',
+                                      bar=None, spinner='fish2', spinner_length=30, stats=False) as _:
+            for _uuid in _entities_to_update:
+                self._entities[_uuid].commit()
 
     @property
     def current_analysis(self) -> Union[Analysis, None]:

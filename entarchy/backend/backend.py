@@ -76,14 +76,14 @@ class Backend(object):
 
     def set_multiple_attributes_on_entity(self,
                                           _entarchy: Entarchy,
-                                          _uuid: str,
+                                          _entity_uuid: str,
                                           names: list[str],
                                           value: list[Any]):
         raise NotImplementedError('')
 
     def set_single_attribute_on_entity(self,
                                        _entarchy: Entarchy,
-                                       _uuid: str,
+                                       _entity_uuid: str,
                                        name: str,
                                        value: Any):
         raise NotImplementedError('')

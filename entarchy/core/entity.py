@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime
 import uuid
-from typing import Any, Type, Union, TYPE_CHECKING
+from typing import Any, Iterable, Type, Union, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -104,7 +104,7 @@ class Entity(object):
 
         # Set current analysis if applicable
         if isinstance(self, Analysis):
-            self._prev_analysis = self._entarchy.current_analysis
+            setattr(self, '__prev_analysis', self._entarchy.current_analysis)
             self._entarchy.set_current_analysis(self)
 
         return self
@@ -117,8 +117,9 @@ class Entity(object):
         self._is_in_context = False
 
         # Reset current analysis if applicable
-        self._entarchy.set_current_analysis(self._prev_analysis)
-        self._prev_analysis = None
+        if hasattr(self, '__prev_analysis'):
+            self._entarchy.set_current_analysis(getattr(self, '__prev_analysis'))
+            delattr(self, '__prev_analysis')
 
     def __hash__(self):
         return self.uuid
@@ -181,11 +182,11 @@ class Entity(object):
     def __repr__(self):
         return f'{self.__class__.__name__}(id=\'{self.id}\' uuid=\'{self.uuid}\')'
 
-    def __setitem__(self, key: Union[str, list[str], tuple[str, ...]], value: Any):
+    def __setitem__(self, key: Union[str, list[str]], value: Any):
         """Set a dynamic attribute on the entity.
 
         Dynamic attribute keys must always be strings.
-        Using a list or tuple of strings will expect the values to be a list or tuple of the same length.
+        Using a list of strings it's expected that the values to be a list or tuple of the same length.
 
         Args:
             key (str or list of str): The key(s) for the attribute(s) to set.
@@ -217,7 +218,9 @@ class Entity(object):
 
         # Update attribute(s) in cache and mark for update
         for k, v in zip(key, value):
+
             self._attribute_cache[k] = v
+
             if k not in self._attributes_to_update:
                 self._attributes_to_update.append(k)
 
@@ -285,29 +288,29 @@ class Entity(object):
 
     def commit(self):
 
-        if len(self._attributes_to_update) == 0:
-            return
-
-        names = self._attributes_to_update
-        values = [self._attribute_cache[n] for n in names]
-        if len(names) > 1:
-            res = self._entarchy.backend.set_multiple_attributes_on_entity(self._entarchy,
-                                                                           self.uuid,
-                                                                           names,
-                                                                           values)
-        else:
-            res = self._entarchy.backend.set_single_attribute_on_entity(self._entarchy,
-                                                                        self.uuid,
-                                                                        names[0],
-                                                                        values[0])
-
-        if not res:
-            raise RuntimeError(f'Failed to update entity attributes {names} in backend.')
-
-        # Reset list
-        self._attributes_to_update = []
         # Remove entity from entarchy update list
         self._entarchy.remove_entity_from_update(self)
+
+        if len(self._attributes_to_update) > 0:
+
+            names = self._attributes_to_update
+            values = [self._attribute_cache[n] for n in names]
+            if len(names) > 1:
+                res = self._entarchy.backend.set_multiple_attributes_on_entity(self._entarchy,
+                                                                               self.uuid,
+                                                                               names,
+                                                                               values)
+            else:
+                res = self._entarchy.backend.set_single_attribute_on_entity(self._entarchy,
+                                                                            self.uuid,
+                                                                            names[0],
+                                                                            values[0])
+
+            if not res:
+                raise RuntimeError(f'Failed to update entity attributes {names} in backend.')
+
+            # Reset list
+            self._attributes_to_update = []
 
 
 class Analysis(Entity):
@@ -407,6 +410,10 @@ class Collection(object):
             collection_c = collection_a + collection_b
         """
 
+        if len(self.as_tree) == 0 or len(other.as_tree) == 0:
+            raise RuntimeError('One of the AS trees is empty. '
+                               'Cannot find union of universal set.')
+
         if not isinstance(other, Collection):
             raise TypeError('Can only add another Collection instance.')
 
@@ -429,6 +436,10 @@ class Collection(object):
             collection_c = collection_a & collection_b
         """
 
+        if len(self.as_tree) == 0 or len(other.as_tree) == 0:
+            raise RuntimeError('One of the AS trees is empty. '
+                               'Cannot find intersection of universal set.')
+
         if not isinstance(other, Collection):
             raise TypeError('Can only intersect with another Collection instance.')
 
@@ -447,6 +458,10 @@ class Collection(object):
             collection_b = ~collection_a
         """
 
+        if len(self.as_tree) == 0:
+            raise RuntimeError('AS tree is empty. '
+                               'Cannot find complement of universal set.')
+
         # Invert and return new collection
         new_tree = query.combine_trees('COMPLEMENT', self.as_tree)
         return Collection(self.entity_type, self._entarchy, new_tree)
@@ -462,6 +477,10 @@ class Collection(object):
             collection_b = Collection(EntityTypeA, entarchy, query_b)
             collection_c = collection_a - collection_b
         """
+
+        if len(self.as_tree) == 0 or len(other.as_tree) == 0:
+            raise RuntimeError('One of the AS trees is empty. '
+                               'Cannot find difference of universal set.')
 
         if not isinstance(other, Collection):
             raise TypeError('Can only subtract another Collection instance.')
@@ -484,6 +503,10 @@ class Collection(object):
             collection_b = Collection(EntityTypeA, entarchy, query_b)
             collection_c = collection_a ^ collection_b
         """
+
+        if len(self.as_tree) == 0 or len(other.as_tree) == 0:
+            raise RuntimeError('One of the AS trees is empty. '
+                               'Cannot perform symmetric difference on universal set.')
 
         if not isinstance(other, Collection):
             raise TypeError('Can only xor with another Collection instance.')
