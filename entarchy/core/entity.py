@@ -48,7 +48,7 @@ class Entity(object):
         self._attributes_to_update: list[str] = []
 
         # Add entity to entarchy object
-        self._entarchy.add_existing_entity(self)
+        self.entarchy.add_existing_entity(self)
 
         # Initialize cache if provided
         if _init_cache is not None:
@@ -86,6 +86,7 @@ class Entity(object):
         """
 
         # TODO: also refer to cache
+        raise NotImplementedError('')
 
         if not isinstance(item, (str, list, tuple)):
             raise TypeError('Item must be a string or list or tuple of strings.')
@@ -94,9 +95,9 @@ class Entity(object):
             if not all(isinstance(k, str) for k in item):
                 raise TypeError('List or tuple of items must contain only strings.')
 
-            return self._entarchy.backend.has_multiple_attributes(self._entarchy, self._uuid, item)
+            return self.entarchy.backend.has_multiple_attributes(self, item)
 
-        return self._entarchy.backend.has_single_attribute(self._entarchy, self._uuid, item)
+        return self.entarchy.backend.has_single_attribute(self, item)
 
     def __enter__(self):
         # Set context flag
@@ -104,8 +105,8 @@ class Entity(object):
 
         # Set current analysis if applicable
         if isinstance(self, Analysis):
-            setattr(self, '__prev_analysis', self._entarchy.current_analysis)
-            self._entarchy.set_current_analysis(self)
+            setattr(self, '__prev_analysis', self.entarchy.current_analysis)
+            self.entarchy.set_current_analysis(self)
 
         return self
 
@@ -118,7 +119,7 @@ class Entity(object):
 
         # Reset current analysis if applicable
         if hasattr(self, '__prev_analysis'):
-            self._entarchy.set_current_analysis(getattr(self, '__prev_analysis'))
+            self.entarchy.set_current_analysis(getattr(self, '__prev_analysis'))
             delattr(self, '__prev_analysis')
 
     def __hash__(self):
@@ -152,7 +153,7 @@ class Entity(object):
 
         # Reset attribute cache if any key is in cache and entity is dirty
         if any([k in self._attribute_cache for k in key]):
-            modified = self._entarchy.backend.get_entity_last_time_modified(self._entarchy, self.uuid)
+            modified = self.entarchy.backend.get_entity_last_time_modified(self)
 
             if modified > self._attribute_cache_start_time:
                 self._attribute_cache_start_time = datetime.datetime.utcnow()
@@ -163,9 +164,9 @@ class Entity(object):
         if len(keys_to_load) > 0:
             if len(keys_to_load) == 1:
                 values = [
-                    self._entarchy.backend.get_single_attribute_of_entity(self._entarchy, self.uuid, keys_to_load[0])]
+                    self.entarchy.backend.get_single_attribute_of_entity(self, keys_to_load[0])]
             else:
-                values = self._entarchy.backend.get_multiple_attributes_of_entity(self._entarchy, self.uuid, keys_to_load)
+                values = self.entarchy.backend.get_multiple_attributes_of_entity(self, keys_to_load)
 
             # Update cache
             for k, v in zip(keys_to_load, values):
@@ -224,10 +225,10 @@ class Entity(object):
             if k not in self._attributes_to_update:
                 self._attributes_to_update.append(k)
 
-        self._entarchy.add_entity_for_update(self)
+        self.entarchy.add_entity_for_update(self)
 
         # If not in context, update immediately
-        if not self.is_in_context and not self._entarchy.is_in_context:
+        if not self.is_in_context and not self.entarchy.is_in_context:
             self.commit()
 
     @classmethod
@@ -249,6 +250,10 @@ class Entity(object):
     def get_child_entity_types(cls):
         # return [globals()[c] if isinstance(c, str) else c for c in cls._child_entity_types] Does not work yet for str
         return cls._child_entity_types
+
+    @property
+    def entarchy(self) -> Entarchy:
+        return self._entarchy
 
     @property
     def id(self) -> str:
@@ -289,22 +294,16 @@ class Entity(object):
     def commit(self):
 
         # Remove entity from entarchy update list
-        self._entarchy.remove_entity_from_update(self)
+        self.entarchy.remove_entity_from_update(self)
 
         if len(self._attributes_to_update) > 0:
 
             names = self._attributes_to_update
             values = [self._attribute_cache[n] for n in names]
             if len(names) > 1:
-                res = self._entarchy.backend.set_multiple_attributes_on_entity(self._entarchy,
-                                                                               self.uuid,
-                                                                               names,
-                                                                               values)
+                res = self.entarchy.backend.set_multiple_attributes_on_entity(self, names, values)
             else:
-                res = self._entarchy.backend.set_single_attribute_on_entity(self._entarchy,
-                                                                            self.uuid,
-                                                                            names[0],
-                                                                            values[0])
+                res = self.entarchy.backend.set_single_attribute_on_entity(self, names[0], values[0])
 
             if not res:
                 raise RuntimeError(f'Failed to update entity attributes {names} in backend.')
@@ -334,11 +333,10 @@ class Collection(object):
 
         self._cache = pd.DataFrame()
         self._pending_changes: dict[str, list[int]] = {}
+        self._init_time = datetime.datetime.utcnow()
 
     def __len__(self):
-        return self._entarchy.backend.get_entity_count_of_collection(self._entarchy,
-                                                                     self.entity_type.__name__,
-                                                                     self.as_tree)
+        return self.entarchy.backend.get_entity_count_of_collection(self)
 
     def __repr__(self):
         return f'Collection(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
@@ -352,19 +350,14 @@ class Collection(object):
             if item < 0:
                 item = len(self) + item
 
-            _uuid, _id = self._entarchy.backend.get_entity_of_collection_by_index(self._entarchy,
-                                                                                  self.entity_type.__name__,
-                                                                                  self.as_tree, item)
+            _uuid, _id = self.entarchy.backend.get_entity_of_collection_by_index(self, item)
             return self._get_entity(_uuid=_uuid, _id=_id)
 
         # Return slice
         elif isinstance(item, slice):
 
             # Get data
-            res = self._entarchy.backend.get_entity_of_collection_by_slice(self._entarchy,
-                                                                           self.entity_type.__name__,
-                                                                           self.as_tree,
-                                                                           item)
+            res = self.entarchy.backend.get_entity_of_collection_by_slice(self, item)
 
             result = [self._get_entity(_uuid=_uuid, _id=_id) for _uuid, _id in res]
 
@@ -422,7 +415,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('UNION', self.as_tree, other.as_tree)
-        return Collection(self.entity_type, self._entarchy, new_tree)
+        return Collection(self.entity_type, self.entarchy, new_tree)
 
     def __and__(self, other):
         """Create a new collection that is the intersection between this collection and another.
@@ -448,7 +441,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('INTERSECTION', self.as_tree, other.as_tree)
-        return Collection(self.entity_type, self._entarchy, new_tree)
+        return Collection(self.entity_type, self.entarchy, new_tree)
 
     def __invert__(self):
         """Create a new collection that is the complement of this collection.
@@ -464,7 +457,7 @@ class Collection(object):
 
         # Invert and return new collection
         new_tree = query.combine_trees('COMPLEMENT', self.as_tree)
-        return Collection(self.entity_type, self._entarchy, new_tree)
+        return Collection(self.entity_type, self.entarchy, new_tree)
 
     def __sub__(self, other):
         """Create a new collection that is the difference between this collection and another.
@@ -490,7 +483,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('DIFFERENCE', self.as_tree, other.as_tree)
-        return Collection(self.entity_type, self._entarchy, new_tree)
+        return Collection(self.entity_type, self.entarchy, new_tree)
 
     def __xor__(self, other):
         """Create a new collection that is the symmetric difference between this collection and another.
@@ -516,7 +509,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('SYMMETRIC_DIFFERENCE', self.as_tree, other.as_tree)
-        return Collection(self.entity_type, self._entarchy, new_tree)
+        return Collection(self.entity_type, self.entarchy, new_tree)
 
     # Properties
 
@@ -527,8 +520,16 @@ class Collection(object):
         return self._as_tree.copy()
 
     @property
+    def entarchy(self) -> Entarchy:
+        return self._entarchy
+
+    @property
     def entity_type(self):
         return self._entity_type
+
+    @property
+    def init_time(self) -> datetime.datetime:
+        return self._init_time
 
     def _get_entity(self, _uuid: str, _id: str) -> Entity:
 
@@ -536,15 +537,12 @@ class Collection(object):
         if _uuid in self._cache.index:
             _init_cache = self._cache.loc[_uuid].to_dict()
 
-        return self.entity_type(_entarchy=self._entarchy, _uuid=_uuid, _id=_id, _init_cache=_init_cache)
+        return self.entity_type(_entarchy=self.entarchy, _uuid=_uuid, _id=_id, _init_cache=_init_cache)
 
     def _load_attributes(self, attribute_names: list[str]):
 
         # Load attributes from backend
-        df = self._entarchy.backend.get_multiple_attributes_of_collection(self._entarchy,
-                                                                          self.entity_type.__name__,
-                                                                          self.as_tree,
-                                                                          attribute_names)
+        df = self.entarchy.backend.get_multiple_attributes_of_collection(self, attribute_names)
 
         # Update cache
         self._cache[df.columns] = df
@@ -563,7 +561,7 @@ class Collection(object):
                 _attributes_cached = []
                 _attributes_to_fetch = attribute_names
 
-            if self._entarchy.debug:
+            if self.entarchy.debug:
                 print('Cached attributes:', _attributes_cached)
                 print('Attributes to fetch: ', _attributes_to_fetch)
 
@@ -584,7 +582,4 @@ class Collection(object):
         self._cache.update(df)
 
         # Send to backend
-        self._entarchy.backend.set_multiple_attributes_on_collection(self._entarchy,
-                                                                     self.entity_type.__name__,
-                                                                     self.as_tree,
-                                                                     df)
+        self.entarchy.backend.set_multiple_attributes_on_collection(self, df)

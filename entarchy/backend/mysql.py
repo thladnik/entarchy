@@ -16,7 +16,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.orm.base import attribute_str
 
 from .backend import Backend
-from .. import Analysis, Entarchy, Entity
+from .. import Analysis, Collection, Entarchy, Entity
 
 
 class Base(DeclarativeBase):
@@ -94,23 +94,29 @@ class AttributeTable(Base):
         return f"<Attribute({self.name}, {self.entity})>"
 
 
-def _build_query_from_as_tree(entity_type_name: str,
-                              session: sqlalchemy.orm.Session,
-                              as_tree: dict[str, ...]) -> sqlalchemy.orm.Query:
+def _build_query_from_collection(_collection: Collection,
+                                 _session: sqlalchemy.orm.Session
+                                 ) -> sqlalchemy.orm.Query:
+
+    entity_type_name = _collection.entity_type.__name__
+    as_tree = _collection.as_tree
+    creation_time = _collection.init_time
+
     # Create base query
-    _query = session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
+    _query = _session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
+    _query = _query.filter(EntityTable.created <= creation_time)
 
     # Apply filters generated from the abstract syntax tree
     if len(as_tree) == 0:
         return _query
 
-    filters = _generate_attribute_filters(entity_type_name, session, as_tree)
+    filters = _generate_attribute_filters(entity_type_name, _session, as_tree)
 
     return _query.filter(filters)
 
 
 def _generate_attribute_filters(entity_type_name: str,
-                                session: sqlalchemy.orm.Session,
+                                _session: sqlalchemy.orm.Session,
                                 as_tree: dict[str, ...]) -> Any:
 
     _operator = as_tree['operator'].upper()
@@ -120,8 +126,8 @@ def _generate_attribute_filters(entity_type_name: str,
         # TODO: implement XOR? Very costly to do like this in SQL // see entarchy.core.query.combine_trees
         #        Requires at least OR + 2xAND + NOT
         _op_fun = {'AND': sqlalchemy.and_, 'OR': sqlalchemy.or_}[_operator]
-        return _op_fun(_generate_attribute_filters(entity_type_name, session, as_tree['left_operand']),
-                       _generate_attribute_filters(entity_type_name, session, as_tree['right_operand']))
+        return _op_fun(_generate_attribute_filters(entity_type_name, _session, as_tree['left_operand']),
+                       _generate_attribute_filters(entity_type_name, _session, as_tree['right_operand']))
 
     # Handle comparisons
     elif _operator in ('IN', '<=', '<', '==', '>', '>='):
@@ -152,7 +158,7 @@ def _generate_attribute_filters(entity_type_name: str,
             comparison = _op_fun(attribute_value_col, value)
 
         # Build the subquery to filter entities matching the comparison
-        subquery = (session.query(AttributeTable.entity_uuid)
+        subquery = (_session.query(AttributeTable.entity_uuid)
                     .filter(AttributeTable.name == name, comparison)
                     .join(EntityTable)
                     .join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
@@ -161,12 +167,12 @@ def _generate_attribute_filters(entity_type_name: str,
     # Handle unary operators
 
     elif _operator == 'EXIST':
-        subquery = (session.query(AttributeTable.entity_uuid)
+        subquery = (_session.query(AttributeTable.entity_uuid)
                     .filter(AttributeTable.name == as_tree['right_operand'])
                     .subquery())
 
     elif _operator == 'NOT':
-        return sqlalchemy.not_(_generate_attribute_filters(entity_type_name, session, as_tree['right_operand']))
+        return sqlalchemy.not_(_generate_attribute_filters(entity_type_name, _session, as_tree['right_operand']))
 
     # Fallback
     else:
@@ -174,7 +180,7 @@ def _generate_attribute_filters(entity_type_name: str,
         raise ValueError('Unexpected operator in the expression tree')
 
     # Return the `IN` filter to apply to the main query
-    return EntityTable.uuid.in_(session.query(subquery.c.entity_uuid))
+    return EntityTable.uuid.in_(_session.query(subquery.c.entity_uuid))
 
 
 def _read_data_from_attribute_row(row: AttributeTable):
@@ -430,9 +436,7 @@ class MySQLBackend(Backend):
 
     # Entity related methods
 
-    def add_entities(self,
-                     _entities: list[Entity]
-                     ) -> bool:
+    def add_entities(self, _entities: list[Entity]) -> bool:
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
@@ -458,11 +462,9 @@ class MySQLBackend(Backend):
 
         return True
 
-    def get_entity_by_uuid(self,
-                           _entarchy: Entarchy,
-                           entity_uuid: str
-                           ) -> tuple[str, str]:
+    def get_entity_by_uuid(self, _entity: Entity) -> tuple[str, str]:
 
+        entity_uuid = _entity.uuid
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
             query = session.query(EntityTable).filter(EntityTable.uuid == entity_uuid)
@@ -477,10 +479,9 @@ class MySQLBackend(Backend):
 
         return row.uuid, row.id
 
-    def get_entity_last_time_modified(self,
-                                      _entarchy: Entarchy,
-                                      entity_uuid: str
-                                      ) -> datetime:
+    def get_entity_last_time_modified(self, _entity: Entity) -> datetime:
+
+        entity_uuid = _entity.uuid
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
@@ -496,10 +497,7 @@ class MySQLBackend(Backend):
 
         return row.modified
 
-    def get_entity_of_type(self,
-                           _entarchy: Entarchy,
-                           entity_type: str
-                           ) -> list[tuple[str, str]]:
+    def get_entity_of_type(self, entity_type: str) -> list[tuple[str, str]]:
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
             query = (session.query(EntityTable)
@@ -512,11 +510,9 @@ class MySQLBackend(Backend):
 
             return [(row.uuid, row.id) for row in query.all()]
 
-    def get_multiple_attributes_of_entity(self,
-                                          _entarchy: Entarchy,
-                                          entity_uuid: str,
-                                          names: list[str]
-                                          ) -> tuple[Any, ...]:
+    def get_multiple_attributes_of_entity(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
+
+        entity_uuid = _entity.uuid
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
@@ -538,20 +534,14 @@ class MySQLBackend(Backend):
 
         return values
 
-    def get_single_attribute_of_entity(self,
-                                       _entarchy: Entarchy,
-                                       entity_uuid: str,
-                                       name: str
-                                       ) -> Any:
+    def get_single_attribute_of_entity(self, _entity: Entity, name: str) -> Any:
 
-        return self.get_multiple_attributes_of_entity(_entarchy, entity_uuid, [name])[0]
+        return self.get_multiple_attributes_of_entity(_entity, [name])[0]
 
-    def set_multiple_attributes_on_entity(self,
-                                          _entarchy: Entarchy,
-                                          entity_uuid: str,
-                                          names: list[str],
-                                          values: list[Any]
-                                          ) -> tuple[bool, str]:
+    def set_multiple_attributes_on_entity(self, _entity: Entity, names: list[str], values: list[Any]) -> tuple[bool, str]:
+
+        _entarchy = _entity.entarchy
+        entity_uuid = _entity.uuid
 
         _analysis_uuid = None
         if _entarchy.current_analysis is not None:
@@ -597,60 +587,45 @@ class MySQLBackend(Backend):
 
             return True, ''
 
-    def set_single_attribute_on_entity(self,
-                                       _entarchy: Entarchy,
-                                       entity_uuid, key: str,
-                                       value: Any):
+    def set_single_attribute_on_entity(self, entity_uuid, key: str, value: Any):
 
-        self.set_multiple_attributes_on_entity(_entarchy, entity_uuid, [key], [value])
+        self.set_multiple_attributes_on_entity(entity_uuid, [key], [value])
 
         return True, ''
 
     # Collection related methods
 
-    def get_entity_count_of_collection(self,
-                                       _entarchy: Entarchy,
-                                       entity_type_name: str,
-                                       as_tree: dict[str, ...]
-                                       ) -> int:
+    def get_entity_count_of_collection(self, _collection: Collection, creation_time: datetime = None) -> int:
 
         # Fetch result
         with sqlalchemy.orm.Session(self.sql_engine) as session:
-            query = _build_query_from_as_tree(entity_type_name, session, as_tree)
+            query = _build_query_from_collection(_collection, session)
 
             res = query.count()
 
             return res
 
-    def get_entity_of_collection_by_index(self,
-                                          _entarchy: Entarchy,
-                                          entity_type_name: str,
-                                          as_tree: dict[str, ...],
-                                          index: int
-                                          ) -> tuple[str, str]:
+    def get_entity_of_collection_by_index(self, _collection: Collection, index: int, creation_time: datetime = None) -> tuple[str, str]:
 
         # Fetch result
         with sqlalchemy.orm.Session(self.sql_engine) as session:
-            query = _build_query_from_as_tree(entity_type_name, session, as_tree)
+            query = _build_query_from_collection(_collection, session)
 
             res = query.order_by(EntityTable.uuid).offset(index).limit(1).one()
 
         return res.uuid, res.id
 
-    def get_entity_of_collection_by_slice(self,
-                                          _entarchy: Entarchy,
-                                          entity_type_name: str,
-                                          as_tree: dict[str, ...],
-                                          _slice: slice
-                                          ) -> list[tuple[str, str]]:
+    def get_entity_of_collection_by_slice(self, _collection: Collection, _slice: slice) -> list[tuple[str, str]]:
+
+        entity_type_name = _collection.entity_type.__name__
 
         # Calculate indices
-        count = self.get_entity_count_of_collection(_entarchy, entity_type_name, as_tree)
+        count = self.get_entity_count_of_collection(_collection, entity_type_name)
         start, stop, step = _slice.indices(count)
 
         # Fetch result
         with sqlalchemy.orm.Session(self.sql_engine) as session:
-            query = _build_query_from_as_tree(entity_type_name, session, as_tree)
+            query = _build_query_from_collection(_collection, session)
 
             res = query.order_by(EntityTable.uuid).offset(start).limit(stop - start).all()
 
@@ -658,18 +633,15 @@ class MySQLBackend(Backend):
         #        but it's not clear how is would work in SQLAlchemy ORM; figure out later
         return [(r.uuid, r.id) for r in res[::step]]
 
-    def get_multiple_attributes_of_collection(self,
-                                              _entarchy: Entarchy,
-                                              entity_type_name: str,
-                                              as_tree: dict[str, ...],
-                                              names: list[str]
-                                              ) -> pd.DataFrame:
+    def get_multiple_attributes_of_collection(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
+
+        entity_type_name = _collection.entity_type.__name__
 
         # Fetch result
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
             # Get entity query for collection
-            entity_query = _build_query_from_as_tree(entity_type_name, session, as_tree)
+            entity_query = _build_query_from_collection(_collection, session)
 
             # Get attribute types for requested names
             attribute_types = {}
@@ -756,12 +728,9 @@ class MySQLBackend(Backend):
 
         return df
 
-    def set_multiple_attributes_on_collection(self,
-                                              _entarchy: Entarchy,
-                                              entity_type_name: str,
-                                              as_tree: dict[str, ...],
-                                              df: pd.DataFrame
-                                              ) -> None:
+    def set_multiple_attributes_on_collection(self, _collection: Collection, df: pd.DataFrame) -> None:
+
+        _entarchy = _collection.entarchy
 
         _dtypes = ['str', 'float', 'int', 'date', 'datetime', 'bool', 'blob']
 
