@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import datetime
+import time
 import uuid
-from typing import Any, Iterable, Type, Union, TYPE_CHECKING
+from typing import Any, Type, Union, TYPE_CHECKING, Callable
 
+import alive_progress
 import numpy as np
 import pandas as pd
 
@@ -56,12 +58,16 @@ class Entity(object):
                 raise TypeError('_init_cache must be a dictionary of attribute names and values.')
             self._attribute_cache.update(_init_cache)
 
-    def __new__(cls, _entarchy, _uuid=None, _id=None, _parent=None, _init_cache=None):
+    def __new__(cls, *args, **kwargs):
+
+        _entarchy = args[0] if len(args) > 0 else kwargs.get('_entarchy', None)
+        _uuid = args[1] if len(args) > 1 else kwargs.get('_uuid', None)
 
         if _uuid is not None and _uuid in _entarchy:
             obj = _entarchy.get_entity_by_uuid(_uuid)
 
             # Update cache if provided
+            _init_cache = kwargs.get('_init_cache', None)
             if _init_cache is not None:
                 obj.update_cache(_init_cache)
 
@@ -153,7 +159,7 @@ class Entity(object):
 
         # Reset attribute cache if any key is in cache and entity is dirty
         if any([k in self._attribute_cache for k in key]):
-            modified = self.entarchy.backend.get_entity_last_time_modified(self)
+            modified = self.entarchy.backend.get_entity_modified_time(self)
 
             if modified > self._attribute_cache_start_time:
                 self._attribute_cache_start_time = datetime.datetime.utcnow()
@@ -164,9 +170,9 @@ class Entity(object):
         if len(keys_to_load) > 0:
             if len(keys_to_load) == 1:
                 values = [
-                    self.entarchy.backend.get_single_attribute_of_entity(self, keys_to_load[0])]
+                    self.entarchy.backend.get_entity_attribute(self, keys_to_load[0])]
             else:
-                values = self.entarchy.backend.get_multiple_attributes_of_entity(self, keys_to_load)
+                values = self.entarchy.backend.get_entity_attributes(self, keys_to_load)
 
             # Update cache
             for k, v in zip(keys_to_load, values):
@@ -278,7 +284,7 @@ class Entity(object):
         """Get the UUID primary key of the entity.
 
         Returns:
-            str: The UUID string representaiton of the entity's PK
+            str: The UUID string representation of the entity's primary UUID key
         """
         return str(self._uuid)
 
@@ -287,9 +293,16 @@ class Entity(object):
         """Get the parent entity of this entity.
 
         Returns:
-            Entity: The parent entity.
+            Entity: The parent entity or None.
         """
-        return self._parent
+        if self._parent is None:
+            res = self.entarchy.backend.get_entity_parent(self)
+            if res is None:
+                self._parent = False
+            else:
+                self._parent = self.entarchy.get_entity(entity_type_name=res[0], _uuid=res[1], _id=res[2])
+
+        return None if not self._parent else self._parent
 
     def commit(self):
 
@@ -301,9 +314,9 @@ class Entity(object):
             names = self._attributes_to_update
             values = [self._attribute_cache[n] for n in names]
             if len(names) > 1:
-                res = self.entarchy.backend.set_multiple_attributes_on_entity(self, names, values)
+                res = self.entarchy.backend.set_entity_attributes(self, names, values)
             else:
-                res = self.entarchy.backend.set_single_attribute_on_entity(self, names[0], values[0])
+                res = self.entarchy.backend.set_entity_attribute(self, names[0], values[0])
 
             if not res:
                 raise RuntimeError(f'Failed to update entity attributes {names} in backend.')
@@ -321,22 +334,22 @@ class Collection(object):
     """Base class for collections of entities
     """
 
-    _as_tree = None
+    _as_tree: dict[str, ...]
 
     def __init__(self,
-                 entity_type: Type[Entity],
                  _entarchy: Entarchy,
-                 _query: Any = None):
+                 entity_type: Type[Entity],
+                 _as_tree: dict[str, ...]):
         self._entity_type = entity_type
         self._entarchy = _entarchy
-        self._as_tree = _query
+        self._as_tree = _as_tree
 
         self._cache = pd.DataFrame()
         self._pending_changes: dict[str, list[int]] = {}
         self._init_time = datetime.datetime.utcnow()
 
     def __len__(self):
-        return self.entarchy.backend.get_entity_count_of_collection(self)
+        return self.entarchy.backend.get_collection_count(self)
 
     def __repr__(self):
         return f'Collection(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
@@ -350,16 +363,16 @@ class Collection(object):
             if item < 0:
                 item = len(self) + item
 
-            _uuid, _id = self.entarchy.backend.get_entity_of_collection_by_index(self, item)
-            return self._get_entity(_uuid=_uuid, _id=_id)
+            _uuid, _id = self.entarchy.backend.get_collection_entity_by_index(self, item)
+            return self.get_entity(_uuid=_uuid, _id=_id)
 
         # Return slice
         elif isinstance(item, slice):
 
             # Get data
-            res = self.entarchy.backend.get_entity_of_collection_by_slice(self, item)
+            res = self.entarchy.backend.get_collection_entities_by_slice(self, item)
 
-            result = [self._get_entity(_uuid=_uuid, _id=_id) for _uuid, _id in res]
+            result = [self.get_entity(_uuid=_uuid, _id=_id) for _uuid, _id in res]
 
             return result
 
@@ -377,6 +390,9 @@ class Collection(object):
             return df
 
         raise KeyError(f'Invalid key {item}')
+
+    def __iter__(self):
+        return CollectionBatchIterator(self)
 
     def __setitem__(self, key, value):
 
@@ -415,7 +431,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('UNION', self.as_tree, other.as_tree)
-        return Collection(self.entity_type, self.entarchy, new_tree)
+        return Collection(self.entarchy, self.entity_type, new_tree)
 
     def __and__(self, other):
         """Create a new collection that is the intersection between this collection and another.
@@ -441,7 +457,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('INTERSECTION', self.as_tree, other.as_tree)
-        return Collection(self.entity_type, self.entarchy, new_tree)
+        return Collection(self.entarchy, self.entity_type, new_tree)
 
     def __invert__(self):
         """Create a new collection that is the complement of this collection.
@@ -457,7 +473,7 @@ class Collection(object):
 
         # Invert and return new collection
         new_tree = query.combine_trees('COMPLEMENT', self.as_tree)
-        return Collection(self.entity_type, self.entarchy, new_tree)
+        return Collection(self.entarchy, self.entity_type, new_tree)
 
     def __sub__(self, other):
         """Create a new collection that is the difference between this collection and another.
@@ -483,7 +499,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('DIFFERENCE', self.as_tree, other.as_tree)
-        return Collection(self.entity_type, self.entarchy, new_tree)
+        return Collection(self.entarchy, self.entity_type, new_tree)
 
     def __xor__(self, other):
         """Create a new collection that is the symmetric difference between this collection and another.
@@ -509,7 +525,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('SYMMETRIC_DIFFERENCE', self.as_tree, other.as_tree)
-        return Collection(self.entity_type, self.entarchy, new_tree)
+        return Collection(self.entarchy, self.entity_type, new_tree)
 
     # Properties
 
@@ -531,7 +547,7 @@ class Collection(object):
     def init_time(self) -> datetime.datetime:
         return self._init_time
 
-    def _get_entity(self, _uuid: str, _id: str) -> Entity:
+    def get_entity(self, _uuid: str, _id: str) -> Entity:
 
         _init_cache = None
         if _uuid in self._cache.index:
@@ -542,7 +558,7 @@ class Collection(object):
     def _load_attributes(self, attribute_names: list[str]):
 
         # Load attributes from backend
-        df = self.entarchy.backend.get_multiple_attributes_of_collection(self, attribute_names)
+        df = self.entarchy.backend.get_collection_attributes(self, attribute_names)
 
         # Update cache
         self._cache[df.columns] = df
@@ -561,7 +577,7 @@ class Collection(object):
                 _attributes_cached = []
                 _attributes_to_fetch = attribute_names
 
-            if self.entarchy.debug:
+            if self._entarchy.debug:
                 print('Cached attributes:', _attributes_cached)
                 print('Attributes to fetch: ', _attributes_to_fetch)
 
@@ -574,6 +590,98 @@ class Collection(object):
 
         return self._cache[attribute_names].copy()
 
+    def map(self, fun: Callable, **kwargs) -> Any:
+        """Sequentially apply a function to each Entity of the collection (kwargs are passed onto the function)
+        """
+
+        entity_count = len(self)
+
+        print(f'Run function {fun.__name__} on {self} with args '
+              f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {entity_count} entities')
+
+        with alive_progress.alive_bar(entity_count, spinner='fishes') as bar:
+            for entity in self:
+                fun(entity, **kwargs)
+                bar()
+
+    def map_async(self, fun: Callable, worker_num: int = None, **kwargs) -> Any:
+        """Concurrently apply a function to each Entity of the collection (kwargs are passed onto the function)
+
+        worker_num: int number of subprocess workers to spawn for parallel execution
+        chunk_size: int (optional) size of chunks for batched execution of function to decrease overhead
+            (note that for batch execution the first argument
+            of fun is going to be of type List[Entity] instead of Entity)
+        """
+
+        entity_count = len(self)
+
+        print(f'Run function {fun.__name__} on {self} with args '
+              f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {entity_count} {self.entity_type.__name__} entities')
+
+        if len(self) == 0:
+            print('No entities to operate on in collection')
+            return
+
+        # Prepare pool and entities
+        import multiprocessing as mp
+        if worker_num is None:
+            worker_num = mp.cpu_count() - 2
+            if entity_count < worker_num:
+                worker_num = entity_count
+        print(f'Start pool with {worker_num} workers')
+
+        # Package entities together with their mapped function and arguments
+        #  and make the entity table instances transient
+        print(f'Prepare entities')
+        t = time.perf_counter()
+        kwargs = tuple([(k, v) for k, v in kwargs.items()])
+        worker_args = []
+        for entity in self:
+            worker_args.append((fun, entity, kwargs))
+
+        print(f'> Preparation finished in {time.perf_counter() - t:.2f}s')
+
+        # Map entities to process pool
+        start_time = time.time()
+        print(f'Start processing at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))}')
+        self.entarchy.backend.close()
+        with (mp.Pool(processes=worker_num, initializer=self.worker_init, initargs=(self.entarchy,)) as pool,
+              alive_progress.alive_bar(entity_count, spinner='fishes') as bar):
+
+            iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
+            for iter_num in range(entity_count):
+
+                # Next iteration
+                try:
+                    exec_time = next(iterator)
+
+                # Catch
+                except StopIteration:
+                    pass
+
+                # Re-raise any exception raised by worker wrapper
+                except Exception as _exc:
+                    raise _exc
+
+                # Calcualate timing info
+                # execution_times.append(exec_time)
+                # mean_exec_time = np.mean(execution_times) if len(execution_times) > 0 else 0
+                # time_per_entity = mean_exec_time / worker_num
+                # time_elapsed = time.time() - start_time
+                # time_rest = time_per_entity * (entity_count - iter_num)
+
+                bar()
+
+                # pbar.update(1)
+                # pbar.set_postfix({
+                #     'time_per_iter': f'{time_per_entity:.2f}s',
+                #     'elapsed': str(datetime.timedelta(seconds=int(time_elapsed))),
+                #     'eta': str(datetime.timedelta(seconds=int(time_rest))),
+                # })
+
+        formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+        print(f'\nFinish processing at {formatted_time}')
+
     def update(self, df: pd.DataFrame):
         if not isinstance(df, pd.DataFrame):
             raise TypeError('df must be a pandas DataFrame.')
@@ -582,4 +690,67 @@ class Collection(object):
         self._cache.update(df)
 
         # Send to backend
-        self.entarchy.backend.set_multiple_attributes_on_collection(self, df)
+        self.entarchy.backend.set_collection_attributes(self, df)
+
+    def where(self, *_string_expressions: str, **_equalities):
+        _collection = self.entarchy.get(self.entity_type, *_string_expressions, **_equalities)
+        new_tree = query.combine_trees('INTERSECTION', self.as_tree, _collection.as_tree)
+
+        return Collection(self.entarchy, self.entity_type, new_tree)
+
+    @staticmethod
+    def worker_init(_entarchy: Entarchy):
+        """Subprocess initializer function for concurrent execution
+        """
+
+        _entarchy.backend.open()
+
+    @staticmethod
+    def worker_wrapper(args):
+        """Subprocess wrapper function for concurrent execution, which handles the MySQL session
+        and provides feedback on execution time to parent process
+        """
+
+        start_time = time.perf_counter()
+
+        # Unpack args
+        fun: Callable = args[0]
+        entity: Entity = args[1]
+        kwargs = {k: v for k, v in args[2]}
+
+        # Run
+        fun(entity, **kwargs)
+
+        return time.perf_counter() - start_time
+
+
+class CollectionBatchIterator(object):
+
+    def __init__(self, _collection: Collection):
+        self._collection = _collection
+        self._batch_size = 100
+        self._current_index = 0
+        self._total_length = len(_collection)
+        self._batch_offset = 0
+        self._batch_results = []
+
+    def __next__(self):
+        # Fetch the next batch of results
+        if self._current_index == 0 or (self._current_index == self._batch_offset + self._batch_size):
+            self._batch_offset = self._current_index
+            _slice = slice(self._batch_offset, self._batch_offset + self._batch_size)
+            res = self._collection.entarchy.backend.get_collection_entities_by_slice(self._collection, _slice)
+
+            self._batch_results = res
+
+        # No more results: reset iteration counter and offset and stop iteration
+        if len(self._batch_results) == 0 or self._current_index >= self._total_length:
+            raise StopIteration
+
+        # Return single result
+        current_row = self._batch_results[self._current_index - self._batch_offset]
+
+        # Increment count
+        self._current_index += 1
+
+        return self._collection.get_entity(_uuid=current_row[0], _id=current_row[1])

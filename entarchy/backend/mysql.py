@@ -2,9 +2,7 @@ import io
 import math
 import operator
 import pickle
-import pprint
-import time
-from datetime import date, datetime
+import datetime
 from typing import Any, List, Union
 
 import numpy as np
@@ -13,7 +11,6 @@ import sqlalchemy
 from sqlalchemy import Index, ForeignKey, String, create_engine, BigInteger, Double
 from sqlalchemy.dialects.mysql import LONGBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.orm.base import attribute_str
 
 from .backend import Backend
 from .. import Analysis, Collection, Entarchy, Entity
@@ -54,8 +51,8 @@ class EntityTable(Base):
     children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent', remote_side=[parent_uuid])
     attributes: Mapped[List['AttributeTable']] = relationship('AttributeTable', back_populates='entity')
 
-    created: Mapped[datetime] = mapped_column(default=datetime.utcnow)
-    modified: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
+    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.utcnow)
+    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
     __table_args__ = (
         Index('ix_unique_id_per_parent_uuid', 'parent_uuid', 'id', unique=True),
@@ -78,13 +75,13 @@ class AttributeTable(Base):
     value_int: Mapped[int] = mapped_column(BigInteger(), nullable=True)
     value_float: Mapped[float] = mapped_column(Double(), nullable=True)
     value_bool: Mapped[bool] = mapped_column(nullable=True)
-    value_date: Mapped[date] = mapped_column(nullable=True)
-    value_datetime: Mapped[datetime] = mapped_column(nullable=True)
+    value_date: Mapped[datetime.date] = mapped_column(nullable=True)
+    value_datetime: Mapped[datetime.datetime] = mapped_column(nullable=True)
     value_blob: Mapped[bytes] = mapped_column(LONGBLOB, nullable=True)
     data_type: Mapped[str] = mapped_column(String(500), nullable=True)
 
-    created: Mapped[datetime] = mapped_column(default=datetime.utcnow)
-    modified: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
+    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.utcnow)
+    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
     __table_args__ = (
         Index('ix_unique_name_per_entity_uuid', 'entity_uuid', 'name', unique=True),
@@ -211,11 +208,11 @@ def _write_data_to_attribute_row(row: AttributeTable, data: Any):
         data = data.item()
 
     # Handle scalars and datetime values
-    if type(data) in (str, float, int, bool, date, datetime):
+    if type(data) in (str, float, int, bool, datetime.date, datetime.datetime):
 
         # Set value type
         data_type_map = {str: 'str', float: 'float', int: 'int',
-                         bool: 'bool', date: 'date', datetime: 'datetime'}
+                         bool: 'bool', datetime.date: 'date', datetime.datetime: 'datetime'}
         data_type = data_type_map.get(type(data))
 
         # Some SQL dialects don't support inf float values
@@ -264,7 +261,7 @@ def _deserialize(data: bytes, _format: str) -> Any:
 
 
 class MySQLBackend(Backend):
-    _sql_engine: sqlalchemy.Engine = None
+    _sql_engine: Union[sqlalchemy.Engine, None] = None
     _db_triggers_enabled: bool = None
 
     def __init__(self, dbname: str, dbhost: str, dbuser: str, dbpassword: str = None, debug: bool = False):
@@ -462,55 +459,11 @@ class MySQLBackend(Backend):
 
         return True
 
-    def get_entity_by_uuid(self, _entity: Entity) -> tuple[str, str]:
+    def get_entity_attribute(self, _entity: Entity, name: str) -> Any:
 
-        entity_uuid = _entity.uuid
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        return self.get_entity_attributes(_entity, [name])[0]
 
-            query = session.query(EntityTable).filter(EntityTable.uuid == entity_uuid)
-
-            count = query.count()
-            if count == 0:
-                raise KeyError(f'Entity with UUID {entity_uuid} not found in database.')
-            elif count > 1:
-                raise RuntimeError(f'Multiple entities with UUID {entity_uuid} found in database.')
-
-            row = query.one()
-
-        return row.uuid, row.id
-
-    def get_entity_last_time_modified(self, _entity: Entity) -> datetime:
-
-        entity_uuid = _entity.uuid
-
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
-
-            query = session.query(EntityTable).filter(EntityTable.uuid == entity_uuid)
-
-            count = query.count()
-            if count == 0:
-                raise KeyError(f'Entity with UUID {entity_uuid} not found in database.')
-            elif count > 1:
-                raise RuntimeError(f'Multiple entities with UUID {entity_uuid} found in database.')
-
-            row = query.one()
-
-        return row.modified
-
-    def get_entity_of_type(self, entity_type: str) -> list[tuple[str, str]]:
-
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
-            query = (session.query(EntityTable)
-                     .order_by(getattr(EntityTable.uuid, 'asc')()))
-
-            # Filter by entity type if provided
-            if entity_type is not None:
-                query = (query.join(EntityTypeTable)
-                         .filter(EntityTypeTable.name == entity_type))
-
-            return [(row.uuid, row.id) for row in query.all()]
-
-    def get_multiple_attributes_of_entity(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
+    def get_entity_attributes(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
 
         entity_uuid = _entity.uuid
 
@@ -529,16 +482,79 @@ class MySQLBackend(Backend):
         values = []
         for n in names:
             if n not in rows:
-                raise AttributeError(f'Attribute "{n}" not found for entity with UUID {entity_uuid}.')
+                raise AttributeError(f'Attribute "{n}" not found for {_entity}.')
             values.append(_read_data_from_attribute_row(rows[n]))
 
-        return values
+        return tuple(values)
 
-    def get_single_attribute_of_entity(self, _entity: Entity, name: str) -> Any:
+    def get_entity_by_uuid(self, entity_uuid) -> tuple[str, str, str]:
 
-        return self.get_multiple_attributes_of_entity(_entity, [name])[0]
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
 
-    def set_multiple_attributes_on_entity(self, _entity: Entity, names: list[str], values: list[Any]) -> tuple[bool, str]:
+            query = session.query(EntityTable).filter(EntityTable.uuid == entity_uuid)
+
+            count = query.count()
+            if count == 0:
+                raise KeyError(f'Entity with UUID {entity_uuid} not found in database.')
+
+            row = query.one()
+
+            return row.entity_type.name, row.uuid, row.id
+
+    def get_entity_modified_time(self, _entity: Entity) -> datetime.datetime:
+
+        entity_uuid = _entity.uuid
+
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            query = session.query(EntityTable.modified).filter(EntityTable.uuid == entity_uuid)
+
+            count = query.count()
+            if count == 0:
+                raise KeyError(f'Entity with UUID {entity_uuid} not found in database.')
+
+            row = query.one()
+
+        return row.modified
+
+    def get_entities_of_type(self, entity_type: str) -> list[tuple[str, str]]:
+
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+            query = (session.query(EntityTable.uuid, EntityTable.id)
+                     .order_by(getattr(EntityTable.uuid, 'asc')()))
+
+            # Filter by entity type if provided
+            if entity_type is not None:
+                query = (query.join(EntityTypeTable)
+                         .filter(EntityTypeTable.name == entity_type))
+
+            return [(row.uuid, row.id) for row in query.all()]
+
+    def get_entity_parent(self, _entity: Entity) -> Union[tuple[str, str, str], None]:
+        entity_uuid = _entity.uuid
+
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            query = session.query(EntityTable).filter(EntityTable.uuid == entity_uuid)
+
+            count = query.count()
+            if count == 0:
+                return None
+
+            row = query.one()
+
+            if row.parent is None:
+                return None
+            else:
+                return row.parent.entity_type.name, row.parent.uuid, row.parent.id
+
+    def set_entity_attribute(self, entity_uuid, key: str, value: Any):
+
+        self.set_entity_attributes(entity_uuid, [key], [value])
+
+        return True, ''
+
+    def set_entity_attributes(self, _entity: Entity, names: list[str], values: list[Any]) -> tuple[bool, str]:
 
         _entarchy = _entity.entarchy
         entity_uuid = _entity.uuid
@@ -580,22 +596,16 @@ class MySQLBackend(Backend):
             if not self.db_triggers_enabled:
                 entity_query = session.query(EntityTable).filter(EntityTable.uuid == entity_uuid)
                 entity_row = entity_query.one()  # Check that entity exists
-                entity_row.modified = datetime.utcnow()
+                entity_row.modified = datetime.datetime.utcnow()
 
             # Commit changes
             session.commit()
 
             return True, ''
 
-    def set_single_attribute_on_entity(self, entity_uuid, key: str, value: Any):
-
-        self.set_multiple_attributes_on_entity(entity_uuid, [key], [value])
-
-        return True, ''
-
     # Collection related methods
 
-    def get_entity_count_of_collection(self, _collection: Collection, creation_time: datetime = None) -> int:
+    def get_collection_count(self, _collection: Collection, creation_time: datetime.datetime = None) -> int:
 
         # Fetch result
         with sqlalchemy.orm.Session(self.sql_engine) as session:
@@ -605,7 +615,7 @@ class MySQLBackend(Backend):
 
             return res
 
-    def get_entity_of_collection_by_index(self, _collection: Collection, index: int, creation_time: datetime = None) -> tuple[str, str]:
+    def get_collection_entity_by_index(self, _collection: Collection, index: int, creation_time: datetime.datetime = None) -> tuple[str, str]:
 
         # Fetch result
         with sqlalchemy.orm.Session(self.sql_engine) as session:
@@ -615,12 +625,12 @@ class MySQLBackend(Backend):
 
         return res.uuid, res.id
 
-    def get_entity_of_collection_by_slice(self, _collection: Collection, _slice: slice) -> list[tuple[str, str]]:
+    def get_collection_entities_by_slice(self, _collection: Collection, _slice: slice) -> list[tuple[str, str]]:
 
         entity_type_name = _collection.entity_type.__name__
 
         # Calculate indices
-        count = self.get_entity_count_of_collection(_collection, entity_type_name)
+        count = self.get_collection_count(_collection, entity_type_name)
         start, stop, step = _slice.indices(count)
 
         # Fetch result
@@ -633,7 +643,7 @@ class MySQLBackend(Backend):
         #        but it's not clear how is would work in SQLAlchemy ORM; figure out later
         return [(r.uuid, r.id) for r in res[::step]]
 
-    def get_multiple_attributes_of_collection(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
+    def get_collection_attributes(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
 
         entity_type_name = _collection.entity_type.__name__
 
@@ -728,7 +738,7 @@ class MySQLBackend(Backend):
 
         return df
 
-    def set_multiple_attributes_on_collection(self, _collection: Collection, df: pd.DataFrame) -> None:
+    def set_collection_attributes(self, _collection: Collection, df: pd.DataFrame) -> None:
 
         _entarchy = _collection.entarchy
 
@@ -758,9 +768,9 @@ class MySQLBackend(Backend):
                 _dt = type(df_insert[attr_name].head(1).values[0])
                 if _dt is str:
                     data_type_str = 'str'
-                elif _dt is date:
+                elif _dt is datetime.date:
                     data_type_str = 'date'
-                elif _dt is datetime:
+                elif _dt is datetime.datetime:
                     data_type_str = 'datetime'
                 else:
                     data_type_str = 'blob'
@@ -777,7 +787,7 @@ class MySQLBackend(Backend):
             df_insert['analysis_uuid'] = _analysis_uuid
 
             if not self.db_triggers_enabled:
-                df_insert['modified'] = datetime.utcnow()
+                df_insert['modified'] = datetime.datetime.utcnow()
 
             # Perform upsert
             with sqlalchemy.orm.Session(self.sql_engine) as session:
@@ -793,9 +803,17 @@ class MySQLBackend(Backend):
 
                 # Add modified time update if triggers are not enabled
                 if not self.db_triggers_enabled:
-                    update_attr_data['modified'] = datetime.utcnow()
+                    update_attr_data['modified'] = datetime.datetime.utcnow()
 
                 # Execute upsert
                 upsert_stmt = insert_stmt.on_duplicate_key_update(update_attr_data)
                 session.execute(upsert_stmt)
                 session.commit()
+
+    def open(self):
+        # Just access the property to create the engine if it doesn't exist yet
+        _ = self.sql_engine
+
+    def close(self):
+        self.sql_engine.dispose()
+        self._sql_engine = None

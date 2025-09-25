@@ -25,7 +25,6 @@ class Entarchy:
     base_min_compat_version = '0.1'
     implementation_version: str
     implementation_min_compat_version: str
-
     _hierarchy_root: Type[Entity]
 
     _backend: Backend = None
@@ -37,8 +36,19 @@ class Entarchy:
         self._path = pathlib.Path(path).absolute().as_posix()
         self._debug = debug
 
+        # Resolve hierarchy
+        self._hierarchy = {}
+        self._entity_map = {}
+        self._hierarchy, self._entity_map = self._resolve_hierarchy()
+
         # Load configuration from path
         self._config = yaml.safe_load(open(os.path.join(path, 'entarchy.yaml'), 'r'))
+
+        if self._config['hierarchy'] != self._hierarchy:
+            raise RuntimeError('Entity type hierarchy in configuration does not match the implementation. '
+                               'This may be due to an incompatible version or a corrupted configuration.')
+
+        # TODO: Check version compatibility
 
         # Load backend
         _backend_path = self._config['backend']
@@ -74,7 +84,7 @@ class Entarchy:
         return hash(self.path)
 
     def __repr__(self):
-        return f'Entarchy(\'{self.path}\')'
+        return f'{self.__class__.__name__}(\'{self.path}\')'
 
     @property
     def backend(self) -> Backend:
@@ -106,6 +116,35 @@ class Entarchy:
     def path(self) -> str:
         return self._path
 
+    @classmethod
+    def _resolve_hierarchy(cls):
+
+        def _resolve_hierarchy(entity_type, parent_dict, _entity_map):
+
+            entity_name = entity_type.__name__
+
+            if entity_name in _entity_map:
+                raise ValueError(f'Entity type {entity_name} is already in the hierarchy. '
+                                 f'Circular reference or duplicate name? Entity names must be unique.')
+
+            _entity_map[entity_name] = entity_type
+
+            # Go through children
+            children = entity_type.get_child_entity_types()
+            if entity_name not in parent_dict:
+                parent_dict[entity_name] = {}
+            if children is None:
+                return
+            for child_type in children:
+                _resolve_hierarchy(child_type, parent_dict[entity_name], _entity_map)
+
+        # Run and return result
+        hierarchy = {'Analysis': {}}
+        entity_map = {'Analysis': Analysis}
+        _resolve_hierarchy(cls._hierarchy_root, hierarchy, entity_map)
+
+        return hierarchy, entity_map
+
     def get_config(self) -> dict[str, Any]:
         return self._config.copy()
 
@@ -121,20 +160,9 @@ class Entarchy:
             Entarchy: An instance of cls.
         """
 
-        # Parse hierarchy
-        _hierarchy = {}
+        # Resolve hierarchy and add Analysis entity
 
-        def _add_to_hierarchy(entity_type, parent_dict):
-            children = entity_type.get_child_entity_types()
-            if entity_type.__name__ not in parent_dict:
-                parent_dict[entity_type.__name__] = {}
-            if children is None:
-                return
-            for child_type in children:
-                _add_to_hierarchy(child_type, parent_dict[entity_type.__name__])
-
-        _add_to_hierarchy(cls._hierarchy_root, _hierarchy)
-        _hierarchy['Analysis'] = {}
+        hierarchy, entity_map = cls._resolve_hierarchy()
 
         # Check if path exists, otherwise create
         if os.path.exists(path):
@@ -143,7 +171,7 @@ class Entarchy:
 
         print('---')
         print('Create entity type hierarchy:')
-        pprint.pprint(_hierarchy)
+        pprint.pprint(hierarchy)
         print('---')
 
         _config = {
@@ -151,7 +179,7 @@ class Entarchy:
             'implementation_version': cls.implementation_version,
             'backend': f'{_backend.__module__}.{_backend.__class__.__name__}',
             'backend_config': _backend.get_config(),
-            'hierarchy': _hierarchy
+            'hierarchy': hierarchy
         }
 
         with open(os.path.join(path, 'entarchy.yaml'), 'w') as f:
@@ -166,7 +194,7 @@ class Entarchy:
             raise RuntimeError('Failed to create backend.')
 
         # Create type hierarchy in backend
-        res = entarchy.backend.create_type_hierarchy(_hierarchy)
+        res = entarchy.backend.create_type_hierarchy(hierarchy)
         if not res:
             raise RuntimeError('Failed to create entity type hierarchy in backend.')
 
@@ -333,19 +361,30 @@ class Entarchy:
         _expression = ' AND '.join(_string_expressions)
 
         # Parse to get dictionary representation
-        _parsed_query = query.parse_boolean_expression(_expression)
-        if _parsed_query is None:
-            _parsed_query = {}
+        as_tree = query.parse_boolean_expression(_expression)
+        if as_tree is None:
+            as_tree = {}
 
-        return Collection(entity_type=entity_type, _entarchy=self, _query=_parsed_query)
+        return Collection(self, entity_type, as_tree)
+
+    def get_entity(self, entity_type_name: str, _uuid: str, _id: str):
+
+        # Get type from map
+        entity_type = self._entity_map.get(entity_type_name, None)
+
+        if entity_type is None:
+            raise ValueError(f'Entity type {entity_type_name} not found in hierarchy.')
+
+        return entity_type(self, _uuid=_uuid, _id=_id)
 
     def get_entity_by_uuid(self, _uuid: str) -> Entity:
 
         if _uuid in self._entities:
             return self._entities[_uuid]
         else:
-            entity_data = self.backend.get_entity_by_uuid(self, _uuid)
-            return Entity(_entarchy=self, _uuid=entity_data[0], _id=entity_data[1])
+            entity_data = self.backend.get_entity_by_uuid(_uuid)
+
+            return self.get_entity(entity_data[0], entity_data[1], entity_data[2])
 
     def set_current_analysis(self, _analysis: Union[Analysis, str]) -> None:
         """Set the current analysis for the entarchy system.
@@ -358,7 +397,7 @@ class Entarchy:
         """
 
         if isinstance(_analysis, str):
-            res = self.backend.get_entity_of_type(self, 'Analysis')
+            res = self.backend.get_entities_of_type(self, 'Analysis')
 
             # Check string against id
             existing_data = [r for r in res if r[1] == _analysis]
