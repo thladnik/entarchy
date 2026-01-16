@@ -21,6 +21,7 @@ class Entity(object):
     """
     # Setup attributes
     _child_entity_types: list[Type[Entity]] = None
+    _collection_cls: Type[Collection] = None
 
     # Runtime attributes
     _is_in_context: bool = False
@@ -45,7 +46,7 @@ class Entity(object):
             self._uuid = uuid.uuid4()
 
         # Set up attribute cache
-        self._attribute_cache_start_time = datetime.datetime.utcnow()
+        self._attribute_cache_start_time = datetime.datetime.now()
         self._attribute_cache: dict[str, Any] = {}
         self._attributes_to_update: list[str] = []
 
@@ -67,43 +68,34 @@ class Entity(object):
             obj = _entarchy.get_entity_by_uuid(_uuid)
 
             # Update cache if provided
-            _init_cache = kwargs.get('_init_cache', None)
-            if _init_cache is not None:
-                obj.update_cache(_init_cache)
+            # _init_cache = kwargs.get('_init_cache', None)
+            # if _init_cache is not None:
+            #     obj.update_cache(_init_cache)
 
             return obj
 
         return super().__new__(cls)
 
-    def __contains__(self, item: Union[str, list[str]]) -> bool:
+    def __contains__(self, item: str) -> bool:
         """Check if the entity has a dynamic attribute.
 
         Dynamic attribute keys must always be strings.
         Using a list or tuple of strings will check if all attributes exist.
 
         Args:
-            item (str or list/tuple of str): The key(s) for the attribute(s) to check.
+            item (str): The key for the attribute to check.
 
         Raises:
-            TypeError: If item is not a string or list/tuple of strings.
+            TypeError: If item is not a string.
 
         Returns:
             bool: True if the attribute(s) exist, False otherwise.
         """
 
-        # TODO: also refer to cache
-        raise NotImplementedError('')
+        if not isinstance(item, str):
+            raise TypeError('Item must be a string')
 
-        if not isinstance(item, (str, list, tuple)):
-            raise TypeError('Item must be a string or list or tuple of strings.')
-
-        if isinstance(item, (list, tuple)):
-            if not all(isinstance(k, str) for k in item):
-                raise TypeError('List or tuple of items must contain only strings.')
-
-            return self.entarchy.backend.has_multiple_attributes(self, item)
-
-        return self.entarchy.backend.has_single_attribute(self, item)
+        return self.entarchy.backend.has_entity_attribute(self, item)
 
     def __enter__(self):
         # Set context flag
@@ -157,13 +149,15 @@ class Entity(object):
         else:
             key = [key]
 
-        # Reset attribute cache if any key is in cache and entity is dirty
-        if any([k in self._attribute_cache for k in key]):
-            modified = self.entarchy.backend.get_entity_modified_time(self)
-
-            if modified > self._attribute_cache_start_time:
-                self._attribute_cache_start_time = datetime.datetime.utcnow()
-                self._attribute_cache = {}
+        # TODO: As expected this causes massive performance issues. Nice idea. Optimize later.
+        #  Better idea: use a time-to-live cache with fixed (configurable) expiration time
+        # # Reset attribute cache if any key is in cache and entity is dirty
+        # if any([k in self._attribute_cache for k in key]):
+        #     modified = self.entarchy.backend.get_entity_modified_time(self)
+        #
+        #     if modified > self._attribute_cache_start_time:
+        #         self._attribute_cache_start_time = datetime.datetime.now()
+        #         self._attribute_cache = {}
 
         # Load missing attributes from backend
         keys_to_load = list(set(key) - set(self._attribute_cache.keys()))
@@ -257,6 +251,17 @@ class Entity(object):
         # return [globals()[c] if isinstance(c, str) else c for c in cls._child_entity_types] Does not work yet for str
         return cls._child_entity_types
 
+    @classmethod
+    @property
+    def collection_type(cls) -> Type[Collection]:
+        """Get the collection class associated with this entity type.
+
+        Returns:
+            Type[Collection]: The collection class for this entity type.
+        """
+
+        return cls._collection_cls
+
     @property
     def entarchy(self) -> Entarchy:
         return self._entarchy
@@ -346,7 +351,7 @@ class Collection(object):
 
         self._cache = pd.DataFrame()
         self._pending_changes: dict[str, list[int]] = {}
-        self._init_time = datetime.datetime.utcnow()
+        self._init_time = datetime.datetime.now()
 
     def __len__(self):
         return self.entarchy.backend.get_collection_count(self)
@@ -407,7 +412,7 @@ class Collection(object):
 
     # Set operations
 
-    def __add__(self, other):
+    def __or__(self, other):
         """Create a new collection that is the union between this collection and another.
 
         Args:
@@ -566,6 +571,9 @@ class Collection(object):
     def dataframe_of(self, attribute_names: list[str] = None, reload_cached: bool = False) -> pd.DataFrame:
 
         # If all attributes are in cache, return cached result
+        parent_attribute_names = [n for n in attribute_names if n.startswith('../')]
+        attribute_names = list(set(attribute_names) - set(parent_attribute_names))
+
         loaded_attributes = set(attribute_names) & set(self._cache.columns.tolist())
         if reload_cached or (len(loaded_attributes) < len(attribute_names)):
 
@@ -584,11 +592,53 @@ class Collection(object):
             # Load attributes from database
             self._load_attributes(_attributes_to_fetch)
 
-        # Return final DataFrame
-        # if self._query_custom_orderby:
-        #     return self._cache.loc[self._pk_order, attribute_names]
+        # If there were parent attributes selected, fetch them individually
+        if len(parent_attribute_names) > 0:
+
+            parent_attribute_names_to_fetch = parent_attribute_names.copy()
+
+            print('Get parent attributes:', parent_attribute_names_to_fetch)
+            parent_df = pd.DataFrame(index=self._cache.index)
+            uuids, parent_uuids = list(zip(*self.entarchy.backend.get_collection_parent_uuids(self)))
+            for parent_attr in parent_attribute_names_to_fetch:
+                parent_level = parent_attr.count('../')
+                parent_attr_name = parent_attr.replace('../', '')
+
+                # Create a list of parent values
+                parent_values = []
+                for parent_uuid in parent_uuids:
+
+                    _parent_value = None
+                    parent_entity = None
+                    if parent_uuid is not None:
+                        parent_entity = self.entarchy.get_entity_by_uuid(_uuid=parent_uuid)
+
+                    # Traverse parent hierarchy
+                    if parent_entity is not None:
+                        for _ in range(parent_level - 1):
+
+                            if parent_entity.parent is None:
+                                _parent_value = None
+                                break
+
+                            parent_entity = parent_entity.parent
+
+                        # Get parent attribute value
+                        _parent_value = parent_entity[parent_attr_name]
+
+                    # Add parent value to list
+                    parent_values.append(_parent_value)
+
+                # Add whole column to parent_df
+                parent_df[parent_attr] = parent_values
+
+            return pd.concat([self._cache[attribute_names], parent_df], axis=1, copy=True)
 
         return self._cache[attribute_names].copy()
+
+        # TODO: return final DataFrame in custom order
+        # if self._query_custom_orderby:
+        #     return self._cache.loc[self._pk_order, attribute_names]
 
     def map(self, fun: Callable, **kwargs) -> Any:
         """Sequentially apply a function to each Entity of the collection (kwargs are passed onto the function)
@@ -683,8 +733,15 @@ class Collection(object):
         print(f'\nFinish processing at {formatted_time}')
 
     def update(self, df: pd.DataFrame):
+        # TODO: idea - allow updating using individual records
         if not isinstance(df, pd.DataFrame):
             raise TypeError('df must be a pandas DataFrame.')
+
+        # Make sure no parent attributes are being updated
+        if any([n.startswith('../') for n in df.columns]):
+            raise RuntimeError('Attempted illegal operation. '
+                               'Cannot update parent attributes through collection of child items '
+                               '(attributes starting with "../")')
 
         # Update cache
         self._cache.update(df)
@@ -694,7 +751,10 @@ class Collection(object):
 
     def where(self, *_string_expressions: str, **_equalities):
         _collection = self.entarchy.get(self.entity_type, *_string_expressions, **_equalities)
-        new_tree = query.combine_trees('INTERSECTION', self.as_tree, _collection.as_tree)
+        if self.as_tree == {}:
+            new_tree = _collection.as_tree
+        else:
+            new_tree = query.combine_trees('INTERSECTION', self.as_tree, _collection.as_tree)
 
         return Collection(self.entarchy, self.entity_type, new_tree)
 

@@ -51,8 +51,8 @@ class EntityTable(Base):
     children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent', remote_side=[parent_uuid])
     attributes: Mapped[List['AttributeTable']] = relationship('AttributeTable', back_populates='entity')
 
-    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.utcnow)
-    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now)
+    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now, onupdate=datetime.datetime.now)
 
     __table_args__ = (
         Index('ix_unique_id_per_parent_uuid', 'parent_uuid', 'id', unique=True),
@@ -80,8 +80,8 @@ class AttributeTable(Base):
     value_blob: Mapped[bytes] = mapped_column(LONGBLOB, nullable=True)
     data_type: Mapped[str] = mapped_column(String(500), nullable=True)
 
-    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.utcnow)
-    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now)
+    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now, onupdate=datetime.datetime.now)
 
     __table_args__ = (
         Index('ix_unique_name_per_entity_uuid', 'entity_uuid', 'name', unique=True),
@@ -154,15 +154,46 @@ def _generate_attribute_filters(entity_type_name: str,
 
             comparison = _op_fun(attribute_value_col, value)
 
-        # Build the subquery to filter entities matching the comparison
-        subquery = (_session.query(AttributeTable.entity_uuid)
-                    .filter(AttributeTable.name == name, comparison)
-                    .join(EntityTable)
-                    .join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
-                    .subquery())
+        # If name does not start with dots, it's a direct attribute
+        if not name.startswith('../'):
+            # Build the subquery to filter entities matching the comparison
+            subquery = (_session.query(AttributeTable.entity_uuid)
+                        .filter(AttributeTable.name == name, comparison)
+                        .join(EntityTable)
+                        .join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
+                        .subquery())
+
+        # If name starts with '../', it's a parent attribute, each '../' indicates one level up
+        else:
+            parent_level = name.count('../')
+            attr_name = name[parent_level * 3:]  # remove leading "../" occurrences
+            if not attr_name:
+                raise ValueError('Attribute name after ../ traversal is empty.')
+
+            # Create aliases: e0 = current entity, e1 = parent, ..., eN = ancestor
+            entity_aliases = [sqlalchemy.orm.aliased(EntityTable) for _ in range(parent_level + 1)]
+
+            # Start query selecting the current entity uuid (label it 'entity_uuid' for later c.entity_uuid access)
+            subq = _session.query(entity_aliases[0].uuid.label('entity_uuid'))
+
+            # Join parent chain: e0.parent_uuid == e1.uuid, e1.parent_uuid == e2.uuid, ...
+            for i in range(parent_level):
+                left = entity_aliases[i]
+                right = entity_aliases[i + 1]
+                subq = subq.join(right, left.parent_uuid == right.uuid)
+
+            # Join ancestor attributes and apply attribute name and comparison there
+            ancestor = entity_aliases[-1]
+            subq = subq.join(AttributeTable, AttributeTable.entity_uuid == ancestor.uuid)
+            subq = subq.filter(AttributeTable.name == attr_name, comparison)
+
+            # Ensure current entity type matches the requested collection entity_type_name
+            subq = subq.join(EntityTypeTable, entity_aliases[0].entity_type_pk == EntityTypeTable.pk)
+            subq = subq.filter(EntityTypeTable.name == entity_type_name)
+
+            subquery = subq.subquery()
 
     # Handle unary operators
-
     elif _operator == 'EXIST':
         subquery = (_session.query(AttributeTable.entity_uuid)
                     .filter(AttributeTable.name == as_tree['right_operand'])
@@ -328,12 +359,12 @@ class MySQLBackend(Backend):
             if self._db_triggers_enabled is None:
                 with sqlalchemy.Connection(self._sql_engine) as conn:
                     res = conn.execute(
-                        sqlalchemy.text(f'''
-                            SELECT TRIGGER_NAME
-                            FROM information_schema.TRIGGERS
-                            WHERE TRIGGER_SCHEMA = '{self.dbname}'
-                              AND TRIGGER_NAME = 'attributes_touch_entities_ai'
-                        ''')
+                        sqlalchemy.text(
+                            'SELECT TRIGGER_NAME '
+                            'FROM information_schema.TRIGGERS '
+                            f'WHERE TRIGGER_SCHEMA = \'{self.dbname}\''
+                            'AND TRIGGER_NAME = \'attributes_touch_entities_ai\''
+                        )
                     )
                     self._db_triggers_enabled = len(res.fetchall()) > 0
 
@@ -366,32 +397,33 @@ class MySQLBackend(Backend):
         print('> Create triggers')
         with self.sql_engine.connect() as connection:
             try:
+                # TODO: this needs to use non-utc datetime
                 connection.execute(
-                    sqlalchemy.text("""
-                        CREATE TRIGGER attributes_touch_entities_ai
-                        AFTER INSERT ON attributes FOR EACH ROW
-                          UPDATE entities
-                          SET modified = UTC_TIMESTAMP(6)
-                          WHERE entities.uuid = NEW.entity_uuid
-                    """)
+                    sqlalchemy.text(
+                        "CREATE TRIGGER attributes_touch_entities_ai\n"
+                        "AFTER INSERT ON attributes FOR EACH ROW\n"
+                        "UPDATE entities\n"
+                        "SET modified = UTC_TIMESTAMP(6)\n"
+                        "WHERE entities.uuid = NEW.entity_uuid\n"
+                    )
                 )
                 connection.execute(
-                    sqlalchemy.text("""
-                        CREATE TRIGGER attributes_touch_entities_au
-                        AFTER UPDATE ON attributes FOR EACH ROW
-                          UPDATE entities
-                          SET modified = UTC_TIMESTAMP(6)
-                          WHERE entities.uuid = NEW.entity_uuid
-                    """)
+                    sqlalchemy.text(
+                        "CREATE TRIGGER attributes_touch_entities_au\n"
+                        "AFTER UPDATE ON attributes FOR EACH ROW\n"
+                        "UPDATE entities\n"
+                        "SET modified = UTC_TIMESTAMP(6)\n"
+                        "WHERE entities.uuid = NEW.entity_uuid\n"
+                    )
                 )
                 connection.execute(
-                    sqlalchemy.text("""
-                        CREATE TRIGGER attributes_touch_entities_ad
-                        AFTER DELETE ON attributes FOR EACH ROW
-                          UPDATE entities
-                          SET modified = UTC_TIMESTAMP(6)
-                          WHERE entities.uuid = OLD.entity_uuid
-                                """)
+                    sqlalchemy.text(
+                        "CREATE TRIGGER attributes_touch_entities_ad\n"
+                        "AFTER DELETE ON attributes FOR EACH ROW\n"
+                        "UPDATE entities\n"
+                        "SET modified = UTC_TIMESTAMP(6)\n"
+                        "WHERE entities.uuid = OLD.entity_uuid\n"
+                    )
                 )
             except:
                 # If this fails after successful creation of tables, the most likely reason is detailed here:
@@ -548,6 +580,16 @@ class MySQLBackend(Backend):
             else:
                 return row.parent.entity_type.name, row.parent.uuid, row.parent.id
 
+    def has_entity_attribute(self, _entity: Entity, name: str) -> bool:
+        entity_uuid = _entity.uuid
+
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            query = session.query(AttributeTable).filter(AttributeTable.entity_uuid == entity_uuid,
+                                                         AttributeTable.name == name)
+
+            return query.count() > 0
+
     def set_entity_attribute(self, entity_uuid, key: str, value: Any):
 
         self.set_entity_attributes(entity_uuid, [key], [value])
@@ -596,7 +638,7 @@ class MySQLBackend(Backend):
             if not self.db_triggers_enabled:
                 entity_query = session.query(EntityTable).filter(EntityTable.uuid == entity_uuid)
                 entity_row = entity_query.one()  # Check that entity exists
-                entity_row.modified = datetime.datetime.utcnow()
+                entity_row.modified = datetime.datetime.now()
 
             # Commit changes
             session.commit()
@@ -642,6 +684,19 @@ class MySQLBackend(Backend):
         # TODO: there should be a way to directly query the n-th row using 'ROW_NUMBER() % n'
         #        but it's not clear how is would work in SQLAlchemy ORM; figure out later
         return [(r.uuid, r.id) for r in res[::step]]
+
+    def get_collection_parent_uuids(self, _collection: Collection) -> list[tuple[str, str]]:
+
+        # Fetch result
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            # Get entity query for collection
+            entity_query = _build_query_from_collection(_collection, session)
+
+            # res = parent_query.all()
+            res = entity_query.all()
+
+        return [(r.uuid, r.parent_uuid) for r in res]
 
     def get_collection_attributes(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
 
@@ -787,7 +842,7 @@ class MySQLBackend(Backend):
             df_insert['analysis_uuid'] = _analysis_uuid
 
             if not self.db_triggers_enabled:
-                df_insert['modified'] = datetime.datetime.utcnow()
+                df_insert['modified'] = datetime.datetime.now()
 
             # Perform upsert
             with sqlalchemy.orm.Session(self.sql_engine) as session:
@@ -803,7 +858,7 @@ class MySQLBackend(Backend):
 
                 # Add modified time update if triggers are not enabled
                 if not self.db_triggers_enabled:
-                    update_attr_data['modified'] = datetime.datetime.utcnow()
+                    update_attr_data['modified'] = datetime.datetime.now()
 
                 # Execute upsert
                 upsert_stmt = insert_stmt.on_duplicate_key_update(update_attr_data)

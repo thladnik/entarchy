@@ -63,7 +63,6 @@ class Entarchy:
 
         self.roi_count = 0
         self.roi_attr_update_count = 0
-        print(f'{self} opened with backend {_backend_path}')
 
     def __contains__(self, item):
         if isinstance(item, Entity):
@@ -84,7 +83,7 @@ class Entarchy:
         return hash(self.path)
 
     def __repr__(self):
-        return f'{self.__class__.__name__}(\'{self.path}\')'
+        return f'{self.__class__.__name__}(\'{self.path}\', backend={self.backend.__class__.__qualname__})'
 
     @property
     def backend(self) -> Backend:
@@ -364,6 +363,9 @@ class Entarchy:
         as_tree = query.parse_boolean_expression(_expression)
         if as_tree is None:
             as_tree = {}
+
+        if entity_type.collection_type is not None:
+            return entity_type.collection_type(self, entity_type, as_tree)
 
         return Collection(self, entity_type, as_tree)
 

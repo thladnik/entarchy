@@ -66,6 +66,9 @@ class Backend(object):
     def get_entity_parent(self, _entity: Entity) -> Union[tuple[str, str, str], None]:
         raise NotImplementedError('')
 
+    def has_entity_attribute(self, _entity: Entity, name: str) -> bool:
+        raise NotImplementedError('')
+
     def set_entity_attribute(self, _entity: Entity, name: str, value: Any):
         raise NotImplementedError('')
 
@@ -87,6 +90,9 @@ class Backend(object):
         raise NotImplementedError('')
 
     def get_collection_attributes(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
+        raise NotImplementedError('')
+
+    def get_collection_parent_uuids(self, _collection: Collection) -> list[tuple[str, str]]:
         raise NotImplementedError('')
 
     def set_collection_attributes(self, _collection: Collection, df: pd.DataFrame) -> None:

@@ -14,7 +14,7 @@ def tokenize(expression):
         |(?P<FLOAT>-?\d+\.\d+)                                   # Float numbers
         |(?P<INTEGER>-?\d+)                                      # Integer numbers
         |(?P<BOOLEAN>\bTrue\b|\bFalse\b)                         # Boolean values
-        |(?P<IDENTIFIER>\b[\w/]+\b)                              # Identifiers (like signal1 or name1/subname1)
+        |(?P<IDENTIFIER>(?:\.\./|\./)*(?:[\w/]+))                # Identifiers (like signal1 or name1/subname1)
         |(?P<EXIST>\bEXIST\b)                                    # EXIST operator
         |(?P<IN>\bIN\b)                                          # IN operator
         |(?P<OPERATOR>>=|<=|==|!=|[<>])                          # Comparison operators
