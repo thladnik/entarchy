@@ -1,6 +1,9 @@
+import hashlib
 import io
 import math
 import operator
+import os.path
+import pathlib
 import pickle
 import datetime
 from typing import Any, List, Union
@@ -13,7 +16,7 @@ from sqlalchemy.dialects.mysql import LONGBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .backend import Backend
-from .. import Analysis, Collection, Entarchy, Entity
+from .. import AnalysisEntity, Collection, Entarchy, Entity
 
 
 class Base(DeclarativeBase):
@@ -26,8 +29,7 @@ class EntityTypeTable(Base):
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     parent_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), nullable=True)
     parent: Mapped['EntityTypeTable'] = relationship('EntityTypeTable', back_populates='children', remote_side=[pk])
-    children: Mapped[List['EntityTypeTable']] = relationship('EntityTypeTable', back_populates='parent',
-                                                             remote_side=[parent_pk])
+    children: Mapped[List['EntityTypeTable']] = relationship('EntityTypeTable', back_populates='parent', remote_side=[parent_pk])
 
     name: Mapped[str] = mapped_column(String(500), unique=True)
 
@@ -55,11 +57,25 @@ class EntityTable(Base):
     modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now, onupdate=datetime.datetime.now)
 
     __table_args__ = (
-        Index('ix_unique_id_per_parent_uuid', 'parent_uuid', 'id', unique=True),
+        Index('ix_unique_id_per_parent_and_entity_type', 'parent_uuid', 'entity_type_pk', 'id', unique=True),
     )
 
     def __repr__(self):
         return f"<{self.entity_type.name}Row(id={self.id}, parent={self.parent})>"
+
+
+class Link(Base):
+    __tablename__ = 'links'
+
+    linker_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), primary_key=True)
+    linker = relationship('EntityTable', foreign_keys=[linker_uuid])
+    linked_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), primary_key=True)
+    linked = relationship('EntityTable', foreign_keys=[linked_uuid])
+    entity_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), nullable=True)
+    entity = relationship('EntityTable', foreign_keys=[entity_uuid])
+
+    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now)
+    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now, onupdate=datetime.datetime.now)
 
 
 class AttributeTable(Base):
@@ -79,6 +95,8 @@ class AttributeTable(Base):
     value_datetime: Mapped[datetime.datetime] = mapped_column(nullable=True)
     value_blob: Mapped[bytes] = mapped_column(LONGBLOB, nullable=True)
     data_type: Mapped[str] = mapped_column(String(500), nullable=True)
+
+    mutable = mapped_column(sqlalchemy.Boolean, default=True)
 
     created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now)
     modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now, onupdate=datetime.datetime.now)
@@ -211,21 +229,41 @@ def _generate_attribute_filters(entity_type_name: str,
     return EntityTable.uuid.in_(_session.query(subquery.c.entity_uuid))
 
 
-def _read_data_from_attribute_row(row: AttributeTable):
+def _get_namehash(name: str) -> str:
+    return hashlib.sha224(name.encode()).hexdigest()
+
+
+def _get_attribute_fp(_entity: Entity, row: AttributeTable, _format) -> tuple[str, str]:
+    fp = os.path.join(_entity.entarchy.path, 'ext', _entity.uuid)
+
+    return pathlib.Path(fp).as_posix(), f'{_get_namehash(row.name)}.{_format}'
+
+
+def _read_data_from_attribute(_entity: Entity, row: AttributeTable):
     if row.data_type is None:
         raise ValueError('Attribute data type is None.')
 
     # Load blob
     if row.data_type.startswith('blob'):
-        _, _format = row.data_type.split('::')
+        data_type, _format = row.data_type.split('::')
 
-        return _deserialize(row.value_blob, _format)
+        if data_type == 'blob_ext':
+
+            fp, fn = _get_attribute_fp(_entity, row, _format)
+
+            with open(f'{fp}/{fn}', 'rb') as f:
+                data_serial = f.read()
+
+        else:
+            data_serial = row.value_blob
+
+        return _deserialize(data_serial, _format)
 
     # Otherwise load from this row based on data type
     return getattr(row, f'value_{row.data_type}')
 
 
-def _write_data_to_attribute_row(row: AttributeTable, data: Any):
+def _write_data_to_attribute(_entity: Entity, row: AttributeTable, data: Any):
 
     # TODO: in future version, information about data type byte number should be included in data_type column
     #  as part of the _format substring
@@ -257,13 +295,37 @@ def _write_data_to_attribute_row(row: AttributeTable, data: Any):
 
     # Set value on corresponding column based on type
     if data_type == 'blob':
-        data, _format = _serialize(data)
+
+        # Serialize data
+        data_serial, _format = _serialize(data)
+
+        # Save large blobs on filesystem
+        if data_serial.__sizeof__() >= _entity.entarchy.max_blob_size:
+
+            data_type += '_ext'
+
+            if data_type == 'blob_ext':
+
+                fp, fn = _get_attribute_fp(_entity, row, _format)
+
+                os.makedirs(fp, exist_ok=True)
+
+                with open(f'{fp}/{fn}', 'wb') as f:
+                    f.write(data_serial)
+
+        # Save small blobs directly to row
+        else:
+            # Set data
+            row.__setattr__(f'value_{data_type}', data_serial)
+
+        # Set data_type regardless
         row.data_type = f'{data_type}::{_format}'
+
     else:
         row.data_type = data_type
 
-    # Set data
-    row.__setattr__(f'value_{data_type}', data)
+        # Set data
+        row.__setattr__(f'value_{data_type}', data)
 
 
 def _serialize(data: Any) -> tuple[bytes, str]:
@@ -376,7 +438,7 @@ class MySQLBackend(Backend):
             self._sql_engine = create_engine(f'mysql+pymysql://'
                                              f'{self.dbuser}:{self.dbpassword}'
                                              f'@{self.dbhost}/{self.dbname}',
-                                             echo=self.debug)
+                                             echo=self.debug, pool_size=1)
 
 
         return self._sql_engine
@@ -515,11 +577,11 @@ class MySQLBackend(Backend):
         for n in names:
             if n not in rows:
                 raise AttributeError(f'Attribute "{n}" not found for {_entity}.')
-            values.append(_read_data_from_attribute_row(rows[n]))
+            values.append(_read_data_from_attribute(_entity, rows[n]))
 
         return tuple(values)
 
-    def get_entity_by_uuid(self, entity_uuid) -> tuple[str, str, str]:
+    def get_entity_by_uuid(self,_entarchy: Entarchy, entity_uuid: str) -> Entity:
 
         with sqlalchemy.orm.Session(self.sql_engine) as session:
 
@@ -527,11 +589,14 @@ class MySQLBackend(Backend):
 
             count = query.count()
             if count == 0:
-                raise KeyError(f'Entity with UUID {entity_uuid} not found in database.')
+                raise RuntimeError(f'Entity with UUID {entity_uuid} does not exist.')
 
-            row = query.one()
+            entity_row = query.one()
+            entity_uuid = entity_row.uuid
+            entity_id = entity_row.id
+            entity_type = _entarchy.get_entity_type(entity_row.entity_type.name)
 
-            return row.entity_type.name, row.uuid, row.id
+        return entity_type(_entarchy, _uuid=entity_uuid, _id=entity_id)
 
     def get_entity_modified_time(self, _entity: Entity) -> datetime.datetime:
 
@@ -580,6 +645,56 @@ class MySQLBackend(Backend):
             else:
                 return row.parent.entity_type.name, row.parent.uuid, row.parent.id
 
+    def get_link(self, linker: Entity, linked: Entity) -> Union[tuple[str, str, str], None]:
+
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            query = (session.query(Link)
+                     .filter(Link.linker_uuid == linker.uuid,
+                             Link.linked_uuid == linked.uuid))
+
+            count = query.count()
+            if count == 0:
+                # Create link and entity
+                new_entity_uuid = str(uuid.uuid4())
+
+                # Ensure an entity type for links exists (named 'link')
+                link_type = session.query(EntityTypeTable).filter(EntityTypeTable.name == 'link').one_or_none()
+                if link_type is None:
+                    link_type = EntityTypeTable(name='link')
+                    session.add(link_type)
+                    session.flush()  # ensure PK is assigned
+
+                # Create the entity row that represents the link (id is a short, readable token)
+                link_entity_id = f'link-{new_entity_uuid[:8]}'
+                new_entity_row = EntityTable(
+                    uuid=new_entity_uuid,
+                    id=link_entity_id,
+                    parent_uuid=None,
+                    entity_type=link_type
+                )
+                session.add(new_entity_row)
+
+                # Create the Link row that ties the two existing entities and references the new entity
+                new_link_row = Link(
+                    linker_uuid=linker_uuid,
+                    linked_uuid=linked_uuid,
+                    entity_uuid=new_entity_uuid
+                )
+                session.add(new_link_row)
+
+                # Commit and reload the created link row
+                session.commit()
+                row = session.query(Link).filter(Link.linker_uuid == linker_uuid,
+                                                 Link.linked_uuid == linked_uuid).one()
+
+            row = query.one()
+
+            if row.entity is None:
+                return None
+            else:
+                return row.entity.entity_type.name, row.entity.uuid, row.entity.id
+
     def has_entity_attribute(self, _entity: Entity, name: str) -> bool:
         entity_uuid = _entity.uuid
 
@@ -618,21 +733,28 @@ class MySQLBackend(Backend):
 
             # Update existing attributes
             for n, row in existing_rows.items():
+
+                if not row.mutable:
+                    raise RuntimeError(f'Attribute "{n}" is immutable and cannot be modified.')
+
                 v = values[names.index(n)]
 
                 # Write new value
-                _write_data_to_attribute_row(row, v)
+                _write_data_to_attribute(_entity, row, v)
 
             # Add new attributes
             for n in list(set(names) - set(list(existing_rows.keys()))):
                 v = values[names.index(n)]
 
                 # Create new attribute row
-                new_row = AttributeTable(entity_uuid=entity_uuid, name=n, analysis_uuid=_analysis_uuid)
+                new_row = AttributeTable(entity_uuid=entity_uuid,
+                                         name=n,
+                                         analysis_uuid=_analysis_uuid,
+                                         mutable=not _entity.entarchy.in_digest_mode())
                 session.add(new_row)
 
                 # Write data to row
-                _write_data_to_attribute_row(new_row, v)
+                _write_data_to_attribute(_entity, new_row, v)
 
             # Update entity modified time if triggers are not enabled
             if not self.db_triggers_enabled:

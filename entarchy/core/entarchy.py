@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import abc
+import contextlib
 import importlib
 import os
 import pathlib
 import pprint
 import sys
-from typing import Any, Type, TYPE_CHECKING, Union
+from typing import Any, Callable, Type, TYPE_CHECKING, Union
 
 import alive_progress
 import yaml
 
 from . import query
-from .entity import Analysis, Entity, Collection
+from .entity import AnalysisEntity, Collection, Entity, LinkEntity
 
 if TYPE_CHECKING:
     from ..backend.backend import Backend
@@ -23,6 +24,7 @@ class Entarchy:
     """
     base_version: str = '0.1'
     base_min_compat_version = '0.1'
+    max_blob_size: int = 10 * 1024 * 1024  # 10 MB
     implementation_version: str
     implementation_min_compat_version: str
     _hierarchy_root: Type[Entity]
@@ -30,7 +32,8 @@ class Entarchy:
     _backend: Backend = None
     _config: dict[str, Any] = None
     _is_in_context: bool = False
-    _current_analysis: Union[Analysis, None] = None
+    _is_in_digest_mode: bool = False
+    _current_analysis: Union[AnalysisEntity, None] = None
 
     def __init__(self, path: str, debug: bool = False):
         self._path = pathlib.Path(path).absolute().as_posix()
@@ -60,6 +63,7 @@ class Entarchy:
         self._entities: dict[str, Entity] = {}
         self._entities_to_add: list[str] = []
         self._entities_to_update: list[str] = []
+        self._links: dict[tuple[str, str], str] = {}
 
         self.roi_count = 0
         self.roi_attr_update_count = 0
@@ -138,14 +142,11 @@ class Entarchy:
                 _resolve_hierarchy(child_type, parent_dict[entity_name], _entity_map)
 
         # Run and return result
-        hierarchy = {'Analysis': {}}
-        entity_map = {'Analysis': Analysis}
+        hierarchy = {'AnalysisEntity': {}, 'LinkEntity': {}}
+        entity_map = {'AnalysisEntity': AnalysisEntity, 'LinkEntity': LinkEntity}
         _resolve_hierarchy(cls._hierarchy_root, hierarchy, entity_map)
 
         return hierarchy, entity_map
-
-    def get_config(self) -> dict[str, Any]:
-        return self._config.copy()
 
     @classmethod
     def create(cls, path: str, _backend: Backend, *args, **kwargs) -> Entarchy:
@@ -249,6 +250,8 @@ class Entarchy:
             if not res:
                 raise RuntimeError('Failed to add new entities to backend.')
 
+            print(f'Added {len(self._entities_to_add)} entities')
+
             # Reset list
             self._entities_to_add = []
 
@@ -256,18 +259,18 @@ class Entarchy:
         #  Note to future self: USE COPY, otherwise iterator is going to
         #  skip entries as the length of the list changes while updated elements are removed
         _entities_to_update = self._entities_to_update.copy()
-        with alive_progress.alive_bar(monitor=f'| Update {len(_entities_to_update)} entities',
-                                      monitor_end=f'Updated {len(_entities_to_update)} entities',
-                                      bar=None, spinner='fish2', spinner_length=30, stats=False) as _:
-            for _uuid in _entities_to_update:
-                self._entities[_uuid].commit()
+        # with alive_progress.alive_bar(monitor=f'| Update {len(_entities_to_update)} entities',
+        #                               monitor_end=f'Updated {len(_entities_to_update)} entities',
+        #                               bar=None, spinner='fish2', spinner_length=30, stats=False) as _:
+        for _uuid in _entities_to_update:
+            self._entities[_uuid].commit()
 
     @property
-    def current_analysis(self) -> Union[Analysis, None]:
+    def current_analysis(self) -> Union[AnalysisEntity, None]:
         """Get the current analysis for the entarchy system.
 
         Returns:
-            Union[Analysis, None]: The current analysis, or None if no analysis is set.
+            Union[AnalysisEntity, None]: The current analysis, or None if no analysis is set.
         """
         return self._current_analysis
 
@@ -320,18 +323,6 @@ class Entarchy:
 
         print(f'\nSuccessfully deleted analysis {path}')
 
-    @abc.abstractmethod
-    def digest(self, raw_data_path: str) -> None:
-        """Digest raw data from a given path into the entarchy system.
-
-        Args:
-            raw_data_path (str): The path to the raw data to digest.
-
-        Returns:
-            None
-        """
-        pass
-
     def get(self, entity_type: Type[Entity], *_string_expressions: str, **_equalities) -> Collection:
         """Get a collection of entities of a given type.
 
@@ -364,20 +355,19 @@ class Entarchy:
         if as_tree is None:
             as_tree = {}
 
+        # Return collection of custom type if available
         if entity_type.collection_type is not None:
             return entity_type.collection_type(self, entity_type, as_tree)
 
+        # Fallback to generic collection
         return Collection(self, entity_type, as_tree)
 
-    def get_entity(self, entity_type_name: str, _uuid: str, _id: str):
+    def get_config(self) -> dict[str, Any]:
+        return self._config.copy()
 
-        # Get type from map
-        entity_type = self._entity_map.get(entity_type_name, None)
+    def get_entity(self, entity_type_name: str, _uuid: str, _id: str) -> Entity:
 
-        if entity_type is None:
-            raise ValueError(f'Entity type {entity_type_name} not found in hierarchy.')
-
-        return entity_type(self, _uuid=_uuid, _id=_id)
+        return self.get_entity_type(entity_type_name)(self, _uuid=_uuid, _id=_id)
 
     def get_entity_by_uuid(self, _uuid: str) -> Entity:
 
@@ -388,34 +378,39 @@ class Entarchy:
 
             return self.get_entity(entity_data[0], entity_data[1], entity_data[2])
 
-    def set_current_analysis(self, _analysis: Union[Analysis, str]) -> None:
-        """Set the current analysis for the entarchy system.
+    def get_entity_type(self, entity_type_name: str) -> Type[Entity]:
+        """Get the entity type class for a given entity type name.
 
         Args:
-            _analysis (Union[Analysis, str]): The analysis to set as current, or its UUID.
+            entity_type_name (str): The name of the entity type.
 
         Returns:
-            None
+            Type[Entity]: The entity type class.
         """
 
-        if isinstance(_analysis, str):
-            res = self.backend.get_entities_of_type(self, 'Analysis')
+        # Get type from map
+        entity_type = self._entity_map.get(entity_type_name, None)
 
-            # Check string against id
-            existing_data = [r for r in res if r[1] == _analysis]
+        if entity_type is None:
+            raise ValueError(f'Entity type {entity_type_name} not found in hierarchy.')
 
-            if len(existing_data) == 0:
-                _analysis_entity = Analysis(self, _id=_analysis)
-                self.add_new_entity(_analysis_entity)
-                self.commit()
-            else:
-                _analysis_entity = Analysis(self, _id=_analysis)
-        elif isinstance(_analysis, Analysis):
-            _analysis_entity = _analysis
-        else:
-            raise ValueError(f'Invalid analysis type {type(_analysis)}. Must be of type Analysis or str.')
+        return entity_type
 
-        self._current_analysis = _analysis_entity
+    def get_link(self, linker: Entity, linked: Entity) -> Union[LinkEntity, None]:
+
+        """Get a link entity between two entities if it exists.
+
+        Args:
+            linker (Entity): The linking entity.
+            linked (Entity): The linked entity.
+        """
+
+        link_key = (linker.uuid, linked.uuid)
+        if link_key not in self._links:
+            self.backend.get_link_uuid(linker, linked)
+
+        link_uuid = self._links[link_key]
+        return self.get_entity('LinkEntity', link_uuid, None)
 
     def remove_entity_from_update(self, entity: Entity) -> None:
         """Unmark an entity for update in the backend.
@@ -429,3 +424,54 @@ class Entarchy:
 
         if entity.uuid in self._entities_to_update:
             self._entities_to_update.remove(entity.uuid)
+
+    def set_current_analysis(self, _analysis: Union[AnalysisEntity, str]) -> None:
+        """Set the current analysis for the entarchy system.
+
+        Args:
+            _analysis (Union[AnalysisEntity, str]): The analysis to set as current, or its UUID.
+
+        Returns:
+            None
+        """
+
+        if isinstance(_analysis, str):
+            res = self.backend.get_entities_of_type(AnalysisEntity.__name__)
+
+            # Check string against id
+            existing_data = [r for r in res if r[1] == _analysis]
+
+            if len(existing_data) == 0:
+                _analysis_entity = AnalysisEntity(self, _id=_analysis)
+                self.add_new_entity(_analysis_entity)
+                self.commit()
+            else:
+                _analysis_entity = AnalysisEntity(self, _id=_analysis)
+        elif isinstance(_analysis, AnalysisEntity):
+            _analysis_entity = _analysis
+        else:
+            raise ValueError(f'Invalid analysis type {type(_analysis)}. Must be of type Analysis or str.')
+
+        self._current_analysis = _analysis_entity
+
+    def start_digest(self):
+        self._is_in_digest_mode = True
+
+    def in_digest_mode(self):
+        return self._is_in_digest_mode
+
+    def end_digest(self):
+        self._is_in_digest_mode = False
+
+
+def digest_method(fun: Callable):
+
+    def _digest_fun(ent: Entarchy, *args, **kwargs):
+        ent.start_digest()
+        try:
+            result = fun(ent, *args, **kwargs)
+        finally:
+            ent.end_digest()
+        return result
+
+    return _digest_fun

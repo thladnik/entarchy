@@ -7,7 +7,7 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from ..core.entarchy import Entarchy
-    from ..core.entity import Analysis, Entity, Collection
+    from ..core.entity import AnalysisEntity, Entity, Collection
 
 
 class Backend(object):
@@ -42,19 +42,19 @@ class Backend(object):
 
     # Entity related methods
 
-    def add_entity(self, _entities: Entity) -> bool:
+    def add_entity(self, _entity: Entity) -> bool:
         raise NotImplementedError('')
 
     def add_entities(self, _entities: list[Entity]) -> bool:
         raise NotImplementedError('')
 
-    def get_entity_attributes(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
-        raise NotImplementedError('')
-
     def get_entity_attribute(self, _entity: Entity, name: str) -> Any:
         raise NotImplementedError('')
 
-    def get_entity_by_uuid(self, entity_uuid: str) -> tuple[str, str, str]:
+    def get_entity_attributes(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
+        raise NotImplementedError('')
+
+    def get_entity_by_uuid(self,_entarchy: Entarchy, entity_uuid: str) -> Entity:
         raise NotImplementedError('')
 
     def get_entity_modified_time(self, _entity: Entity) -> datetime.datetime:

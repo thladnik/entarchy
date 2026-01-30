@@ -1,6 +1,6 @@
 from . import core
 
-from .core.entarchy import Entarchy
-from .core.entity import Analysis, Entity, Collection
+from .core.entarchy import Entarchy, digest_method
+from .core.entity import AnalysisEntity, Entity, Collection
 
 __version__ = Entarchy.base_version

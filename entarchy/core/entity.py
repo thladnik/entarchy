@@ -21,7 +21,7 @@ class Entity(object):
     """
     # Setup attributes
     _child_entity_types: list[Type[Entity]] = None
-    _collection_cls: Type[Collection] = None
+    collection_type: Type[Collection] = None
 
     # Runtime attributes
     _is_in_context: bool = False
@@ -102,7 +102,7 @@ class Entity(object):
         self._is_in_context = True
 
         # Set current analysis if applicable
-        if isinstance(self, Analysis):
+        if isinstance(self, AnalysisEntity):
             setattr(self, '__prev_analysis', self.entarchy.current_analysis)
             self.entarchy.set_current_analysis(self)
 
@@ -180,6 +180,22 @@ class Entity(object):
             return res
         return res[0]
 
+    def __matmul__(self, other) -> LinkEntity:
+        """Create a link entity between this entity and another entity.
+
+        Args:
+            other (Entity): The target entity to link to.
+        """
+
+        if not isinstance(other, Entity):
+            raise TypeError('Can only create link to another Entity instance.')
+
+        link_entity = LinkEntity(_entarchy=self.entarchy)
+
+        self.entarchy.add_new_entity(link_entity)
+
+        return link_entity
+
     def __repr__(self):
         return f'{self.__class__.__name__}(id=\'{self.id}\' uuid=\'{self.uuid}\')'
 
@@ -251,17 +267,6 @@ class Entity(object):
         # return [globals()[c] if isinstance(c, str) else c for c in cls._child_entity_types] Does not work yet for str
         return cls._child_entity_types
 
-    @classmethod
-    @property
-    def collection_type(cls) -> Type[Collection]:
-        """Get the collection class associated with this entity type.
-
-        Returns:
-            Type[Collection]: The collection class for this entity type.
-        """
-
-        return cls._collection_cls
-
     @property
     def entarchy(self) -> Entarchy:
         return self._entarchy
@@ -314,10 +319,14 @@ class Entity(object):
         # Remove entity from entarchy update list
         self.entarchy.remove_entity_from_update(self)
 
+        # Update attributes in backend if updates are pending
         if len(self._attributes_to_update) > 0:
 
             names = self._attributes_to_update
             values = [self._attribute_cache[n] for n in names]
+            # print(f'Update entity attributes: {names}')
+            # print(f'Values: {values}')
+
             if len(names) > 1:
                 res = self.entarchy.backend.set_entity_attributes(self, names, values)
             else:
@@ -330,8 +339,11 @@ class Entity(object):
             self._attributes_to_update = []
 
 
-class Analysis(Entity):
+class AnalysisEntity(Entity):
+    pass
 
+
+class LinkEntity(Entity):
     pass
 
 
@@ -357,7 +369,7 @@ class Collection(object):
         return self.entarchy.backend.get_collection_count(self)
 
     def __repr__(self):
-        return f'Collection(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
+        return f'{self.__class__.__name__}(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
 
     # Access methods
 
