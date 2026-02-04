@@ -338,6 +338,22 @@ class Entity(object):
             # Reset list
             self._attributes_to_update = []
 
+        # In digest mode, purge cache from memory after commit
+        if self.entarchy.is_in_digest_mode:
+            self._attribute_cache = {}
+
+    def update(self, attribute_dict: dict[str, Any]):
+        for k, v in attribute_dict.items():
+
+            if not isinstance(k, str):
+                raise TypeError('Attribute keys must be strings.')
+
+            self.__setitem__(k, v)
+
+
+class EntarchyEntity(Entity):
+    pass
+
 
 class AnalysisEntity(Entity):
     pass
@@ -350,6 +366,8 @@ class LinkEntity(Entity):
 class Collection(object):
     """Base class for collections of entities
     """
+
+    # TODO: implement .apply method along column axis similar to pandas DataFrame.apply() ?
 
     _as_tree: dict[str, ...]
 
@@ -413,12 +431,16 @@ class Collection(object):
 
     def __setitem__(self, key, value):
 
-        if key != slice(None, None, None):
-            raise KeyError(f'Invalid key {key}')
-        if not isinstance(value, pd.DataFrame):
-            if not isinstance(value, pd.Series):
-                raise ValueError(f'Invalid value of type {type(value)}. Needs to be pandas.Series or pandas.DataFrame')
+        # if isinstance(key, slice) and key != slice(None, None, None):
+        #     raise KeyError(f'Invalid key {key}')
+
+        # Set series data to key attribute name
+        if isinstance(value, pd.Series):
+            value.name = key
             value = pd.DataFrame(value)
+
+        else:
+            raise RuntimeError('Invalid key/value pair')
 
         self.update(value)
 
@@ -583,7 +605,7 @@ class Collection(object):
     def dataframe_of(self, attribute_names: list[str] = None, reload_cached: bool = False) -> pd.DataFrame:
 
         # If all attributes are in cache, return cached result
-        parent_attribute_names = [n for n in attribute_names if n.startswith('../')]
+        parent_attribute_names = [n for n in attribute_names if n.startswith('../') or n.startswith('[')]
         attribute_names = list(set(attribute_names) - set(parent_attribute_names))
 
         loaded_attributes = set(attribute_names) & set(self._cache.columns.tolist())
@@ -607,14 +629,31 @@ class Collection(object):
         # If there were parent attributes selected, fetch them individually
         if len(parent_attribute_names) > 0:
 
+            # If cache is empty, initialize it. Otherwise, the uuid index won't be there.
+            if len(self._cache.index) == 0:
+                # TODO: there is a bug here. If uuid is called first, it does not return any attribute,
+                #  because the returned DataFrame just contains the uuid index and no columns
+                self._load_attributes(['id'])
+
+            # TODO: enable fetching of parent attributes like <ParentEntityTypeName>:attribute1
+
             parent_attribute_names_to_fetch = parent_attribute_names.copy()
 
-            print('Get parent attributes:', parent_attribute_names_to_fetch)
+            # print('Get parent attributes:', parent_attribute_names_to_fetch)
             parent_df = pd.DataFrame(index=self._cache.index)
             uuids, parent_uuids = list(zip(*self.entarchy.backend.get_collection_parent_uuids(self)))
             for parent_attr in parent_attribute_names_to_fetch:
-                parent_level = parent_attr.count('../')
-                parent_attr_name = parent_attr.replace('../', '')
+
+                if parent_attr.startswith('../'):
+                    parent_level = parent_attr.count('../')
+                    parent_attr_name = parent_attr.replace('../', '')
+                else:
+                    if not (('[' in parent_attr) and (']' in parent_attr)):
+                        raise ValueError('Malformed attribute name for parent entity traversal.')
+                    parent_entity_type_name, parent_attr_name = parent_attr.replace('[', '').split(']')
+                    parent_level = get_ancestor_distance_from_nested(self.entarchy.hierarchy,
+                                                                     self.entity_type.__name__,
+                                                                     parent_entity_type_name)
 
                 # Create a list of parent values
                 parent_values = []
@@ -623,7 +662,7 @@ class Collection(object):
                     _parent_value = None
                     parent_entity = None
                     if parent_uuid is not None:
-                        parent_entity = self.entarchy.get_entity_by_uuid(_uuid=parent_uuid)
+                        parent_entity = self.entarchy.get_entity_by_uuid(parent_uuid)
 
                     # Traverse parent hierarchy
                     if parent_entity is not None:
@@ -745,15 +784,20 @@ class Collection(object):
         print(f'\nFinish processing at {formatted_time}')
 
     def update(self, df: pd.DataFrame):
-        # TODO: idea - allow updating using individual records
+
+        # TODO: idea - allow update using individual records (i.e., list of dicts) to avoid pandas dependency here
+
         if not isinstance(df, pd.DataFrame):
             raise TypeError('df must be a pandas DataFrame.')
 
-        # Make sure no parent attributes are being updated
-        if any([n.startswith('../') for n in df.columns]):
+        # Validate names
+        if not all(isinstance(n, str) for n in df.columns):
+            raise TypeError('Attribute names must be strings.')
+
+        if any(n.startswith('../') or n.startswith('[') for n in df.columns):
             raise RuntimeError('Attempted illegal operation. '
                                'Cannot update parent attributes through collection of child items '
-                               '(attributes starting with "../")')
+                               '(attributes starting with "../" or "[EntityTypeName]").')
 
         # Update cache
         self._cache.update(df)
@@ -826,3 +870,41 @@ class CollectionBatchIterator(object):
         self._current_index += 1
 
         return self._collection.get_entity(_uuid=current_row[0], _id=current_row[1])
+
+
+def _find_path(hierarchy: dict[str, Any], target: str) -> list[str] | None:
+    """Return path from current hierarchy root to target as a list of names, or None if not found."""
+    for name, subtree in hierarchy.items():
+        if name == target:
+            return [name]
+        if isinstance(subtree, dict):
+            subpath = _find_path(subtree, target)
+            if subpath is not None:
+                return [name] + subpath
+    return None
+
+
+def get_ancestor_distance_from_nested(hierarchy: dict[str, Any],
+                                      entity_type_name: str,
+                                      parent_entity_type_name: str) -> int | None:
+    """
+    Return number of parent steps from entity_type_name up to parent_entity_type_name.
+    Return 0 if same, or None if parent_entity_type_name is not an ancestor or either is missing.
+    """
+    if entity_type_name == parent_entity_type_name:
+        return 0
+
+    descendant_path = _find_path(hierarchy, entity_type_name)
+    if descendant_path is None:
+        return None
+
+    ancestor_path = _find_path(hierarchy, parent_entity_type_name)
+    if ancestor_path is None:
+        return None
+
+    # ancestor must be a prefix of descendant path
+    if len(ancestor_path) > len(descendant_path):
+        return None
+    if descendant_path[: len(ancestor_path)] == ancestor_path:
+        return len(descendant_path) - len(ancestor_path)
+    return None

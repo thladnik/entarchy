@@ -173,7 +173,7 @@ def _generate_attribute_filters(entity_type_name: str,
             comparison = _op_fun(attribute_value_col, value)
 
         # If name does not start with dots, it's a direct attribute
-        if not name.startswith('../'):
+        if not name.startswith('../') and not name.startswith('['):
             # Build the subquery to filter entities matching the comparison
             subquery = (_session.query(AttributeTable.entity_uuid)
                         .filter(AttributeTable.name == name, comparison)
@@ -182,25 +182,36 @@ def _generate_attribute_filters(entity_type_name: str,
                         .subquery())
 
         # If name starts with '../', it's a parent attribute, each '../' indicates one level up
+        # Alternatively, explicit parent entity type names may be used: [ParentEntityTypeName]attribute_name
         else:
-            parent_level = name.count('../')
-            attr_name = name[parent_level * 3:]  # remove leading "../" occurrences
+
+            if name.startswith('../'):
+                parent_level = name.count('../')
+                attr_name = name[parent_level * 3:]  # remove leading "../" occurrences
+
+            else:
+                if not (('[' in name) and (']' in name)):
+                    raise ValueError('Malformed attribute name for parent entity traversal.')
+                parent_entity_type_name, attr_name = name.replace('[', '').split(']')
+                parent_level = get_entity_type_ancestor_distance(_session, entity_type_name, parent_entity_type_name)
+                # print(f'Going {parent_level} up from {entity_type_name} to {parent_entity_type_name}')
+
             if not attr_name:
                 raise ValueError('Attribute name after ../ traversal is empty.')
 
-            # Create aliases: e0 = current entity, e1 = parent, ..., eN = ancestor
+            # Create aliases
             entity_aliases = [sqlalchemy.orm.aliased(EntityTable) for _ in range(parent_level + 1)]
 
-            # Start query selecting the current entity uuid (label it 'entity_uuid' for later c.entity_uuid access)
+            # Start query selecting the current entity uuid
             subq = _session.query(entity_aliases[0].uuid.label('entity_uuid'))
 
-            # Join parent chain: e0.parent_uuid == e1.uuid, e1.parent_uuid == e2.uuid, ...
+            # Join parent chain
             for i in range(parent_level):
                 left = entity_aliases[i]
                 right = entity_aliases[i + 1]
                 subq = subq.join(right, left.parent_uuid == right.uuid)
 
-            # Join ancestor attributes and apply attribute name and comparison there
+            # Join parent attributes and apply attribute name and comparison there
             ancestor = entity_aliases[-1]
             subq = subq.join(AttributeTable, AttributeTable.entity_uuid == ancestor.uuid)
             subq = subq.filter(AttributeTable.name == attr_name, comparison)
@@ -229,41 +240,166 @@ def _generate_attribute_filters(entity_type_name: str,
     return EntityTable.uuid.in_(_session.query(subquery.c.entity_uuid))
 
 
+def get_entity_type_ancestor_distance(session: sqlalchemy.orm.Session,
+                                      entity_type_name: str,
+                                      parent_entity_type_name: str) -> int | None:
+    """
+    Return number of parent steps required to reach `parent_entity_type_name`
+    starting from `entity_type_name`. Return 0 if names are equal, or None
+    if `parent_entity_type_name` is not an ancestor.
+    """
+    # Quick equality check
+    if entity_type_name == parent_entity_type_name:
+        return 0
+
+    row = session.query(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name).one_or_none()
+    if row is None:
+        return None
+
+    distance = 0
+    visited = set()
+    current = row
+
+    while current is not None:
+        # protect against cycles
+        if current.pk in visited:
+            return None
+        visited.add(current.pk)
+
+        # move to parent
+        parent = current.parent
+        distance += 1
+        if parent is None:
+            return None
+
+        if parent.name == parent_entity_type_name:
+            return distance
+
+        current = parent
+
+    return None
+
+
 def _get_namehash(name: str) -> str:
     return hashlib.sha224(name.encode()).hexdigest()
 
 
-def _get_attribute_fp(_entity: Entity, row: AttributeTable, _format) -> tuple[str, str]:
-    fp = os.path.join(_entity.entarchy.path, 'ext', _entity.uuid)
+# def _get_attribute_fp(_entity: Entity, row: AttributeTable, _format) -> tuple[str, str]:
+#
+#     _uuid = _entity.uuid.replace('-', '')
+#     _shards = [_uuid[4*i:4*(i+1)] for i in range(8)]  # Create path shards from uuid (8x4 characters for uuid4)
+#     fp = os.path.join(_entity.entarchy.path, 'ext', *_shards)
+#
+#     return pathlib.Path(fp).as_posix(), f'{_get_namehash(row.name)}.{_format}'
 
-    return pathlib.Path(fp).as_posix(), f'{_get_namehash(row.name)}.{_format}'
+def _get_attribute_fp(_entity: Entity, name: str, _format) -> tuple[str, str]:
+
+    _uuid = _entity.uuid.replace('-', '')
+    _shards = [_uuid[4*i:4*(i+1)] for i in range(8)]  # Create path shards from uuid (8x4 characters for uuid4)
+    fp = os.path.join(_entity.entarchy.path, 'ext', *_shards)
+
+    return pathlib.Path(fp).as_posix(), f'{_get_namehash(name)}.{_format}'
 
 
-def _read_data_from_attribute(_entity: Entity, row: AttributeTable):
+def _read_attribute_data(_entity: Entity, row: AttributeTable):
     if row.data_type is None:
         raise ValueError('Attribute data type is None.')
 
     # Load blob
-    if row.data_type.startswith('blob'):
-        data_type, _format = row.data_type.split('::')
+    if row.data_type == 'blob':
+        ser: Serializer = pickle.loads(row.value_blob)
+        return ser.deserialize()
 
-        if data_type == 'blob_ext':
-
-            fp, fn = _get_attribute_fp(_entity, row, _format)
-
-            with open(f'{fp}/{fn}', 'rb') as f:
-                data_serial = f.read()
-
-        else:
-            data_serial = row.value_blob
-
-        return _deserialize(data_serial, _format)
+    # if row.data_type.startswith('blob'):
+        # data_type, _format = row.data_type.split('::')
+        #
+        # if data_type == 'blob_ext':
+        #
+        #     fp, fn = _get_attribute_fp(_entity, row.name, _format)
+        #
+        #     with open(f'{fp}/{fn}', 'rb') as f:
+        #         data_serial = f.read()
+        #
+        # else:
+        #     data_serial = row.value_blob
+        #
+        # return _deserialize(data_serial, _format)
 
     # Otherwise load from this row based on data type
     return getattr(row, f'value_{row.data_type}')
 
 
-def _write_data_to_attribute(_entity: Entity, row: AttributeTable, data: Any):
+class Serializer(object):
+
+    _type: type
+    _store: str
+    _data: bytes
+
+    def serialize(self, _entity: Entity, name: str, data: Any) -> bytes:
+
+        self._type = type(data)
+
+        if isinstance(data, bytes):
+            self._data = data
+        elif isinstance(data, list):
+            self._data = pickle.dumps(data)
+        elif isinstance(data, dict):
+            self._data = pickle.dumps(data)
+        elif isinstance(data, np.ndarray):
+            with io.BytesIO() as buffer:
+                np.lib.format.write_array(buffer, data)
+                buffer.seek(0)
+                self._data = buffer.read()
+
+        else:
+            raise RuntimeError(f'Unsupported data type for serialization: {type(data)}')
+
+        if self._data.__sizeof__() >= _entity.entarchy.max_blob_size:
+
+            # Save to file
+            _format = 'npy' if self._type is np.ndarray else 'pickle'
+
+            fp, fn = _get_attribute_fp(_entity, name, _format)
+
+            os.makedirs(fp, exist_ok=True)
+
+            fullpath = f'{fp}/{fn}'
+            self._store = fullpath
+
+            with open(fullpath, 'wb') as f:
+                f.write(self._data)
+                del self._data
+                # print('Saved large blob to external file:', fullpath)
+                # print('Serializer size:', self.__sizeof__())
+
+        else:
+            self._store = 'internal'
+
+    def deserialize(self):
+
+        print('Deserialize')
+        # Read from file if needed
+        if self._store != 'internal':
+            # Load from file
+            with open(self._store, 'rb') as f:
+                self._data = f.read()
+
+            print('> Read large blob from external file')
+
+        # Return data
+        if self._type is bytes:
+            return self._data
+        elif self._type is list:
+            return pickle.loads(self._data)
+        elif self._type is dict:
+            return pickle.loads(self._data)
+        elif self._type is np.ndarray:
+            with io.BytesIO(self._data) as buffer:
+                buffer.seek(0)
+                return np.lib.format.read_array(buffer)
+
+
+def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
 
     # TODO: in future version, information about data type byte number should be included in data_type column
     #  as part of the _format substring
@@ -291,66 +427,29 @@ def _write_data_to_attribute(_entity: Entity, row: AttributeTable, data: Any):
         data_type = 'blob'
 
     # Set (potential) previous value to None
+    # TODO: with ext storage for blobs, we should also delete previous files on disk
     row.__setattr__(f'value_{row.data_type}', None)
 
     # Set value on corresponding column based on type
     if data_type == 'blob':
 
-        # Serialize data
-        data_serial, _format = _serialize(data)
+        # Create serializer
+        ser = Serializer()
+        ser.serialize(_entity, row.name, data)
 
-        # Save large blobs on filesystem
-        if data_serial.__sizeof__() >= _entity.entarchy.max_blob_size:
+        # Serialize the serializer
+        data = pickle.dumps(ser)
 
-            data_type += '_ext'
+    row.data_type = data_type
 
-            if data_type == 'blob_ext':
-
-                fp, fn = _get_attribute_fp(_entity, row, _format)
-
-                os.makedirs(fp, exist_ok=True)
-
-                with open(f'{fp}/{fn}', 'wb') as f:
-                    f.write(data_serial)
-
-        # Save small blobs directly to row
-        else:
-            # Set data
-            row.__setattr__(f'value_{data_type}', data_serial)
-
-        # Set data_type regardless
-        row.data_type = f'{data_type}::{_format}'
-
-    else:
-        row.data_type = data_type
-
-        # Set data
-        row.__setattr__(f'value_{data_type}', data)
+    # Set data
+    row.__setattr__(f'value_{data_type}', data)
 
 
-def _serialize(data: Any) -> tuple[bytes, str]:
-    if isinstance(data, np.ndarray):
-        _format = 'npy'
-        with io.BytesIO() as buffer:
-            np.lib.format.write_array(buffer, data)
-            buffer.seek(0)
-            _bytes = buffer.read()
-    else:
-        _format = 'pickle'
-        _bytes = pickle.dumps(data)
+def _deserialize(data: bytes) -> Any:
 
-    return _bytes, _format
-
-
-def _deserialize(data: bytes, _format: str) -> Any:
-    if _format == 'npy':
-        with io.BytesIO(data) as buffer:
-            buffer.seek(0)
-            return np.lib.format.read_array(buffer)
-    elif _format == 'pickle':
-        return pickle.loads(data)
-    else:
-        raise ValueError(f'Unknown blob format "{_format}".')
+    ser: Serializer = pickle.loads(data)
+    return ser.deserialize()
 
 
 class MySQLBackend(Backend):
@@ -577,7 +676,7 @@ class MySQLBackend(Backend):
         for n in names:
             if n not in rows:
                 raise AttributeError(f'Attribute "{n}" not found for {_entity}.')
-            values.append(_read_data_from_attribute(_entity, rows[n]))
+            values.append(_read_attribute_data(_entity, rows[n]))
 
         return tuple(values)
 
@@ -740,7 +839,7 @@ class MySQLBackend(Backend):
                 v = values[names.index(n)]
 
                 # Write new value
-                _write_data_to_attribute(_entity, row, v)
+                _write_attribute_data(_entity, row, v)
 
             # Add new attributes
             for n in list(set(names) - set(list(existing_rows.keys()))):
@@ -750,11 +849,11 @@ class MySQLBackend(Backend):
                 new_row = AttributeTable(entity_uuid=entity_uuid,
                                          name=n,
                                          analysis_uuid=_analysis_uuid,
-                                         mutable=not _entity.entarchy.in_digest_mode())
+                                         mutable=not _entity.entarchy.is_in_digest_mode)
                 session.add(new_row)
 
                 # Write data to row
-                _write_data_to_attribute(_entity, new_row, v)
+                _write_attribute_data(_entity, new_row, v)
 
             # Update entity modified time if triggers are not enabled
             if not self.db_triggers_enabled:
@@ -857,7 +956,14 @@ class MySQLBackend(Backend):
 
                 # Leave out blob format substring
                 if data_type.startswith('blob'):
-                    data_type, _ = data_type.split('::')
+                    if data_type.startswith('blob_ext'):
+                        cases.append(
+                            sqlalchemy.func.max(sqlalchemy.case(
+                                (AttributeTable.name == n, getattr(AttributeTable, f'value_{data_type}')),
+                                else_=None)).label(n)
+                        )
+
+                        continue
 
                 # Use the appropriate column for the data_type
                 cases.append(
@@ -903,9 +1009,8 @@ class MySQLBackend(Backend):
                 elif data_type == 'datetime':
                     df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode()), format='%Y-%m-%d %H:%M:%S')
                 # Load blobs
-                elif data_type.startswith('blob'):
-                    _, _format = data_type.split('::')
-                    df[n] = df[n].apply(lambda s: _deserialize(s, _format) if s is not None else None)
+                elif data_type == 'blob':
+                    df[n] = df[n].apply(lambda s: _deserialize(s) if s is not None else None)
 
             except ValueError:
                 raise RuntimeWarning(f'Failed to cast attribute {n} to type {data_type}')

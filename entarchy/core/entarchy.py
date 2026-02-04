@@ -6,6 +6,7 @@ import importlib
 import os
 import pathlib
 import pprint
+import shutil
 import sys
 from typing import Any, Callable, Type, TYPE_CHECKING, Union
 
@@ -13,7 +14,7 @@ import alive_progress
 import yaml
 
 from . import query
-from .entity import AnalysisEntity, Collection, Entity, LinkEntity
+from .entity import AnalysisEntity, Collection, EntarchyEntity, Entity, LinkEntity
 
 if TYPE_CHECKING:
     from ..backend.backend import Backend
@@ -24,7 +25,7 @@ class Entarchy:
     """
     base_version: str = '0.1'
     base_min_compat_version = '0.1'
-    max_blob_size: int = 10 * 1024 * 1024  # 10 MB
+    max_blob_size: int = 1 * 1024 * 1024  # 1 MB
     implementation_version: str
     implementation_min_compat_version: str
     _hierarchy_root: Type[Entity]
@@ -34,6 +35,7 @@ class Entarchy:
     _is_in_context: bool = False
     _is_in_digest_mode: bool = False
     _current_analysis: Union[AnalysisEntity, None] = None
+    _entarchy_entity: EntarchyEntity = None
 
     def __init__(self, path: str, debug: bool = False):
         self._path = pathlib.Path(path).absolute().as_posix()
@@ -107,6 +109,10 @@ class Entarchy:
         self._backend.debug = value
 
     @property
+    def hierarchy(self):
+        return self._hierarchy.copy()
+
+    @property
     def is_in_context(self) -> bool:
         """Check if the entarchy is in a context manager.
 
@@ -116,8 +122,26 @@ class Entarchy:
         return self._is_in_context
 
     @property
+    def is_in_digest_mode(self):
+        return self._is_in_digest_mode
+
+    @property
     def path(self) -> str:
         return self._path
+
+    @property
+    def root(self):
+
+        if self._entarchy_entity is None:
+
+            # Load entarchy entity
+            entarchy_uuid = self._config.get('entarchy_uuid')
+            if entarchy_uuid is None:
+                RuntimeError('No entarchy UUID found in configuration. Is the entarchy initialized correctly?')
+
+            self._entarchy_entity = self.backend.get_entity_by_uuid(self, entarchy_uuid)
+
+        return self._entarchy_entity
 
     @classmethod
     def _resolve_hierarchy(cls):
@@ -142,8 +166,8 @@ class Entarchy:
                 _resolve_hierarchy(child_type, parent_dict[entity_name], _entity_map)
 
         # Run and return result
-        hierarchy = {'AnalysisEntity': {}, 'LinkEntity': {}}
-        entity_map = {'AnalysisEntity': AnalysisEntity, 'LinkEntity': LinkEntity}
+        hierarchy = {'EntarchyEntity': {}, 'AnalysisEntity': {}, 'LinkEntity': {}}
+        entity_map = {'EntarchyEntity': EntarchyEntity,'AnalysisEntity': AnalysisEntity, 'LinkEntity': LinkEntity}
         _resolve_hierarchy(cls._hierarchy_root, hierarchy, entity_map)
 
         return hierarchy, entity_map
@@ -174,6 +198,7 @@ class Entarchy:
         pprint.pprint(hierarchy)
         print('---')
 
+        # Save configuration so entarchy object can be created
         _config = {
             'base_version': cls.base_version,
             'implementation_version': cls.implementation_version,
@@ -186,19 +211,29 @@ class Entarchy:
             yaml.safe_dump(_config, f)
 
         # Create instance
-        entarchy = cls(path, *args, **kwargs)
+        ent = cls(path, *args, **kwargs)
 
         # Create backend
-        res = entarchy.backend.create()
+        res = ent.backend.create()
         if not res:
             raise RuntimeError('Failed to create backend.')
 
         # Create type hierarchy in backend
-        res = entarchy.backend.create_type_hierarchy(hierarchy)
+        res = ent.backend.create_type_hierarchy(hierarchy)
         if not res:
             raise RuntimeError('Failed to create entity type hierarchy in backend.')
 
-        return entarchy
+        # Create entarchy entity
+        with ent:
+            ent_entity = EntarchyEntity(ent, _id='Entarchy', _parent=None)
+            ent.add_new_entity(ent_entity)
+
+        # Update config to include entarchy entity uuid
+        with open(os.path.join(path, 'entarchy.yaml'), 'r+') as f:
+            _config.update({'entarchy_uuid': ent_entity.uuid})
+            yaml.safe_dump(_config, f)
+
+        return ent
 
     def add_entity_for_update(self, entity: Entity) -> None:
         """Mark an entity for update in the backend.
@@ -222,6 +257,10 @@ class Entarchy:
         Returns:
             None
         """
+
+        # Add immutable id attributes
+        entity['id'] = entity.id
+        entity['uuid'] = entity.uuid
         self.add_existing_entity(entity)
         self._entities_to_add.append(entity.uuid)
 
@@ -259,11 +298,11 @@ class Entarchy:
         #  Note to future self: USE COPY, otherwise iterator is going to
         #  skip entries as the length of the list changes while updated elements are removed
         _entities_to_update = self._entities_to_update.copy()
-        # with alive_progress.alive_bar(monitor=f'| Update {len(_entities_to_update)} entities',
-        #                               monitor_end=f'Updated {len(_entities_to_update)} entities',
-        #                               bar=None, spinner='fish2', spinner_length=30, stats=False) as _:
-        for _uuid in _entities_to_update:
-            self._entities[_uuid].commit()
+        with alive_progress.alive_bar(monitor=f'| Update {len(_entities_to_update)} entities',
+                                      monitor_end=f'Updated {len(_entities_to_update)} entities',
+                                      bar=None, spinner='fish2', spinner_length=30, stats=False) as _:
+            for _uuid in _entities_to_update:
+                self._entities[_uuid].commit()
 
     @property
     def current_analysis(self) -> Union[AnalysisEntity, None]:
@@ -301,8 +340,9 @@ class Entarchy:
         self.backend.delete(True)
 
         print('> Remove directories and files')
-        # Use pathlib recursive unlinker by mitch from https://stackoverflow.com/a/49782093
+
         def rmdir(directory, counter):
+            # Use pathlib recursive unlinker by mitch from https://stackoverflow.com/a/49782093
             directory = pathlib.Path(directory)
             for item in directory.iterdir():
                 if item.is_dir():
@@ -320,6 +360,7 @@ class Entarchy:
 
         # Delete tree
         rmdir(path, 0)
+        # shutil.rmtree(path)
 
         print(f'\nSuccessfully deleted analysis {path}')
 
@@ -374,9 +415,9 @@ class Entarchy:
         if _uuid in self._entities:
             return self._entities[_uuid]
         else:
-            entity_data = self.backend.get_entity_by_uuid(_uuid)
+            _entity = self.backend.get_entity_by_uuid(self, _uuid)
 
-            return self.get_entity(entity_data[0], entity_data[1], entity_data[2])
+            return _entity
 
     def get_entity_type(self, entity_type_name: str) -> Type[Entity]:
         """Get the entity type class for a given entity type name.
@@ -456,9 +497,6 @@ class Entarchy:
 
     def start_digest(self):
         self._is_in_digest_mode = True
-
-    def in_digest_mode(self):
-        return self._is_in_digest_mode
 
     def end_digest(self):
         self._is_in_digest_mode = False
