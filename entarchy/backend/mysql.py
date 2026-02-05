@@ -335,7 +335,10 @@ class Serializer(object):
     _store: str
     _data: bytes
 
-    def serialize(self, _entity: Entity, name: str, data: Any) -> bytes:
+    def __repr__(self):
+        return f'Serializer({self._type}, {self._store})'
+
+    def serialize(self, _entity: Entity, name: str, data: Any):
 
         self._type = type(data)
 
@@ -352,7 +355,7 @@ class Serializer(object):
                 self._data = buffer.read()
 
         else:
-            raise RuntimeError(f'Unsupported data type for serialization: {type(data)}')
+            raise TypeError(f'Unsupported data type for serialization: {type(data)}')
 
         if self._data.__sizeof__() >= _entity.entarchy.max_blob_size:
 
@@ -377,16 +380,15 @@ class Serializer(object):
 
     def deserialize(self):
 
-        print('Deserialize')
+        # print(f'Deserialize {self}')
         # Read from file if needed
         if self._store != 'internal':
             # Load from file
+            # print('> Read large blob from external file')
             with open(self._store, 'rb') as f:
                 self._data = f.read()
 
-            print('> Read large blob from external file')
-
-        # Return data
+        # Return data according to original type
         if self._type is bytes:
             return self._data
         elif self._type is list:
@@ -397,12 +399,13 @@ class Serializer(object):
             with io.BytesIO(self._data) as buffer:
                 buffer.seek(0)
                 return np.lib.format.read_array(buffer)
+        else:
+            raise TypeError(f'Unsupported data type during deserialization: {self._type}')
 
 
 def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
 
     # TODO: in future version, information about data type byte number should be included in data_type column
-    #  as part of the _format substring
     #  This way the exact data type can be restored upon read (e.g. int8, int16, float32, float64, etc.)
     #  This would mean that python native scalars may be stored as regular 64bit,
     #  while numpy scalars get variable sizes.
@@ -616,6 +619,7 @@ class MySQLBackend(Backend):
     def delete(self, confirm: bool = False):
 
         if not confirm:
+            raise RuntimeError('Failed to delete backend. Confirmation not provided.')
             return
 
         print('> Drop schema')
@@ -655,6 +659,18 @@ class MySQLBackend(Backend):
     def get_entity_attribute(self, _entity: Entity, name: str) -> Any:
 
         return self.get_entity_attributes(_entity, [name])[0]
+
+    def get_entity_attribute_names(self, _entity: Entity) -> list[str]:
+
+        entity_uuid = _entity.uuid
+
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            query = session.query(AttributeTable.name).filter(AttributeTable.entity_uuid == entity_uuid)
+
+            names = [row.name for row in query.all()]
+
+        return names
 
     def get_entity_attributes(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
 
@@ -918,6 +934,24 @@ class MySQLBackend(Backend):
             res = entity_query.all()
 
         return [(r.uuid, r.parent_uuid) for r in res]
+
+    def get_collection_attribute_names(self, _collection: Collection) -> list[str]:
+
+        # Fetch result
+        with sqlalchemy.orm.Session(self.sql_engine) as session:
+
+            # Get entity query for collection
+            entity_query = _build_query_from_collection(_collection, session)
+
+            # Get attribute types for requested names
+            attribute_query = (session.query(AttributeTable.name)
+                               .join(EntityTable)
+                               .filter(EntityTable.uuid.in_(entity_query.subquery().primary_key))
+                               .distinct())
+
+            names = [row.name for row in attribute_query.all()]
+
+        return names
 
     def get_collection_attributes(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
 

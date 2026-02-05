@@ -18,6 +18,7 @@ from .entity import AnalysisEntity, Collection, EntarchyEntity, Entity, LinkEnti
 
 if TYPE_CHECKING:
     from ..backend.backend import Backend
+    from ..backend.mysql import MySQLBackend
 
 
 class Entarchy:
@@ -30,7 +31,7 @@ class Entarchy:
     implementation_min_compat_version: str
     _hierarchy_root: Type[Entity]
 
-    _backend: Backend = None
+    _backend: MySQLBackend = None  # Backend # TODO: Make this more generic, currently only MySQLBackend is supported
     _config: dict[str, Any] = None
     _is_in_context: bool = False
     _is_in_digest_mode: bool = False
@@ -92,7 +93,7 @@ class Entarchy:
         return f'{self.__class__.__name__}(\'{self.path}\', backend={self.backend.__class__.__qualname__})'
 
     @property
-    def backend(self) -> Backend:
+    def backend(self) -> MySQLBackend:  # Backend:
         return self._backend
 
     @property
@@ -445,6 +446,7 @@ class Entarchy:
             linker (Entity): The linking entity.
             linked (Entity): The linked entity.
         """
+        raise NotImplementedError('Links are not implemented yet.')
 
         link_key = (linker.uuid, linked.uuid)
         if link_key not in self._links:

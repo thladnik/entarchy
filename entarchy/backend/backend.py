@@ -51,6 +51,9 @@ class Backend(object):
     def get_entity_attribute(self, _entity: Entity, name: str) -> Any:
         raise NotImplementedError('')
 
+    def get_entity_attribute_names(self, _entity: Entity) -> list[str]:
+        raise NotImplementedError('')
+
     def get_entity_attributes(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
         raise NotImplementedError('')
 

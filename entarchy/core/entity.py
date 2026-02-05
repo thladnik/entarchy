@@ -187,6 +187,8 @@ class Entity(object):
             other (Entity): The target entity to link to.
         """
 
+        raise NotImplementedError('Links are not implemented yet.')
+
         if not isinstance(other, Entity):
             raise TypeError('Can only create link to another Entity instance.')
 
@@ -341,6 +343,18 @@ class Entity(object):
         # In digest mode, purge cache from memory after commit
         if self.entarchy.is_in_digest_mode:
             self._attribute_cache = {}
+
+    def keys(self):
+        """Return a list of all dynamic attribute keys for this entity.
+        """
+        return self.entarchy.backend.get_entity_attribute_names(self)
+
+    def to_dict(self):
+        """Return a dictionary of all dynamic attributes for this entity.
+        """
+        keys = self.keys()
+        values = self[keys]
+        return dict(zip(keys, values))
 
     def update(self, attribute_dict: dict[str, Any]):
         for k, v in attribute_dict.items():
@@ -575,12 +589,28 @@ class Collection(object):
         return self._as_tree.copy()
 
     @property
+    def columns(self):
+        return self.entarchy.backend.get_collection_attribute_names(self)
+
+    @property
     def entarchy(self) -> Entarchy:
         return self._entarchy
 
     @property
     def entity_type(self):
         return self._entity_type
+
+    @property
+    def index(self):
+
+        # If cache is empty, initialize it. Otherwise, the uuid index won't be there.
+        if len(self._cache.index) == 0:
+            # TODO: there is a bug here. If uuid is called first, it does not return any attribute,
+            #  because the returned DataFrame just contains the uuid index and no columns
+            #  -> look into this
+            self._load_attributes(['id'])
+
+        return self._cache.index
 
     @property
     def init_time(self) -> datetime.datetime:
@@ -604,10 +634,12 @@ class Collection(object):
 
     def dataframe_of(self, attribute_names: list[str] = None, reload_cached: bool = False) -> pd.DataFrame:
 
-        # If all attributes are in cache, return cached result
+        # Check for parent attributes in attribute_names and separate them from regular attributes,
+        #  because they need to be fetched separately
         parent_attribute_names = [n for n in attribute_names if n.startswith('../') or n.startswith('[')]
         attribute_names = list(set(attribute_names) - set(parent_attribute_names))
 
+        # If not all attributes are in cache, fetch the missing ones
         loaded_attributes = set(attribute_names) & set(self._cache.columns.tolist())
         if reload_cached or (len(loaded_attributes) < len(attribute_names)):
 
@@ -623,19 +655,15 @@ class Collection(object):
                 print('Cached attributes:', _attributes_cached)
                 print('Attributes to fetch: ', _attributes_to_fetch)
 
-            # Load attributes from database
+            # Load missing attributes into cache
             self._load_attributes(_attributes_to_fetch)
 
         # If there were parent attributes selected, fetch them individually
+        # - Parent attributes can either be accessed relative to the current entity type level using "../"
+        #    or by specifying the parent entity type in square brackets ("[ParentEntityTypeName]attr_name")
+        # - Parent attributes are not cached in the collection cache,
+        #    because they are not needed for most operations and would cause too much overhead
         if len(parent_attribute_names) > 0:
-
-            # If cache is empty, initialize it. Otherwise, the uuid index won't be there.
-            if len(self._cache.index) == 0:
-                # TODO: there is a bug here. If uuid is called first, it does not return any attribute,
-                #  because the returned DataFrame just contains the uuid index and no columns
-                self._load_attributes(['id'])
-
-            # TODO: enable fetching of parent attributes like <ParentEntityTypeName>:attribute1
 
             parent_attribute_names_to_fetch = parent_attribute_names.copy()
 
@@ -706,7 +734,8 @@ class Collection(object):
                 bar()
 
     def map_async(self, fun: Callable, worker_num: int = None, **kwargs) -> Any:
-        """Concurrently apply a function to each Entity of the collection (kwargs are passed onto the function)
+        """
+        Concurrently apply a function to each Entity of the collection (kwargs are passed onto the function)
 
         worker_num: int number of subprocess workers to spawn for parallel execution
         chunk_size: int (optional) size of chunks for batched execution of function to decrease overhead
@@ -782,6 +811,13 @@ class Collection(object):
 
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
+
+    def to_dict(self):
+        """
+        Return a generator of dictionaries of all dynamic attributes for each entity in the collection.
+        """
+        for entity in self:
+            yield entity.to_dict()
 
     def update(self, df: pd.DataFrame):
 
@@ -873,7 +909,9 @@ class CollectionBatchIterator(object):
 
 
 def _find_path(hierarchy: dict[str, Any], target: str) -> list[str] | None:
-    """Return path from current hierarchy root to target as a list of names, or None if not found."""
+    """
+    Return path from current hierarchy root to target as a list of names, or None if not found.
+    """
     for name, subtree in hierarchy.items():
         if name == target:
             return [name]
