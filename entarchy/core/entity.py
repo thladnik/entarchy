@@ -648,6 +648,8 @@ class Collection(object):
 
     def dataframe_of(self, attribute_names: list[str] = None, reload_cached: bool = False) -> pd.DataFrame:
 
+        original_attribute_order = attribute_names.copy()
+
         # Check for parent attributes in attribute_names and separate them from regular attributes,
         #  because they need to be fetched separately
         parent_attribute_names = [n for n in attribute_names if n.startswith('../') or n.startswith('[')]
@@ -727,9 +729,11 @@ class Collection(object):
                 # Add whole column to parent_df
                 parent_df[parent_attr] = parent_values
 
-            return pd.concat([self._cache[attribute_names], parent_df], axis=1, copy=True)
+            df = pd.concat([self._cache[attribute_names], parent_df], axis=1, copy=True)
 
-        return self._cache[attribute_names].copy()
+            return df[original_attribute_order]
+
+        return self._cache[original_attribute_order].copy()
 
         # TODO: return final DataFrame in custom order
         # if self._query_custom_orderby:
@@ -785,14 +789,17 @@ class Collection(object):
         for entity in self:
             worker_args.append((fun, entity, kwargs))
 
-        print(f'> Preparation finished in {time.perf_counter() - t:.2f}s')
-
-        # Map entities to process pool
-        start_time = time.time()
-        print(f'Start processing at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))}')
         self.entarchy.backend.close()
+
+        print('Open processing pool')
         with (mp.Pool(processes=worker_num, initializer=self.worker_init, initargs=(self.entarchy,)) as pool,
               alive_progress.alive_bar(entity_count, spinner='fishes') as bar):
+
+            print(f'> Preparation finished in {time.perf_counter() - t:.2f}s')
+
+            # Map entities to process pool
+            start_time = time.time()
+            print(f'Start processing at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))}')
 
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
             for iter_num in range(entity_count):

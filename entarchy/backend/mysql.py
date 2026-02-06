@@ -570,7 +570,8 @@ class MySQLBackend(Backend):
             self._sql_engine = create_engine(f'mysql+pymysql://'
                                              f'{self.dbuser}:{self.dbpassword}'
                                              f'@{self.dbhost}/{self.dbname}',
-                                             echo=self.debug, pool_size=1)
+                                             echo=self.debug,
+                                             poolclass=sqlalchemy.pool.NullPool)
 
         return self._sql_engine
 
