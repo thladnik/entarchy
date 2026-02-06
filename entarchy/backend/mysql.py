@@ -96,6 +96,9 @@ class AttributeTable(Base):
     value_blob: Mapped[bytes] = mapped_column(LONGBLOB, nullable=True)
     data_type: Mapped[str] = mapped_column(String(500), nullable=True)
 
+    float_is_nan: Mapped[bool] = mapped_column(default=False)
+    float_is_inf: Mapped[bool] = mapped_column(default=False)
+
     mutable = mapped_column(sqlalchemy.Boolean, default=True)
 
     created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now)
@@ -326,7 +329,16 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
         # return _deserialize(data_serial, _format)
 
     # Otherwise load from this row based on data type
-    return getattr(row, f'value_{row.data_type}')
+    val = getattr(row, f'value_{row.data_type}')
+
+    # Check for inf and NaNs
+    if row.data_type == 'float' and val is None:
+        if row.float_is_inf:
+            return float('inf')
+        elif row.float_is_nan:
+            return float('nan')
+
+    return val
 
 
 class Serializer(object):
@@ -350,7 +362,7 @@ class Serializer(object):
             self._data = pickle.dumps(data)
         elif isinstance(data, np.ndarray):
             with io.BytesIO() as buffer:
-                np.lib.format.write_array(buffer, data)
+                np.lib.format.write_array(buffer, data, allow_pickle=True)
                 buffer.seek(0)
                 self._data = buffer.read()
 
@@ -398,7 +410,7 @@ class Serializer(object):
         elif self._type is np.ndarray:
             with io.BytesIO(self._data) as buffer:
                 buffer.seek(0)
-                return np.lib.format.read_array(buffer)
+                return np.lib.format.read_array(buffer, allow_pickle=True)
         else:
             raise TypeError(f'Unsupported data type during deserialization: {self._type}')
 
@@ -415,6 +427,16 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
     if isinstance(data, np.generic):
         data = data.item()
 
+    # If previous data type war float, reset flags
+    if row.data_type == 'float':
+        row.float_is_inf = False
+        row.float_is_nan = False
+
+    # Set (potential) previous value to None
+    row.__setattr__(f'value_{row.data_type}', None)
+
+    # TODO: with ext storage for blobs, we should also delete previous files on disk
+
     # Handle scalars and datetime values
     if type(data) in (str, float, int, bool, datetime.date, datetime.datetime):
 
@@ -425,13 +447,13 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
 
         # Some SQL dialects don't support inf float values
         if data_type == 'float' and math.isinf(data):
-            data_type = 'blob'
+            row.float_is_inf = True
+            data = None
+        elif data_type == 'float' and math.isnan(data):
+            row.float_is_nan = True
+            data = None
     else:
         data_type = 'blob'
-
-    # Set (potential) previous value to None
-    # TODO: with ext storage for blobs, we should also delete previous files on disk
-    row.__setattr__(f'value_{row.data_type}', None)
 
     # Set value on corresponding column based on type
     if data_type == 'blob':
@@ -456,7 +478,8 @@ def _deserialize(data: bytes) -> Any:
 
 
 class MySQLBackend(Backend):
-    _sql_engine: Union[sqlalchemy.Engine, None] = None
+    _sql_engine: sqlalchemy.Engine | None = None
+    _sql_session: sqlalchemy.orm.Session | None = None
     _db_triggers_enabled: bool = None
 
     def __init__(self, dbname: str, dbhost: str, dbuser: str, dbpassword: str = None, debug: bool = False):
@@ -509,6 +532,13 @@ class MySQLBackend(Backend):
     def dbpassword(self) -> str:
         return self._config['dbpassword']
 
+    @property
+    def sql_session(self) -> sqlalchemy.orm.Session:
+        if self._sql_session is None:
+            self._sql_session = sqlalchemy.orm.Session(self.sql_engine)
+            
+        return self._sql_session
+
     @Backend.debug.setter
     def debug(self, value: bool) -> None:
         self._debug = value
@@ -541,7 +571,6 @@ class MySQLBackend(Backend):
                                              f'{self.dbuser}:{self.dbpassword}'
                                              f'@{self.dbhost}/{self.dbname}',
                                              echo=self.debug, pool_size=1)
-
 
         return self._sql_engine
 
@@ -603,7 +632,7 @@ class MySQLBackend(Backend):
 
     def create_type_hierarchy(self, _hierarchy: dict[str, ...]) -> bool:
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
             def _create_entity_type(_hierarchy: dict[str, ...], parent_row: Union[EntityTypeTable, None]):
                 for name, children in _hierarchy.items():
                     row = EntityTypeTable(name=name, parent=parent_row)
@@ -632,7 +661,7 @@ class MySQLBackend(Backend):
 
     def add_entities(self, _entities: list[Entity]) -> bool:
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             # Get entity type map
             entity_type_map = {None: None}
@@ -664,7 +693,7 @@ class MySQLBackend(Backend):
 
         entity_uuid = _entity.uuid
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             query = session.query(AttributeTable.name).filter(AttributeTable.entity_uuid == entity_uuid)
 
@@ -676,7 +705,7 @@ class MySQLBackend(Backend):
 
         entity_uuid = _entity.uuid
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             query = session.query(AttributeTable).filter(AttributeTable.entity_uuid == entity_uuid)
             conditions = []
@@ -698,7 +727,7 @@ class MySQLBackend(Backend):
 
     def get_entity_by_uuid(self,_entarchy: Entarchy, entity_uuid: str) -> Entity:
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             query = session.query(EntityTable).filter(EntityTable.uuid == entity_uuid)
 
@@ -717,7 +746,7 @@ class MySQLBackend(Backend):
 
         entity_uuid = _entity.uuid
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             query = session.query(EntityTable.modified).filter(EntityTable.uuid == entity_uuid)
 
@@ -731,7 +760,7 @@ class MySQLBackend(Backend):
 
     def get_entities_of_type(self, entity_type: str) -> list[tuple[str, str]]:
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
             query = (session.query(EntityTable.uuid, EntityTable.id)
                      .order_by(getattr(EntityTable.uuid, 'asc')()))
 
@@ -745,7 +774,7 @@ class MySQLBackend(Backend):
     def get_entity_parent(self, _entity: Entity) -> Union[tuple[str, str, str], None]:
         entity_uuid = _entity.uuid
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             query = session.query(EntityTable).filter(EntityTable.uuid == entity_uuid)
 
@@ -762,7 +791,7 @@ class MySQLBackend(Backend):
 
     def get_link(self, linker: Entity, linked: Entity) -> Union[tuple[str, str, str], None]:
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             query = (session.query(Link)
                      .filter(Link.linker_uuid == linker.uuid,
@@ -813,7 +842,7 @@ class MySQLBackend(Backend):
     def has_entity_attribute(self, _entity: Entity, name: str) -> bool:
         entity_uuid = _entity.uuid
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             query = session.query(AttributeTable).filter(AttributeTable.entity_uuid == entity_uuid,
                                                          AttributeTable.name == name)
@@ -835,7 +864,7 @@ class MySQLBackend(Backend):
         if _entarchy.current_analysis is not None:
             _analysis_uuid = _entarchy.current_analysis.uuid
 
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             attribute_query = session.query(AttributeTable).filter(AttributeTable.entity_uuid == entity_uuid)
             conditions = []
@@ -850,7 +879,7 @@ class MySQLBackend(Backend):
             for n, row in existing_rows.items():
 
                 if not row.mutable:
-                    raise RuntimeError(f'Attribute "{n}" is immutable and cannot be modified.')
+                    raise RuntimeError(f'Attribute "{n}" is immutable and cannot be modified on {_entity}.')
 
                 v = values[names.index(n)]
 
@@ -887,7 +916,7 @@ class MySQLBackend(Backend):
     def get_collection_count(self, _collection: Collection, creation_time: datetime.datetime = None) -> int:
 
         # Fetch result
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
             query = _build_query_from_collection(_collection, session)
 
             res = query.count()
@@ -897,7 +926,7 @@ class MySQLBackend(Backend):
     def get_collection_entity_by_index(self, _collection: Collection, index: int, creation_time: datetime.datetime = None) -> tuple[str, str]:
 
         # Fetch result
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
             query = _build_query_from_collection(_collection, session)
 
             res = query.order_by(EntityTable.uuid).offset(index).limit(1).one()
@@ -913,7 +942,7 @@ class MySQLBackend(Backend):
         start, stop, step = _slice.indices(count)
 
         # Fetch result
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
             query = _build_query_from_collection(_collection, session)
 
             res = query.order_by(EntityTable.uuid).offset(start).limit(stop - start).all()
@@ -925,7 +954,7 @@ class MySQLBackend(Backend):
     def get_collection_parent_uuids(self, _collection: Collection) -> list[tuple[str, str]]:
 
         # Fetch result
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             # Get entity query for collection
             entity_query = _build_query_from_collection(_collection, session)
@@ -938,7 +967,7 @@ class MySQLBackend(Backend):
     def get_collection_attribute_names(self, _collection: Collection) -> list[str]:
 
         # Fetch result
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             # Get entity query for collection
             entity_query = _build_query_from_collection(_collection, session)
@@ -958,7 +987,7 @@ class MySQLBackend(Backend):
         entity_type_name = _collection.entity_type.__name__
 
         # Fetch result
-        with sqlalchemy.orm.Session(self.sql_engine) as session:
+        with self.sql_session as session:
 
             # Get entity query for collection
             entity_query = _build_query_from_collection(_collection, session)
@@ -1106,7 +1135,7 @@ class MySQLBackend(Backend):
                 df_insert['modified'] = datetime.datetime.now()
 
             # Perform upsert
-            with sqlalchemy.orm.Session(self.sql_engine) as session:
+            with self.sql_session as session:
                 insert_attr_data = df_insert.to_dict('records')
                 insert_stmt = sqlalchemy.dialects.mysql.insert(AttributeTable).values(insert_attr_data)
                 update_attr_data = {
@@ -1128,8 +1157,11 @@ class MySQLBackend(Backend):
 
     def open(self):
         # Just access the property to create the engine if it doesn't exist yet
-        _ = self.sql_engine
+        # _ = self.sql_engine
+        pass
 
     def close(self):
         self.sql_engine.dispose()
         self._sql_engine = None
+        self.sql_session.close()
+        self._sql_session = None

@@ -460,17 +460,21 @@ class Collection(object):
 
     # Set operations
 
-    def __or__(self, other):
+    def __or__(self, other: Collection | str):
         """Create a new collection that is the union between this collection and another.
 
         Args:
-            other (Collection): Another collection to add.
+            other (Collection | str): Another collection to add.
 
         Example:
             collection_a = Collection(EntityTypeA, entarchy, query_a)
             collection_b = Collection(EntityTypeA, entarchy, query_b)
             collection_c = collection_a + collection_b
         """
+
+        # If other is a string, treat it as a query and add the resulting collection to this collection
+        if isinstance(other, str):
+            return self | self.entarchy.get(self.entity_type, other)
 
         if len(self.as_tree) == 0 or len(other.as_tree) == 0:
             raise RuntimeError('One of the AS trees is empty. '
@@ -486,17 +490,21 @@ class Collection(object):
         new_tree = query.combine_trees('UNION', self.as_tree, other.as_tree)
         return Collection(self.entarchy, self.entity_type, new_tree)
 
-    def __and__(self, other):
+    def __and__(self, other: Collection | str):
         """Create a new collection that is the intersection between this collection and another.
 
         Args:
-            other (Collection): Another collection to intersect.
+            other (Collection | str): Another collection to intersect.
 
         Example:
             collection_a = Collection(EntityTypeA, entarchy, query_a)
             collection_b = Collection(EntityTypeA, entarchy, query_b)
             collection_c = collection_a & collection_b
         """
+
+        # If other is a string, treat it as a query and intersect with the resulting collection
+        if isinstance(other, str):
+            return self.where(other)
 
         if len(self.as_tree) == 0 or len(other.as_tree) == 0:
             raise RuntimeError('One of the AS trees is empty. '
@@ -528,17 +536,20 @@ class Collection(object):
         new_tree = query.combine_trees('COMPLEMENT', self.as_tree)
         return Collection(self.entarchy, self.entity_type, new_tree)
 
-    def __sub__(self, other):
+    def __sub__(self, other: Collection | str):
         """Create a new collection that is the difference between this collection and another.
 
         Args:
-            other (Collection): Another collection to subtract.
+            other (Collection | str): Another collection to subtract.
 
         Example:
             collection_a = Collection(EntityTypeA, entarchy, query_a)
             collection_b = Collection(EntityTypeA, entarchy, query_b)
             collection_c = collection_a - collection_b
         """
+
+        if isinstance(other, str):
+            return self - self.entarchy.get(self.entity_type, other)
 
         if len(self.as_tree) == 0 or len(other.as_tree) == 0:
             raise RuntimeError('One of the AS trees is empty. '
@@ -554,17 +565,20 @@ class Collection(object):
         new_tree = query.combine_trees('DIFFERENCE', self.as_tree, other.as_tree)
         return Collection(self.entarchy, self.entity_type, new_tree)
 
-    def __xor__(self, other):
+    def __xor__(self, other: Collection | str):
         """Create a new collection that is the symmetric difference between this collection and another.
 
         Args:
-            other (Collection): Another collection to xor.
+            other (Collection | str): Another collection to xor.
 
         Example:
             collection_a = Collection(EntityTypeA, entarchy, query_a)
             collection_b = Collection(EntityTypeA, entarchy, query_b)
             collection_c = collection_a ^ collection_b
         """
+
+        if isinstance(other, str):
+            return self ^ self.entarchy.get(self.entity_type, other)
 
         if len(self.as_tree) == 0 or len(other.as_tree) == 0:
             raise RuntimeError('One of the AS trees is empty. '
@@ -677,7 +691,9 @@ class Collection(object):
                     parent_attr_name = parent_attr.replace('../', '')
                 else:
                     if not (('[' in parent_attr) and (']' in parent_attr)):
-                        raise ValueError('Malformed attribute name for parent entity traversal.')
+                        raise ValueError('Malformed attribute name for parent entity traversal. '
+                                         'Explicit parent attribute addressing must be '
+                                         'of format "[ParentEntityTypeName]attr_name".')
                     parent_entity_type_name, parent_attr_name = parent_attr.replace('[', '').split(']')
                     parent_level = get_ancestor_distance_from_nested(self.entarchy.hierarchy,
                                                                      self.entity_type.__name__,
