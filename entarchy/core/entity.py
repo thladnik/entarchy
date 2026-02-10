@@ -751,7 +751,7 @@ class Collection(object):
         print(f'Run function {fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {entity_count} entities')
 
-        with alive_progress.alive_bar(entity_count, spinner='fish2') as bar:
+        with alive_progress.alive_bar(entity_count, spinner='fish2', force_tty=True) as bar:
             for entity in self:
                 fun(entity, **kwargs)
                 bar()
@@ -781,25 +781,10 @@ class Collection(object):
             worker_num = mp.cpu_count() - 2
             if entity_count < worker_num:
                 worker_num = entity_count
+
         print(f'Start pool with {worker_num} workers')
-
-        # Package entities together with their mapped function and arguments
-        #  and make the entity table instances transient
-        print(f'Prepare entities')
-        t = time.perf_counter()
-        # kwargs = tuple([(k, v) for k, v in kwargs.items()])
-        # worker_args = []
-        # for entity in self:
-        #     worker_args.append((fun, entity, kwargs))
-
-        # self.entarchy.backend.close()
-
-        print('Open processing pool')
-        # with (mp.Pool(processes=worker_num, initializer=self.worker_init, initargs=(self.entarchy,)) as pool,
         with (mp.Pool(processes=worker_num) as pool,
-              alive_progress.alive_bar(entity_count, spinner='fish2') as bar):
-
-            print(f'> Preparation finished in {time.perf_counter() - t:.2f}s')
+              alive_progress.alive_bar(entity_count, spinner='fish2', length=20, spinner_length=20, force_tty=True) as bar):
 
             # Map entities to process pool
             start_time = time.time()
@@ -891,13 +876,6 @@ class Collection(object):
             collection_type = self.entity_type.collection_type
 
         return collection_type(self.entarchy, self.entity_type, new_tree)
-
-    # @staticmethod
-    # def worker_init(_entarchy: Entarchy):
-    #     """Subprocess initializer function for concurrent execution
-    #     """
-    #
-    #     _entarchy.backend.open()
 
     @staticmethod
     def worker_wrapper(args):

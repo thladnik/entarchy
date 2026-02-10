@@ -310,7 +310,8 @@ class Entarchy:
         _entities_to_update = self._entities_to_update.copy()
         with alive_progress.alive_bar(monitor=f'| Update {len(_entities_to_update)} entities',
                                       monitor_end=f'Updated {len(_entities_to_update)} entities',
-                                      bar=None, spinner='fish2', spinner_length=30, stats=False) as _:
+                                      bar=None, spinner='fish2', spinner_length=30, stats=False,
+                                      force_tty=True) as _:
             for _uuid in _entities_to_update:
                 self._entities[_uuid].commit()
 
