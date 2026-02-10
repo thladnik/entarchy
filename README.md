@@ -1,2 +1,2 @@
-## Entarchy - entity hierarchy data management framework for Python analysis prototyping
+## Entarchy - Hierarchical entity data manger for analysis prototyping 
 
