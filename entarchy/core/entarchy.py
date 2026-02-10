@@ -56,12 +56,6 @@ class Entarchy:
 
         # TODO: Check version compatibility
 
-        # Load backend
-        _backend_path = self._config['backend']
-        _backend_path_parts = _backend_path.split('.')
-        _backend_cls = getattr(importlib.import_module('.'.join(_backend_path_parts[:-1])), _backend_path_parts[-1])
-        self._backend = _backend_cls(**self._config['backend_config'], debug=self._debug)
-
         # Set up entities objects
         self._entities: dict[str, Entity] = {}
         self._entities_to_add: list[str] = []
@@ -86,6 +80,13 @@ class Entarchy:
         self.commit()
         self._is_in_context = False
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Remove backend from serialization, so it may stay open on original object
+        #  This prevents broken file handles or database connections
+        del state['_backend']
+        return state
+
     def __hash__(self):
         return hash(self.path)
 
@@ -94,6 +95,14 @@ class Entarchy:
 
     @property
     def backend(self) -> MySQLBackend:  # Backend:
+
+        if not hasattr(self, '_backend') or self._backend is None:
+            # Load backend
+            _backend_path = self._config['backend']
+            _backend_path_parts = _backend_path.split('.')
+            _backend_cls = getattr(importlib.import_module('.'.join(_backend_path_parts[:-1])), _backend_path_parts[-1])
+            self._backend = _backend_cls(**self._config['backend_config'], debug=self._debug)
+
         return self._backend
 
     @property
@@ -365,7 +374,7 @@ class Entarchy:
 
         print(f'\nSuccessfully deleted analysis {path}')
 
-    def get(self, entity_type: Type[Entity], *_string_expressions: str, **_equalities) -> Collection:
+    def get(self, entity_type: Type[Entity] | str, *_string_expressions: str, **_equalities) -> Collection:
         """Get a collection of entities of a given type.
 
         Args:
@@ -379,6 +388,9 @@ class Entarchy:
             Collection: A collection of entities of the given type.
 
         """
+
+        if isinstance(entity_type, str):
+            entity_type = self.get_entity_type(entity_type)
 
         # Add equality filters to filter expressions
         for k, v in _equalities.items():

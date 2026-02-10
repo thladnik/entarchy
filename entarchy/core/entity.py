@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 import time
 import uuid
-from typing import Any, Type, Union, TYPE_CHECKING, Callable
+from typing import Any, Generator, Type, Union, TYPE_CHECKING, Callable
 
 import alive_progress
 import numpy as np
@@ -349,7 +349,7 @@ class Entity(object):
         """
         return self.entarchy.backend.get_entity_attribute_names(self)
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """Return a dictionary of all dynamic attributes for this entity.
         """
         keys = self.keys()
@@ -630,14 +630,6 @@ class Collection(object):
     def init_time(self) -> datetime.datetime:
         return self._init_time
 
-    def get_entity(self, _uuid: str, _id: str) -> Entity:
-
-        _init_cache = None
-        if _uuid in self._cache.index:
-            _init_cache = self._cache.loc[_uuid].to_dict()
-
-        return self.entity_type(_entarchy=self.entarchy, _uuid=_uuid, _id=_id, _init_cache=_init_cache)
-
     def _load_attributes(self, attribute_names: list[str]):
 
         # Load attributes from backend
@@ -739,6 +731,17 @@ class Collection(object):
         # if self._query_custom_orderby:
         #     return self._cache.loc[self._pk_order, attribute_names]
 
+    def get_entity(self, _uuid: str, _id: str) -> Entity:
+
+        _init_cache = None
+        if _uuid in self._cache.index:
+            _init_cache = self._cache.loc[_uuid].to_dict()
+
+        return self.entity_type(_entarchy=self.entarchy, _uuid=_uuid, _id=_id, _init_cache=_init_cache)
+
+    def keys(self) -> list[str]:
+        return self.columns
+
     def map(self, fun: Callable, **kwargs) -> Any:
         """Sequentially apply a function to each Entity of the collection (kwargs are passed onto the function)
         """
@@ -748,7 +751,7 @@ class Collection(object):
         print(f'Run function {fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {entity_count} entities')
 
-        with alive_progress.alive_bar(entity_count, spinner='fishes') as bar:
+        with alive_progress.alive_bar(entity_count, spinner='fish2') as bar:
             for entity in self:
                 fun(entity, **kwargs)
                 bar()
@@ -784,16 +787,17 @@ class Collection(object):
         #  and make the entity table instances transient
         print(f'Prepare entities')
         t = time.perf_counter()
-        kwargs = tuple([(k, v) for k, v in kwargs.items()])
-        worker_args = []
-        for entity in self:
-            worker_args.append((fun, entity, kwargs))
+        # kwargs = tuple([(k, v) for k, v in kwargs.items()])
+        # worker_args = []
+        # for entity in self:
+        #     worker_args.append((fun, entity, kwargs))
 
-        self.entarchy.backend.close()
+        # self.entarchy.backend.close()
 
         print('Open processing pool')
-        with (mp.Pool(processes=worker_num, initializer=self.worker_init, initargs=(self.entarchy,)) as pool,
-              alive_progress.alive_bar(entity_count, spinner='fishes') as bar):
+        # with (mp.Pool(processes=worker_num, initializer=self.worker_init, initargs=(self.entarchy,)) as pool,
+        with (mp.Pool(processes=worker_num) as pool,
+              alive_progress.alive_bar(entity_count, spinner='fish2') as bar):
 
             print(f'> Preparation finished in {time.perf_counter() - t:.2f}s')
 
@@ -801,7 +805,7 @@ class Collection(object):
             start_time = time.time()
             print(f'Start processing at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))}')
 
-            iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
+            iterator = pool.imap_unordered(self.worker_wrapper, self._async_iterator(fun, **kwargs))
             for iter_num in range(entity_count):
 
                 # Next iteration
@@ -811,6 +815,9 @@ class Collection(object):
                 # Catch
                 except StopIteration:
                     pass
+
+                # except KeyboardInterrupt:
+                #     break
 
                 # Re-raise any exception raised by worker wrapper
                 except Exception as _exc:
@@ -835,7 +842,14 @@ class Collection(object):
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
 
-    def to_dict(self):
+    def _async_iterator(self, fun: Callable, **kwargs) -> Generator[Any, None, None]:
+        """Generator that yields results of applying a function to each entity in the collection concurrently.
+        """
+        kwargs = tuple([(k, v) for k, v in kwargs.items()])
+        for entity in self:
+            yield fun, entity, kwargs
+
+    def to_dict(self) -> Generator[dict[str, Any]]:
         """
         Return a generator of dictionaries of all dynamic attributes for each entity in the collection.
         """
@@ -871,14 +885,19 @@ class Collection(object):
         else:
             new_tree = query.combine_trees('INTERSECTION', self.as_tree, _collection.as_tree)
 
-        return Collection(self.entarchy, self.entity_type, new_tree)
+        if self.entity_type.collection_type is None:
+            collection_type = Collection
+        else:
+            collection_type = self.entity_type.collection_type
 
-    @staticmethod
-    def worker_init(_entarchy: Entarchy):
-        """Subprocess initializer function for concurrent execution
-        """
+        return collection_type(self.entarchy, self.entity_type, new_tree)
 
-        _entarchy.backend.open()
+    # @staticmethod
+    # def worker_init(_entarchy: Entarchy):
+    #     """Subprocess initializer function for concurrent execution
+    #     """
+    #
+    #     _entarchy.backend.open()
 
     @staticmethod
     def worker_wrapper(args):
@@ -895,6 +914,10 @@ class Collection(object):
 
         # Run
         fun(entity, **kwargs)
+
+        # Close backend to avoid broken file handles and dangling open database connections in subprocesses after fork
+        #  (especially important for MySQL backend, which does not allow sharing connections between processes)
+        entity.entarchy.backend.close()
 
         return time.perf_counter() - start_time
 

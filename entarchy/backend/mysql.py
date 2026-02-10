@@ -197,6 +197,9 @@ def _generate_attribute_filters(entity_type_name: str,
                     raise ValueError('Malformed attribute name for parent entity traversal.')
                 parent_entity_type_name, attr_name = name.replace('[', '').split(']')
                 parent_level = get_entity_type_ancestor_distance(_session, entity_type_name, parent_entity_type_name)
+
+                if parent_level is None:
+                    raise ValueError(f'Entity type "{parent_entity_type_name}" is not an ancestor of "{entity_type_name}".')
                 # print(f'Going {parent_level} up from {entity_type_name} to {parent_entity_type_name}')
 
             if not attr_name:
@@ -356,18 +359,17 @@ class Serializer(object):
 
         if isinstance(data, bytes):
             self._data = data
-        elif isinstance(data, list):
-            self._data = pickle.dumps(data)
-        elif isinstance(data, dict):
-            self._data = pickle.dumps(data)
+        # elif isinstance(data, list):
+        #     self._data = pickle.dumps(data)
+        # elif isinstance(data, dict):
+        #     self._data = pickle.dumps(data)
         elif isinstance(data, np.ndarray):
             with io.BytesIO() as buffer:
                 np.lib.format.write_array(buffer, data, allow_pickle=True)
                 buffer.seek(0)
                 self._data = buffer.read()
-
         else:
-            raise TypeError(f'Unsupported data type for serialization: {type(data)}')
+            self._data = pickle.dumps(data)
 
         if self._data.__sizeof__() >= _entity.entarchy.max_blob_size:
 
@@ -403,15 +405,16 @@ class Serializer(object):
         # Return data according to original type
         if self._type is bytes:
             return self._data
-        elif self._type is list:
-            return pickle.loads(self._data)
-        elif self._type is dict:
-            return pickle.loads(self._data)
+        # elif self._type is list:
+        #     return pickle.loads(self._data)
+        # elif self._type is dict:
+        #     return pickle.loads(self._data)
         elif self._type is np.ndarray:
             with io.BytesIO(self._data) as buffer:
                 buffer.seek(0)
                 return np.lib.format.read_array(buffer, allow_pickle=True)
         else:
+            return pickle.loads(self._data)
             raise TypeError(f'Unsupported data type during deserialization: {self._type}')
 
 
@@ -571,7 +574,10 @@ class MySQLBackend(Backend):
                                              f'{self.dbuser}:{self.dbpassword}'
                                              f'@{self.dbhost}/{self.dbname}',
                                              echo=self.debug,
-                                             poolclass=sqlalchemy.pool.NullPool)
+                                             pool_size=1,
+                                             max_overflow=5,
+                                             # poolclass=sqlalchemy.pool.NullPool
+                                             )
 
         return self._sql_engine
 
