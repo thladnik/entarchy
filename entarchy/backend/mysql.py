@@ -131,7 +131,11 @@ def retry_on_operational_failure(fun: Callable, retry_num: int = 1) -> Callable:
             except OperationalError as e:
                 i += 1
 
-        raise e
+            except Exception as e:
+                raise e
+
+        if i > retry_num:
+            raise e
 
     return _wrapper
 
