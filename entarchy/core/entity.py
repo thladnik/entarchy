@@ -441,7 +441,7 @@ class Collection(object):
         raise KeyError(f'Invalid key {item}')
 
     def __iter__(self):
-        return CollectionBatchIterator(self)
+        return CollectionIterator(self)
 
     def __setitem__(self, key, value):
 
@@ -900,36 +900,57 @@ class Collection(object):
         return time.perf_counter() - start_time
 
 
-class CollectionBatchIterator(object):
+class CollectionIterator(object):
 
     def __init__(self, _collection: Collection):
         self._collection = _collection
-        self._batch_size = 100
         self._current_index = 0
-        self._total_length = len(_collection)
-        self._batch_offset = 0
-        self._batch_results = []
+        self._results = self._collection.entarchy.backend.get_collection_entities_by_slice(self._collection, slice(None, None, None))
 
     def __next__(self):
-        # Fetch the next batch of results
-        if self._current_index == 0 or (self._current_index == self._batch_offset + self._batch_size):
-            self._batch_offset = self._current_index
-            _slice = slice(self._batch_offset, self._batch_offset + self._batch_size)
-            res = self._collection.entarchy.backend.get_collection_entities_by_slice(self._collection, _slice)
-
-            self._batch_results = res
-
         # No more results: reset iteration counter and offset and stop iteration
-        if len(self._batch_results) == 0 or self._current_index >= self._total_length:
+        if self._current_index >= len(self._results):
             raise StopIteration
 
         # Return single result
-        current_row = self._batch_results[self._current_index - self._batch_offset]
+        current_row = self._results[self._current_index]
 
         # Increment count
         self._current_index += 1
 
         return self._collection.get_entity(_uuid=current_row[0], _id=current_row[1])
+
+
+# class CollectionBatchIterator(object):
+#
+#     def __init__(self, _collection: Collection):
+#         self._collection = _collection
+#         self._batch_size = 100
+#         self._current_index = 0
+#         self._total_length = len(_collection)
+#         self._batch_offset = 0
+#         self._batch_results = []
+#
+#     def __next__(self):
+#         # Fetch the next batch of results
+#         if self._current_index == 0 or (self._current_index == self._batch_offset + self._batch_size):
+#             self._batch_offset = self._current_index
+#             _slice = slice(self._batch_offset, self._batch_offset + self._batch_size)
+#             res = self._collection.entarchy.backend.get_collection_entities_by_slice(self._collection, _slice)
+#
+#             self._batch_results = res
+#
+#         # No more results: reset iteration counter and offset and stop iteration
+#         if len(self._batch_results) == 0 or self._current_index >= self._total_length:
+#             raise StopIteration
+#
+#         # Return single result
+#         current_row = self._batch_results[self._current_index - self._batch_offset]
+#
+#         # Increment count
+#         self._current_index += 1
+#
+#         return self._collection.get_entity(_uuid=current_row[0], _id=current_row[1])
 
 
 def _find_path(hierarchy: dict[str, Any], target: str) -> list[str] | None:
