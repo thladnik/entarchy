@@ -6,7 +6,7 @@ import os.path
 import pathlib
 import pickle
 import datetime
-from typing import Any, List, Union
+from typing import Any, Callable, List, Union
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,7 @@ import sqlalchemy
 from sqlalchemy import Index, ForeignKey, String, create_engine, BigInteger, Double
 from sqlalchemy.dialects.mysql import LONGBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.exc import OperationalError
 
 from .backend import Backend
 from .. import AnalysisEntity, Collection, Entarchy, Entity
@@ -110,6 +111,29 @@ class AttributeTable(Base):
 
     def __repr__(self):
         return f"<Attribute({self.name}, {self.entity})>"
+
+
+def retry_on_operational_failure(fun: Callable, retry_num: int = 1) -> Callable:
+    """Decorator for catching sqlalchemy.exc.OperationalError,
+    which is typically emitted when a connection has been disconnected by the host.
+    """
+
+    assert retry_num > 0, 'Need at least one retry'
+
+    def _wrapper(self, *args, **kwargs):
+        i = 0
+
+        while i <= retry_num:
+
+            try:
+                return fun(self, *args, **kwargs)
+
+            except OperationalError as e:
+                i += 1
+
+        raise e
+
+    return _wrapper
 
 
 def _build_query_from_collection(_collection: Collection,
@@ -536,6 +560,20 @@ class MySQLBackend(Backend):
         return self._config['dbpassword']
 
     @property
+    def sql_engine(self):
+        if self._sql_engine is None:
+            self._sql_engine = create_engine(f'mysql+pymysql://'
+                                             f'{self.dbuser}:{self.dbpassword}'
+                                             f'@{self.dbhost}/{self.dbname}',
+                                             echo=self.debug,
+                                             pool_size=1,
+                                             max_overflow=5,
+                                             # poolclass=sqlalchemy.pool.NullPool
+                                             )
+
+        return self._sql_engine
+
+    @property
     def sql_session(self) -> sqlalchemy.orm.Session:
         if self._sql_session is None:
             self._sql_session = sqlalchemy.orm.Session(self.sql_engine)
@@ -567,20 +605,7 @@ class MySQLBackend(Backend):
 
         return self._db_triggers_enabled
 
-    @property
-    def sql_engine(self):
-        if self._sql_engine is None:
-            self._sql_engine = create_engine(f'mysql+pymysql://'
-                                             f'{self.dbuser}:{self.dbpassword}'
-                                             f'@{self.dbhost}/{self.dbname}',
-                                             echo=self.debug,
-                                             pool_size=1,
-                                             max_overflow=5,
-                                             # poolclass=sqlalchemy.pool.NullPool
-                                             )
-
-        return self._sql_engine
-
+    @retry_on_operational_failure
     def create(self) -> bool:
 
         # Create schema
@@ -637,6 +662,7 @@ class MySQLBackend(Backend):
 
         return True
 
+    @retry_on_operational_failure
     def create_type_hierarchy(self, _hierarchy: dict[str, ...]) -> bool:
 
         with self.sql_session as session:
@@ -652,6 +678,7 @@ class MySQLBackend(Backend):
 
         return True
 
+    @retry_on_operational_failure
     def delete(self, confirm: bool = False):
 
         if not confirm:
@@ -666,6 +693,7 @@ class MySQLBackend(Backend):
 
     # Entity related methods
 
+    @retry_on_operational_failure
     def add_entities(self, _entities: list[Entity]) -> bool:
 
         with self.sql_session as session:
@@ -696,6 +724,7 @@ class MySQLBackend(Backend):
 
         return self.get_entity_attributes(_entity, [name])[0]
 
+    @retry_on_operational_failure
     def get_entity_attribute_names(self, _entity: Entity) -> list[str]:
 
         entity_uuid = _entity.uuid
@@ -708,6 +737,7 @@ class MySQLBackend(Backend):
 
         return names
 
+    @retry_on_operational_failure
     def get_entity_attributes(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
 
         entity_uuid = _entity.uuid
@@ -732,6 +762,7 @@ class MySQLBackend(Backend):
 
         return tuple(values)
 
+    @retry_on_operational_failure
     def get_entity_by_uuid(self,_entarchy: Entarchy, entity_uuid: str) -> Entity:
 
         with self.sql_session as session:
@@ -749,6 +780,7 @@ class MySQLBackend(Backend):
 
         return entity_type(_entarchy, _uuid=entity_uuid, _id=entity_id)
 
+    @retry_on_operational_failure
     def get_entity_modified_time(self, _entity: Entity) -> datetime.datetime:
 
         entity_uuid = _entity.uuid
@@ -765,6 +797,7 @@ class MySQLBackend(Backend):
 
         return row.modified
 
+    @retry_on_operational_failure
     def get_entities_of_type(self, entity_type: str) -> list[tuple[str, str]]:
 
         with self.sql_session as session:
@@ -778,6 +811,7 @@ class MySQLBackend(Backend):
 
             return [(row.uuid, row.id) for row in query.all()]
 
+    @retry_on_operational_failure
     def get_entity_parent(self, _entity: Entity) -> Union[tuple[str, str, str], None]:
         entity_uuid = _entity.uuid
 
@@ -796,6 +830,7 @@ class MySQLBackend(Backend):
             else:
                 return row.parent.entity_type.name, row.parent.uuid, row.parent.id
 
+    @retry_on_operational_failure
     def get_link(self, linker: Entity, linked: Entity) -> Union[tuple[str, str, str], None]:
 
         with self.sql_session as session:
@@ -846,6 +881,7 @@ class MySQLBackend(Backend):
             else:
                 return row.entity.entity_type.name, row.entity.uuid, row.entity.id
 
+    @retry_on_operational_failure
     def has_entity_attribute(self, _entity: Entity, name: str) -> bool:
         entity_uuid = _entity.uuid
 
@@ -856,12 +892,14 @@ class MySQLBackend(Backend):
 
             return query.count() > 0
 
+    @retry_on_operational_failure
     def set_entity_attribute(self, entity_uuid, key: str, value: Any):
 
         self.set_entity_attributes(entity_uuid, [key], [value])
 
         return True, ''
 
+    @retry_on_operational_failure
     def set_entity_attributes(self, _entity: Entity, names: list[str], values: list[Any]) -> tuple[bool, str]:
 
         _entarchy = _entity.entarchy
@@ -920,6 +958,7 @@ class MySQLBackend(Backend):
 
     # Collection related methods
 
+    @retry_on_operational_failure
     def get_collection_count(self, _collection: Collection, creation_time: datetime.datetime = None) -> int:
 
         # Fetch result
@@ -930,6 +969,7 @@ class MySQLBackend(Backend):
 
             return res
 
+    @retry_on_operational_failure
     def get_collection_entity_by_index(self, _collection: Collection, index: int, creation_time: datetime.datetime = None) -> tuple[str, str]:
 
         # Fetch result
@@ -940,6 +980,7 @@ class MySQLBackend(Backend):
 
         return res.uuid, res.id
 
+    @retry_on_operational_failure
     def get_collection_entities_by_slice(self, _collection: Collection, _slice: slice) -> list[tuple[str, str]]:
 
         entity_type_name = _collection.entity_type.__name__
@@ -958,6 +999,7 @@ class MySQLBackend(Backend):
         #        but it's not clear how is would work in SQLAlchemy ORM; figure out later
         return [(r.uuid, r.id) for r in res[::step]]
 
+    @retry_on_operational_failure
     def get_collection_parent_uuids(self, _collection: Collection) -> list[tuple[str, str]]:
 
         # Fetch result
@@ -971,6 +1013,7 @@ class MySQLBackend(Backend):
 
         return [(r.uuid, r.parent_uuid) for r in res]
 
+    @retry_on_operational_failure
     def get_collection_attribute_names(self, _collection: Collection) -> list[str]:
 
         # Fetch result
@@ -989,6 +1032,7 @@ class MySQLBackend(Backend):
 
         return names
 
+    @retry_on_operational_failure
     def get_collection_attributes(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
 
         entity_type_name = _collection.entity_type.__name__
@@ -1090,6 +1134,7 @@ class MySQLBackend(Backend):
 
         return df
 
+    @retry_on_operational_failure
     def set_collection_attributes(self, _collection: Collection, df: pd.DataFrame) -> None:
 
         _entarchy = _collection.entarchy
