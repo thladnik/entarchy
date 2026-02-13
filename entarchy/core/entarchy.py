@@ -363,6 +363,7 @@ class Entarchy:
 
             if counter % 10 == 0:
                 # print(' ' * 500, end='\n')
+                sys.stdout.write('\r' + ' ' * 255)
                 sys.stdout.write(f'\rRemove {directory.as_posix()}')
             counter += 1
             directory.rmdir()

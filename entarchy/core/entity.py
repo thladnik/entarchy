@@ -756,7 +756,13 @@ class Collection(object):
                 fun(entity, **kwargs)
                 bar()
 
-    def map_async(self, fun: Callable, worker_num: int = None, **kwargs) -> Any:
+    def map_async(self,
+                  _fun: Callable,
+                  _worker_num: int = None,
+                  _chunk_size: int = None,
+                  _use_gpu: bool = False,
+                  _gpu_max_device_num: int = None,
+                  **kwargs) -> None:
         """
         Concurrently apply a function to each Entity of the collection (kwargs are passed onto the function)
 
@@ -768,61 +774,50 @@ class Collection(object):
 
         entity_count = len(self)
 
-        print(f'Run function {fun.__name__} on {self} with args '
+        print(f'Run function {_fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {entity_count} {self.entity_type.__name__} entities')
 
-        if len(self) == 0:
+        if entity_count == 0:
             print('No entities to operate on in collection')
             return
 
         # Prepare pool and entities
         import multiprocessing as mp
-        if worker_num is None:
-            worker_num = mp.cpu_count() - 2
-            if entity_count < worker_num:
-                worker_num = entity_count
+        if _worker_num is None:
+            _worker_num = mp.cpu_count() - 2
+            if entity_count < _worker_num:
+                _worker_num = entity_count
 
-        print(f'Start pool with {worker_num} workers')
-        with (mp.Pool(processes=worker_num) as pool,
+        # Set chunk size (crucial for performance of large collections)
+        if _chunk_size is None:
+            _chunk_size = int(entity_count / 1_000)
+            if _chunk_size == 0:
+                _chunk_size = 1
+
+        # Set _gpu_max_device_num if necessary
+        if _use_gpu and _gpu_max_device_num is None:
+            import torch
+            kwargs['_use_gpu'] = _use_gpu
+            kwargs['_gpu_max_device_num'] = torch.cuda.device_count()
+
+        print(f'Start pool with {_worker_num} workers')
+        with (mp.Pool(processes=_worker_num) as pool,
               alive_progress.alive_bar(entity_count, spinner='fish2', length=20, spinner_length=20, force_tty=True) as bar):
 
             # Map entities to process pool
             start_time = time.time()
             print(f'Start processing at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))}')
 
-            iterator = pool.imap_unordered(self.worker_wrapper, self._async_iterator(fun, **kwargs))
+            t = time.perf_counter()
+            iterator = pool.imap(self.worker_wrapper, self._async_iterator(_fun, **kwargs), chunksize=_chunk_size)
             for iter_num in range(entity_count):
 
-                # Next iteration
-                try:
-                    exec_time = next(iterator)
-
-                # Catch
-                except StopIteration:
-                    pass
-
-                # except KeyboardInterrupt:
-                #     break
-
-                # Re-raise any exception raised by worker wrapper
-                except Exception as _exc:
-                    raise _exc
-
-                # Calcualate timing info
-                # execution_times.append(exec_time)
-                # mean_exec_time = np.mean(execution_times) if len(execution_times) > 0 else 0
-                # time_per_entity = mean_exec_time / worker_num
-                # time_elapsed = time.time() - start_time
-                # time_rest = time_per_entity * (entity_count - iter_num)
+                _ = next(iterator)
 
                 bar()
 
-                # pbar.update(1)
-                # pbar.set_postfix({
-                #     'time_per_iter': f'{time_per_entity:.2f}s',
-                #     'elapsed': str(datetime.timedelta(seconds=int(time_elapsed))),
-                #     'eta': str(datetime.timedelta(seconds=int(time_rest))),
-                # })
+            pool.close()
+            pool.join()
 
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
@@ -831,8 +826,8 @@ class Collection(object):
         """Generator that yields results of applying a function to each entity in the collection concurrently.
         """
         kwargs = tuple([(k, v) for k, v in kwargs.items()])
-        for entity in self:
-            yield fun, entity, kwargs
+        for i, entity in enumerate(self):
+            yield fun, i, entity, kwargs
 
     def to_dict(self) -> Generator[dict[str, Any]]:
         """
@@ -887,11 +882,24 @@ class Collection(object):
 
         # Unpack args
         fun: Callable = args[0]
-        entity: Entity = args[1]
-        kwargs = {k: v for k, v in args[2]}
+        i: int = args[1]
+        entity: Entity = args[2]
+        kwargs = {k: v for k, v in args[3]}
+
+        # Set GPU device if applicable
+        _use_gpu = kwargs.pop('_use_gpu', False)
+        _gpu_max_device_num = kwargs.pop('_gpu_max_device_num')
+        if _use_gpu:
+            if _gpu_max_device_num > 0:
+                _use_gpu_device = f'cuda:{i % _gpu_max_device_num}'
+            else:
+                _use_gpu_device = 'cpu'
+
+            kwargs['_use_gpu_device'] = _use_gpu_device
 
         # Run
-        fun(entity, **kwargs)
+        with entity:
+            fun(entity, **kwargs)
 
         # Close backend to avoid broken file handles and dangling open database connections in subprocesses after fork
         #  (especially important for MySQL backend, which does not allow sharing connections between processes)

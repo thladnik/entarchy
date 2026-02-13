@@ -113,7 +113,7 @@ class AttributeTable(Base):
         return f"<Attribute({self.name}, {self.entity})>"
 
 
-def retry_on_operational_failure(fun: Callable, retry_num: int = 1) -> Callable:
+def retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable:
     """Decorator for catching sqlalchemy.exc.OperationalError,
     which is typically emitted when a connection has been disconnected by the host.
     """
@@ -122,20 +122,22 @@ def retry_on_operational_failure(fun: Callable, retry_num: int = 1) -> Callable:
 
     def _wrapper(self, *args, **kwargs):
         i = 0
-
+        err = None
         while i <= retry_num:
 
             try:
                 return fun(self, *args, **kwargs)
 
             except OperationalError as e:
+                err = e
                 i += 1
 
             except Exception as e:
+                err = e
                 raise e
 
-        if i > retry_num:
-            raise e
+        if err is not None:
+            raise err
 
     return _wrapper
 
@@ -342,7 +344,7 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
     # Load blob
     if row.data_type == 'blob':
         ser: Serializer = pickle.loads(row.value_blob)
-        return ser.deserialize()
+        return ser.deserialize(_entity.entarchy)
 
     # if row.data_type.startswith('blob'):
         # data_type, _format = row.data_type.split('::')
@@ -409,7 +411,7 @@ class Serializer(object):
             os.makedirs(fp, exist_ok=True)
 
             fullpath = f'{fp}/{fn}'
-            self._store = fullpath
+            self._store = pathlib.Path(fullpath).relative_to(_entity.entarchy.path)
 
             with open(fullpath, 'wb') as f:
                 f.write(self._data)
@@ -420,14 +422,14 @@ class Serializer(object):
         else:
             self._store = 'internal'
 
-    def deserialize(self):
+    def deserialize(self, _entarchy: Entarchy) -> Any:
 
         # print(f'Deserialize {self}')
         # Read from file if needed
         if self._store != 'internal':
             # Load from file
-            # print('> Read large blob from external file')
-            with open(self._store, 'rb') as f:
+            # print(f'Load from path {self._store}')
+            with open(os.path.join(_entarchy.path, self._store), 'rb') as f:
                 self._data = f.read()
 
         # Return data according to original type
@@ -502,10 +504,10 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
     row.__setattr__(f'value_{data_type}', data)
 
 
-def _deserialize(data: bytes) -> Any:
+def _deserialize(data: bytes, _entarchy: Entarchy) -> Any:
 
     ser: Serializer = pickle.loads(data)
-    return ser.deserialize()
+    return ser.deserialize(_entarchy)
 
 
 class MySQLBackend(Backend):
@@ -565,21 +567,21 @@ class MySQLBackend(Backend):
 
     @property
     def sql_engine(self):
-        if self._sql_engine is None:
+        if not hasattr(self, '_sql_engine') or self._sql_engine is None:
             self._sql_engine = create_engine(f'mysql+pymysql://'
                                              f'{self.dbuser}:{self.dbpassword}'
                                              f'@{self.dbhost}/{self.dbname}',
                                              echo=self.debug,
                                              pool_size=1,
-                                             max_overflow=5,
-                                             # poolclass=sqlalchemy.pool.NullPool
+                                             pool_recycle=60,
+                                             pool_pre_ping=True,
                                              )
 
         return self._sql_engine
 
     @property
     def sql_session(self) -> sqlalchemy.orm.Session:
-        if self._sql_session is None:
+        if not hasattr(self, '_sql_session') or self._sql_session is None:
             self._sql_session = sqlalchemy.orm.Session(self.sql_engine)
             
         return self._sql_session
@@ -1128,7 +1130,7 @@ class MySQLBackend(Backend):
                     df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode()), format='%Y-%m-%d %H:%M:%S')
                 # Load blobs
                 elif data_type == 'blob':
-                    df[n] = df[n].apply(lambda s: _deserialize(s) if s is not None else None)
+                    df[n] = df[n].apply(lambda s: _deserialize(s, _collection.entarchy) if s is not None else None)
 
             except ValueError:
                 raise RuntimeWarning(f'Failed to cast attribute {n} to type {data_type}')
@@ -1217,7 +1219,7 @@ class MySQLBackend(Backend):
         pass
 
     def close(self):
-        self.sql_engine.dispose()
-        self._sql_engine = None
         self.sql_session.close()
-        self._sql_session = None
+        self.sql_engine.dispose()
+        del self._sql_session
+        del self._sql_engine
