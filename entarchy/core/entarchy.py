@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import abc
-import contextlib
 import importlib
 import os
 import pathlib
 import pprint
-import shutil
 import sys
 from typing import Any, Callable, Type, TYPE_CHECKING, Union
 
@@ -21,12 +18,12 @@ if TYPE_CHECKING:
     from ..backend.mysql import MySQLBackend
 
 
-class Entarchy:
+class Entarchy(object):
     """Entarchy is a class that represents a system of hierarchically organized entities.
     """
     base_version: str = '0.1'
     base_min_compat_version = '0.1'
-    max_blob_size: int = 1 * 1024 * 1024  # 1 MB
+    max_blob_size: int = 10 * 1024 * 1024  # bytes (20MB)
     implementation_version: str
     implementation_min_compat_version: str
     _hierarchy_root: Type[Entity]
@@ -183,19 +180,32 @@ class Entarchy:
         return hierarchy, entity_map
 
     @classmethod
-    def create(cls, path: str, _backend: Backend, *args, **kwargs) -> Entarchy:
+    def create(cls, path: str,
+               _backend: Backend | str,
+               _backend_config: dict[str, Any] = None,
+               **kwargs) -> Entarchy:
         """Factory function to create an Entarchy instance from a given path.
 
         Args:
             path (str): The path to the entarchy configuration directory.
-            _backend (Backend): The backend instance to use for this entarchy.
-
+            _backend (Backend): an entarchy.backend.Backend object or its string representation
+            _backend_config (dict): dictionary for initialization of backend if _backend is str or type
         Returns:
-            Entarchy: An instance of cls.
+            Entarchy:
         """
 
-        # Resolve hierarchy and add Analysis entity
+        # Instantiate backend of necessary
+        if isinstance(_backend, str):
+            if '.' in _backend:
+                _backend_path_parts = _backend.split('.')
+                _backend_cls = getattr(importlib.import_module('.'.join(_backend_path_parts[:-1])), _backend_path_parts[-1])
+            else:
+                from .. import backend
+                _backend_cls = getattr(backend, _backend)(**(_backend_config or {}), debug=False)
 
+            _backend = _backend_cls(**(_backend_config or {}), debug=False)
+
+        # Resolve hierarchy and add Analysis entity
         hierarchy, entity_map = cls._resolve_hierarchy()
 
         # Check if path exists, otherwise create
@@ -221,7 +231,7 @@ class Entarchy:
             yaml.safe_dump(_config, f)
 
         # Create instance
-        ent = cls(path, *args, **kwargs)
+        ent = cls(path, **kwargs)
 
         # Create backend
         res = ent.backend.create()
@@ -311,9 +321,10 @@ class Entarchy:
         with alive_progress.alive_bar(monitor=f'| Update {len(_entities_to_update)} entities',
                                       monitor_end=f'Updated {len(_entities_to_update)} entities',
                                       bar=None, spinner='fish2', spinner_length=30, stats=False,
-                                      force_tty=True) as _:
+                                      force_tty=True) as bar:
             for _uuid in _entities_to_update:
                 self._entities[_uuid].commit()
+                bar()
 
     @property
     def current_analysis(self) -> Union[AnalysisEntity, None]:
@@ -372,7 +383,6 @@ class Entarchy:
 
         # Delete tree
         rmdir(path, 0)
-        # shutil.rmtree(path)
 
         print(f'\nSuccessfully deleted analysis {path}')
 
@@ -452,22 +462,22 @@ class Entarchy:
 
         return entity_type
 
-    def get_link(self, linker: Entity, linked: Entity) -> Union[LinkEntity, None]:
-
-        """Get a link entity between two entities if it exists.
-
-        Args:
-            linker (Entity): The linking entity.
-            linked (Entity): The linked entity.
-        """
-        raise NotImplementedError('Links are not implemented yet.')
-
-        link_key = (linker.uuid, linked.uuid)
-        if link_key not in self._links:
-            self.backend.get_link_uuid(linker, linked)
-
-        link_uuid = self._links[link_key]
-        return self.get_entity('LinkEntity', link_uuid, None)
+    # def get_link(self, linker: Entity, linked: Entity) -> Union[LinkEntity, None]:
+    #
+    #     """Get a link entity between two entities if it exists.
+    #
+    #     Args:
+    #         linker (Entity): The linking entity.
+    #         linked (Entity): The linked entity.
+    #     """
+    #     raise NotImplementedError('Links are not implemented yet.')
+    #
+    #     link_key = (linker.uuid, linked.uuid)
+    #     if link_key not in self._links:
+    #         self.backend.get_link_uuid(linker, linked)
+    #
+    #     link_uuid = self._links[link_key]
+    #     return self.get_entity('LinkEntity', link_uuid, None)
 
     def remove_entity_from_update(self, entity: Entity) -> None:
         """Unmark an entity for update in the backend.

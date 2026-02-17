@@ -14,7 +14,6 @@ import sqlalchemy
 from sqlalchemy import Index, ForeignKey, String, create_engine, BigInteger, Double
 from sqlalchemy.dialects.mysql import LONGBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.exc import OperationalError
 
 from .backend import Backend
 from .. import AnalysisEntity, Collection, Entarchy, Entity
@@ -128,16 +127,19 @@ def retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable:
             try:
                 return fun(self, *args, **kwargs)
 
-            except OperationalError as e:
+            except Exception as e:
                 err = e
                 i += 1
 
-            except Exception as e:
-                err = e
-                raise e
+            # except Exception as e:
+            #     err = e
+            #     raise e
 
         if err is not None:
+            print(f'Failed after {retry_num} retries')
             raise err
+
+        return None
 
     return _wrapper
 
@@ -344,6 +346,7 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
     # Load blob
     if row.data_type == 'blob':
         ser: Serializer = pickle.loads(row.value_blob)
+        # print(ser)
         return ser.deserialize(_entity.entarchy)
 
     # if row.data_type.startswith('blob'):
@@ -389,10 +392,6 @@ class Serializer(object):
 
         if isinstance(data, bytes):
             self._data = data
-        # elif isinstance(data, list):
-        #     self._data = pickle.dumps(data)
-        # elif isinstance(data, dict):
-        #     self._data = pickle.dumps(data)
         elif isinstance(data, np.ndarray):
             with io.BytesIO() as buffer:
                 np.lib.format.write_array(buffer, data, allow_pickle=True)
@@ -403,6 +402,8 @@ class Serializer(object):
 
         if self._data.__sizeof__() >= _entity.entarchy.max_blob_size:
 
+            # print(f'> Serialize {self._data.__sizeof__()} bytes to file')
+
             # Save to file
             _format = 'npy' if self._type is np.ndarray else 'pickle'
 
@@ -411,15 +412,14 @@ class Serializer(object):
             os.makedirs(fp, exist_ok=True)
 
             fullpath = f'{fp}/{fn}'
-            self._store = pathlib.Path(fullpath).relative_to(_entity.entarchy.path)
+            self._store = pathlib.Path(fullpath).relative_to(_entity.entarchy.path).as_posix()
 
             with open(fullpath, 'wb') as f:
                 f.write(self._data)
                 del self._data
-                # print('Saved large blob to external file:', fullpath)
-                # print('Serializer size:', self.__sizeof__())
 
         else:
+            # print(f'> Serialize {self._data.__sizeof__()} bytes directly')
             self._store = 'internal'
 
     def deserialize(self, _entarchy: Entarchy) -> Any:
@@ -427,6 +427,7 @@ class Serializer(object):
         # print(f'Deserialize {self}')
         # Read from file if needed
         if self._store != 'internal':
+            # print(type(self._store), isinstance(self._store, str), self.__dict__)
             # Load from file
             # print(f'Load from path {self._store}')
             with open(os.path.join(_entarchy.path, self._store), 'rb') as f:
@@ -435,17 +436,12 @@ class Serializer(object):
         # Return data according to original type
         if self._type is bytes:
             return self._data
-        # elif self._type is list:
-        #     return pickle.loads(self._data)
-        # elif self._type is dict:
-        #     return pickle.loads(self._data)
         elif self._type is np.ndarray:
             with io.BytesIO(self._data) as buffer:
                 buffer.seek(0)
                 return np.lib.format.read_array(buffer, allow_pickle=True)
         else:
             return pickle.loads(self._data)
-            raise TypeError(f'Unsupported data type during deserialization: {self._type}')
 
 
 def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
@@ -836,56 +832,56 @@ class MySQLBackend(Backend):
             else:
                 return row.parent.entity_type.name, row.parent.uuid, row.parent.id
 
-    @retry_on_operational_failure
-    def get_link(self, linker: Entity, linked: Entity) -> Union[tuple[str, str, str], None]:
-
-        with self.sql_session as session:
-
-            query = (session.query(Link)
-                     .filter(Link.linker_uuid == linker.uuid,
-                             Link.linked_uuid == linked.uuid))
-
-            count = query.count()
-            if count == 0:
-                # Create link and entity
-                new_entity_uuid = str(uuid.uuid4())
-
-                # Ensure an entity type for links exists (named 'link')
-                link_type = session.query(EntityTypeTable).filter(EntityTypeTable.name == 'link').one_or_none()
-                if link_type is None:
-                    link_type = EntityTypeTable(name='link')
-                    session.add(link_type)
-                    session.flush()  # ensure PK is assigned
-
-                # Create the entity row that represents the link (id is a short, readable token)
-                link_entity_id = f'link-{new_entity_uuid[:8]}'
-                new_entity_row = EntityTable(
-                    uuid=new_entity_uuid,
-                    id=link_entity_id,
-                    parent_uuid=None,
-                    entity_type=link_type
-                )
-                session.add(new_entity_row)
-
-                # Create the Link row that ties the two existing entities and references the new entity
-                new_link_row = Link(
-                    linker_uuid=linker_uuid,
-                    linked_uuid=linked_uuid,
-                    entity_uuid=new_entity_uuid
-                )
-                session.add(new_link_row)
-
-                # Commit and reload the created link row
-                session.commit()
-                row = session.query(Link).filter(Link.linker_uuid == linker_uuid,
-                                                 Link.linked_uuid == linked_uuid).one()
-
-            row = query.one()
-
-            if row.entity is None:
-                return None
-            else:
-                return row.entity.entity_type.name, row.entity.uuid, row.entity.id
+    # @retry_on_operational_failure
+    # def get_link(self, linker: Entity, linked: Entity) -> Union[tuple[str, str, str], None]:
+    #
+    #     with self.sql_session as session:
+    #
+    #         query = (session.query(Link)
+    #                  .filter(Link.linker_uuid == linker.uuid,
+    #                          Link.linked_uuid == linked.uuid))
+    #
+    #         count = query.count()
+    #         if count == 0:
+    #             # Create link and entity
+    #             new_entity_uuid = str(uuid.uuid4())
+    #
+    #             # Ensure an entity type for links exists (named 'link')
+    #             link_type = session.query(EntityTypeTable).filter(EntityTypeTable.name == 'link').one_or_none()
+    #             if link_type is None:
+    #                 link_type = EntityTypeTable(name='link')
+    #                 session.add(link_type)
+    #                 session.flush()  # ensure PK is assigned
+    #
+    #             # Create the entity row that represents the link (id is a short, readable token)
+    #             link_entity_id = f'link-{new_entity_uuid[:8]}'
+    #             new_entity_row = EntityTable(
+    #                 uuid=new_entity_uuid,
+    #                 id=link_entity_id,
+    #                 parent_uuid=None,
+    #                 entity_type=link_type
+    #             )
+    #             session.add(new_entity_row)
+    #
+    #             # Create the Link row that ties the two existing entities and references the new entity
+    #             new_link_row = Link(
+    #                 linker_uuid=linker_uuid,
+    #                 linked_uuid=linked_uuid,
+    #                 entity_uuid=new_entity_uuid
+    #             )
+    #             session.add(new_link_row)
+    #
+    #             # Commit and reload the created link row
+    #             session.commit()
+    #             row = session.query(Link).filter(Link.linker_uuid == linker_uuid,
+    #                                              Link.linked_uuid == linked_uuid).one()
+    #
+    #         row = query.one()
+    #
+    #         if row.entity is None:
+    #             return None
+    #         else:
+    #             return row.entity.entity_type.name, row.entity.uuid, row.entity.id
 
     @retry_on_operational_failure
     def has_entity_attribute(self, _entity: Entity, name: str) -> bool:
