@@ -479,6 +479,14 @@ class Entarchy(object):
     #     link_uuid = self._links[link_key]
     #     return self.get_entity('LinkEntity', link_uuid, None)
 
+    def get_temp_path(self, path: str):
+        temp_path = os.path.join(self.path, 'temp', path)
+        if not os.path.exists(temp_path):
+            # Avoid error if concurrent process already created it in meantime
+            os.makedirs(temp_path, exist_ok=True)
+
+        return temp_path
+
     def remove_entity_from_update(self, entity: Entity) -> None:
         """Unmark an entity for update in the backend.
 

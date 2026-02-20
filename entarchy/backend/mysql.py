@@ -6,6 +6,7 @@ import os.path
 import pathlib
 import pickle
 import datetime
+from os.path import relpath
 from typing import Any, Callable, List, Union
 
 import numpy as np
@@ -13,6 +14,7 @@ import pandas as pd
 import sqlalchemy
 from sqlalchemy import Index, ForeignKey, String, create_engine, BigInteger, Double
 from sqlalchemy.dialects.mysql import LONGBLOB
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .backend import Backend
@@ -127,16 +129,12 @@ def retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable:
             try:
                 return fun(self, *args, **kwargs)
 
-            except Exception as e:
+            except OperationalError as e:
                 err = e
                 i += 1
 
-            # except Exception as e:
-            #     err = e
-            #     raise e
-
         if err is not None:
-            print(f'Failed after {retry_num} retries')
+            # print(f'Failed after {retry_num} retries')
             raise err
 
         return None
@@ -330,13 +328,13 @@ def _get_namehash(name: str) -> str:
 #
 #     return pathlib.Path(fp).as_posix(), f'{_get_namehash(row.name)}.{_format}'
 
-def _get_attribute_fp(_entity: Entity, name: str, _format) -> tuple[str, str]:
+def _get_attribute_fp(_ent_path: str, _entity_uuid: str, attr_name: str, _format) -> tuple[str, str]:
 
-    _uuid = _entity.uuid.replace('-', '')
+    _uuid = _entity_uuid.replace('-', '')
     _shards = [_uuid[4*i:4*(i+1)] for i in range(8)]  # Create path shards from uuid (8x4 characters for uuid4)
-    fp = os.path.join(_entity.entarchy.path, 'ext', *_shards)
+    fp = os.path.join(_ent_path, 'ext', *_shards)
 
-    return pathlib.Path(fp).as_posix(), f'{_get_namehash(name)}.{_format}'
+    return pathlib.Path(fp).as_posix(), f'{_get_namehash(attr_name)}.{_format}'
 
 
 def _read_attribute_data(_entity: Entity, row: AttributeTable):
@@ -347,7 +345,17 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
     if row.data_type == 'blob':
         ser: Serializer = pickle.loads(row.value_blob)
         # print(ser)
-        return ser.deserialize(_entity.entarchy)
+        try:
+            return ser.deserialize(_entity.entarchy)
+        except Exception as e:
+
+            print(f'Failed to deserialize blob attribute "{row.name}" of entity "{_entity}".')
+            print('This may be caused by missing files on disk if the blob was stored externally, '
+                  'or by corrupted data in the database.')
+            print('Store: ', ser._store)
+            print('Type:', ser._type)
+
+            raise e
 
     # if row.data_type.startswith('blob'):
         # data_type, _format = row.data_type.split('::')
@@ -386,7 +394,7 @@ class Serializer(object):
     def __repr__(self):
         return f'Serializer({self._type}, {self._store})'
 
-    def serialize(self, _entity: Entity, name: str, data: Any):
+    def serialize(self, data: Any, _ent_path: str, _entity_uuid: str, attr_name: str, max_blob_size: int):
 
         self._type = type(data)
 
@@ -400,19 +408,20 @@ class Serializer(object):
         else:
             self._data = pickle.dumps(data)
 
-        if self._data.__sizeof__() >= _entity.entarchy.max_blob_size:
+        # Store data in file if possible and above max_blob_size
+        if self._data.__sizeof__() >= max_blob_size:
 
             # print(f'> Serialize {self._data.__sizeof__()} bytes to file')
 
             # Save to file
             _format = 'npy' if self._type is np.ndarray else 'pickle'
 
-            fp, fn = _get_attribute_fp(_entity, name, _format)
+            fp, fn = _get_attribute_fp(_ent_path, _entity_uuid, attr_name, _format)
 
             os.makedirs(fp, exist_ok=True)
 
             fullpath = f'{fp}/{fn}'
-            self._store = pathlib.Path(fullpath).relative_to(_entity.entarchy.path).as_posix()
+            self._store = pathlib.Path(fullpath).relative_to(_ent_path).as_posix()
 
             with open(fullpath, 'wb') as f:
                 f.write(self._data)
@@ -422,6 +431,9 @@ class Serializer(object):
             # print(f'> Serialize {self._data.__sizeof__()} bytes directly')
             self._store = 'internal'
 
+        # print('Serialized', self)
+        # print('> Data:', self._data)
+
     def deserialize(self, _entarchy: Entarchy) -> Any:
 
         # print(f'Deserialize {self}')
@@ -430,7 +442,16 @@ class Serializer(object):
             # print(type(self._store), isinstance(self._store, str), self.__dict__)
             # Load from file
             # print(f'Load from path {self._store}')
-            with open(os.path.join(_entarchy.path, self._store), 'rb') as f:
+
+            # TODO: this is a temp fix for existing datasets
+            if self._store.startswith('ext'):
+                path = self._store
+            else:
+                parts = self._store.split('/')
+                path = os.path.join(*parts[parts.index('ext'):])
+
+            # Read binary data from file
+            with open(os.path.join(_entarchy.path, path), 'rb') as f:
                 self._data = f.read()
 
         # Return data according to original type
@@ -489,7 +510,7 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
 
         # Create serializer
         ser = Serializer()
-        ser.serialize(_entity, row.name, data)
+        ser.serialize(data, _entity.entarchy.path, _entity.uuid, row.name, _entity.entarchy.max_blob_size)
 
         # Serialize the serializer
         data = pickle.dumps(ser)
@@ -1139,13 +1160,13 @@ class MySQLBackend(Backend):
     @retry_on_operational_failure
     def set_collection_attributes(self, _collection: Collection, df: pd.DataFrame) -> None:
 
-        _entarchy = _collection.entarchy
+        ent = _collection.entarchy
 
         _dtypes = ['str', 'float', 'int', 'date', 'datetime', 'bool', 'blob']
 
         _analysis_uuid = None
-        if _entarchy.current_analysis is not None:
-            _analysis_uuid = _entarchy.current_analysis.uuid
+        if ent.current_analysis is not None:
+            _analysis_uuid = ent.current_analysis.uuid
 
         # Do an upsert for each attribute to be updated
         for attr_name in df.columns:
@@ -1161,6 +1182,10 @@ class MySQLBackend(Backend):
                 data_type_str = 'float'
             elif 'bool' in dtype:
                 data_type_str = 'bool'
+            elif 'str' in dtype:
+                data_type_str = 'str'
+
+            # If column information does not contain a specific data type, try to figure it out anyway
             elif 'object' in dtype:
 
                 # Use first row to determine type
@@ -1173,17 +1198,34 @@ class MySQLBackend(Backend):
                     data_type_str = 'datetime'
                 else:
                     data_type_str = 'blob'
+
+            # Fallback: make it opaque
             else:
                 data_type_str = 'blob'
-
-            # Rename value column
-            df_insert.rename(columns={attr_name: f'value_{data_type_str}'}, inplace=True)
 
             # Add PK set
             df_insert['entity_uuid'] = df_insert.index
             df_insert['name'] = attr_name
             df_insert['data_type'] = data_type_str
             df_insert['analysis_uuid'] = _analysis_uuid
+
+            # Serialize data
+            if data_type_str == 'blob':
+                # Create serialize function for each attribute
+                def _serialize_blob(series: pd.Series) -> bytes:
+                    ser = Serializer()
+                    ser.serialize(series[attr_name],
+                                  _collection.entarchy.path,
+                                  series['entity_uuid'],
+                                  attr_name,
+                                  _collection.entarchy.max_blob_size)
+                    return pickle.dumps(ser)
+
+                # Apply to each row
+                df_insert[attr_name] = df_insert.apply(_serialize_blob, axis=1)
+
+            # Rename value column
+            df_insert.rename(columns={attr_name: f'value_{data_type_str}'}, inplace=True)
 
             if not self.db_triggers_enabled:
                 df_insert['modified'] = datetime.datetime.now()
