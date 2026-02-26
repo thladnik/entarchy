@@ -97,6 +97,7 @@ class AttributeTable(Base):
     value_datetime: Mapped[datetime.datetime] = mapped_column(nullable=True)
     value_blob: Mapped[bytes] = mapped_column(LONGBLOB, nullable=True)
     data_type: Mapped[str] = mapped_column(String(500), nullable=True)
+    data_size: Mapped[int] = mapped_column(BigInteger(), nullable=False, default=0)
 
     float_is_nan: Mapped[bool] = mapped_column(default=False)
     float_is_inf: Mapped[bool] = mapped_column(default=False)
@@ -343,9 +344,8 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
 
     # Load blob
     if row.data_type == 'blob':
-        ser: Serializer = pickle.loads(row.value_blob)
-        # print(ser)
         try:
+            ser: Serializer = pickle.loads(row.value_blob)
             return ser.deserialize(_entity.entarchy)
         except Exception as e:
 
@@ -356,21 +356,6 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
             print('Type:', ser._type)
 
             raise e
-
-    # if row.data_type.startswith('blob'):
-        # data_type, _format = row.data_type.split('::')
-        #
-        # if data_type == 'blob_ext':
-        #
-        #     fp, fn = _get_attribute_fp(_entity, row.name, _format)
-        #
-        #     with open(f'{fp}/{fn}', 'rb') as f:
-        #         data_serial = f.read()
-        #
-        # else:
-        #     data_serial = row.value_blob
-        #
-        # return _deserialize(data_serial, _format)
 
     # Otherwise load from this row based on data type
     val = getattr(row, f'value_{row.data_type}')
@@ -390,58 +375,15 @@ class Serializer(object):
     _type: type
     _store: str
     _data: bytes
+    _data_size: int = 0
 
     def __repr__(self):
         return f'Serializer({self._type}, {self._store})'
 
-    def serialize(self, data: Any, _ent_path: str, _entity_uuid: str, attr_name: str, max_blob_size: int):
-
-        self._type = type(data)
-
-        if isinstance(data, bytes):
-            self._data = data
-        elif isinstance(data, np.ndarray):
-            with io.BytesIO() as buffer:
-                np.lib.format.write_array(buffer, data, allow_pickle=True)
-                buffer.seek(0)
-                self._data = buffer.read()
-        else:
-            self._data = pickle.dumps(data)
-
-        # Store data in file if possible and above max_blob_size
-        if self._data.__sizeof__() >= max_blob_size:
-
-            # print(f'> Serialize {self._data.__sizeof__()} bytes to file')
-
-            # Save to file
-            _format = 'npy' if self._type is np.ndarray else 'pickle'
-
-            fp, fn = _get_attribute_fp(_ent_path, _entity_uuid, attr_name, _format)
-
-            os.makedirs(fp, exist_ok=True)
-
-            fullpath = f'{fp}/{fn}'
-            self._store = pathlib.Path(fullpath).relative_to(_ent_path).as_posix()
-
-            with open(fullpath, 'wb') as f:
-                f.write(self._data)
-                del self._data
-
-        else:
-            # print(f'> Serialize {self._data.__sizeof__()} bytes directly')
-            self._store = 'internal'
-
-        # print('Serialized', self)
-        # print('> Data:', self._data)
-
     def deserialize(self, _entarchy: Entarchy) -> Any:
 
-        # print(f'Deserialize {self}')
         # Read from file if needed
         if self._store != 'internal':
-            # print(type(self._store), isinstance(self._store, str), self.__dict__)
-            # Load from file
-            # print(f'Load from path {self._store}')
 
             # TODO: this is a temp fix for existing datasets
             if self._store.startswith('ext'):
@@ -463,6 +405,57 @@ class Serializer(object):
                 return np.lib.format.read_array(buffer, allow_pickle=True)
         else:
             return pickle.loads(self._data)
+
+    def serialize(self, data: Any, _ent_path: str, _entity_uuid: str, attr_name: str, max_blob_size: int):
+
+        self._type = type(data)
+
+        # Serialize data to bytes
+        if isinstance(data, bytes):
+            self._data = data
+        elif isinstance(data, np.ndarray):
+            with io.BytesIO() as buffer:
+                np.lib.format.write_array(buffer, data, allow_pickle=True)
+                buffer.seek(0)
+                self._data = buffer.read()
+        else:
+            self._data = pickle.dumps(data)
+
+        # Save size of data to object
+        self._data_size = self._data.__sizeof__()
+
+        # Store data in file if necessary
+        if self._data_size >= max_blob_size:
+
+            # print(f'> Serialize {self._data.__sizeof__()} bytes to file')
+
+            # Save to file
+            _format = 'npy' if self._type is np.ndarray else 'pickle'
+
+            fp, fn = _get_attribute_fp(_ent_path, _entity_uuid, attr_name, _format)
+
+            os.makedirs(fp, exist_ok=True)
+
+            fullpath = f'{fp}/{fn}'
+            self._store = pathlib.Path(fullpath).relative_to(_ent_path).as_posix()
+
+            with open(fullpath, 'wb') as f:
+                f.write(self._data)
+                del self._data
+
+        else:
+            # print(f'> Serialize {self._data.__sizeof__()} bytes directly')
+            self._store = 'internal'
+
+    @property
+    def store(self) -> str:
+        return self._store
+
+    def __sizeof__(self) -> int:
+        if self.store == 'internal':
+            return object.__sizeof__(self)
+        else:
+            return object.__sizeof__(self) + self._data_size
 
 
 def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
@@ -502,11 +495,23 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
         elif data_type == 'float' and math.isnan(data):
             row.float_is_nan = True
             data = None
-    else:
-        data_type = 'blob'
+
+        if data_type in ('int', 'float'):
+            data_size = 8
+        elif data_type == 'bool':
+            data_size = 1
+        elif data_type == 'date':
+            data_size = 3
+        elif data_type == 'datetime':
+            data_size = 8  # depends on fractional seconds in current MySQL, but max. 8
+        elif data_type == 'str':
+            data_size = len(data.encode('utf-8'))
+        else:
+            raise RuntimeError(f'Unsupported data type {data_type}.')
 
     # Set value on corresponding column based on type
-    if data_type == 'blob':
+    else:
+        data_type = 'blob'
 
         # Create serializer
         ser = Serializer()
@@ -515,8 +520,12 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
         # Serialize the serializer
         data = pickle.dumps(ser)
 
-    row.data_type = data_type
+        # Get size on disk
+        data_size = ser.__sizeof__()
 
+    # Write to row
+    row.data_type = data_type
+    row.data_size = data_size
     # Set data
     row.__setattr__(f'value_{data_type}', data)
 
@@ -946,7 +955,8 @@ class MySQLBackend(Backend):
             # Update existing attributes
             for n, row in existing_rows.items():
 
-                if not row.mutable:
+                # Updates to existing rows are only allowed if attribute is mutable or if digest mode is enabled
+                if not (row.mutable or _entity.entarchy.is_in_digest_mode):
                     raise RuntimeError(f'Attribute "{n}" is immutable and cannot be modified on {_entity}.')
 
                 v = values[names.index(n)]
@@ -1212,17 +1222,43 @@ class MySQLBackend(Backend):
             # Serialize data
             if data_type_str == 'blob':
                 # Create serialize function for each attribute
-                def _serialize_blob(series: pd.Series) -> bytes:
+                def _serialize_blob(series: pd.Series) -> Serializer:
                     ser = Serializer()
                     ser.serialize(series[attr_name],
                                   _collection.entarchy.path,
                                   series['entity_uuid'],
                                   attr_name,
                                   _collection.entarchy.max_blob_size)
-                    return pickle.dumps(ser)
+                    return ser
 
                 # Apply to each row
-                df_insert[attr_name] = df_insert.apply(_serialize_blob, axis=1)
+                df_insert['__serializer'] = df_insert.apply(_serialize_blob, axis=1)
+                # Dump serializer to bytes for storage
+                df_insert[attr_name] = df_insert.apply(pickle.dumps, axis=1)
+
+            # Save attribute size
+            def _get_attribute_size(series: pd.Series) -> int:
+                if data_type_str == 'int':
+                    return 8
+                elif data_type_str == 'float':
+                    return 8
+                elif data_type_str == 'bool':
+                    return 1
+                elif data_type_str == 'date':
+                    return 3
+                elif data_type_str == 'datetime':
+                    return 8
+                elif data_type_str == 'str':
+                    return len(series[attr_name].encode('utf-8'))
+                elif data_type_str == 'blob':
+                    return series['__serializer'].__sizeof__()
+                else:
+                    raise RuntimeError(f'Unsupported data type {data_type_str}.')
+
+            df_insert['data_size'] = df_insert.apply(_get_attribute_size, axis=1)
+
+            if data_type_str == 'blob':
+                del df_insert['__serializer']
 
             # Rename value column
             df_insert.rename(columns={attr_name: f'value_{data_type_str}'}, inplace=True)
@@ -1239,7 +1275,9 @@ class MySQLBackend(Backend):
                     # On update, reset all other value fields to None:
                     **{f'value_{dt}': None for dt in list(set(_dtypes) - {data_type_str})},
                     'data_type': data_type_str,
-                    'analysis_uuid': insert_stmt.inserted.analysis_uuid
+                    'data_size': insert_stmt.inserted.data_size,
+                    'analysis_uuid': insert_stmt.inserted.analysis_uuid,
+                    'modified': insert_stmt.inserted.modified
                 }
 
                 # Add modified time update if triggers are not enabled

@@ -21,12 +21,12 @@ if TYPE_CHECKING:
 class Entarchy(object):
     """Entarchy is a class that represents a system of hierarchically organized entities.
     """
-    base_version: str = '0.1'
-    base_min_compat_version = '0.1'
-    max_blob_size: int = 10 * 1024 * 1024  # bytes (20MB)
-    implementation_version: str
-    implementation_min_compat_version: str
-    _hierarchy_root: Type[Entity]
+    _base_version: str = '0.1'
+    _base_compat_version_list: list[str] = ['0.1']
+    _implementation_version: str
+    _implementation_compat_version_list: list[str]
+    _hierarchy_root_type: Type[Entity]
+    max_blob_size: int = 10 * 1024 * 1024  # bytes (10MB)
 
     _backend: MySQLBackend = None  # Backend # TODO: Make this more generic, currently only MySQLBackend is supported
     _config: dict[str, Any] = None
@@ -47,11 +47,21 @@ class Entarchy(object):
         # Load configuration from path
         self._config = yaml.safe_load(open(os.path.join(path, 'entarchy.yaml'), 'r'))
 
+        if self._config['base_version'] not in self._base_compat_version_list:
+            raise RuntimeError(f'Base version in configuration '
+                               f'("{self._config["base_version"]}") '
+                               f'is not compatible with current base version '
+                               f'("{self._base_version}"). ')
+
+        if self._config['implementation_version'] not in self._implementation_compat_version_list:
+            raise RuntimeError(f'Implementation version in configuration '
+                               f'("{self._config["implementation_version"]}") '
+                               f'is not compatible with curreng implementation version '
+                               f'("{self._implementation_version}"). ')
+
         if self._config['hierarchy'] != self._hierarchy:
             raise RuntimeError('Entity type hierarchy in configuration does not match the implementation. '
-                               'This may be due to an incompatible version or a corrupted configuration.')
-
-        # TODO: Check version compatibility
+                               'This may be due to a corrupted configuration.')
 
         # Set up entities objects
         self._entities: dict[str, Entity] = {}
@@ -103,6 +113,10 @@ class Entarchy(object):
         return self._backend
 
     @property
+    def base_version(self):
+        return self._base_version
+
+    @property
     def debug(self) -> bool:
         """Get the debug mode for the entarchy and its backend.
         """
@@ -118,6 +132,10 @@ class Entarchy(object):
     @property
     def hierarchy(self):
         return self._hierarchy.copy()
+
+    @property
+    def implementation_version(self):
+        return self._implementation_version
 
     @property
     def is_in_context(self) -> bool:
@@ -175,7 +193,7 @@ class Entarchy(object):
         # Run and return result
         hierarchy = {'EntarchyEntity': {}, 'AnalysisEntity': {}, 'LinkEntity': {}}
         entity_map = {'EntarchyEntity': EntarchyEntity,'AnalysisEntity': AnalysisEntity, 'LinkEntity': LinkEntity}
-        _resolve_hierarchy(cls._hierarchy_root, hierarchy, entity_map)
+        _resolve_hierarchy(cls._hierarchy_root_type, hierarchy, entity_map)
 
         return hierarchy, entity_map
 
@@ -220,8 +238,8 @@ class Entarchy(object):
 
         # Save configuration so entarchy object can be created
         _config = {
-            'base_version': cls.base_version,
-            'implementation_version': cls.implementation_version,
+            'base_version': cls._base_version,
+            'implementation_version': cls._implementation_version,
             'backend': f'{_backend.__module__}.{_backend.__class__.__name__}',
             'backend_config': _backend.get_config(),
             'hierarchy': hierarchy
