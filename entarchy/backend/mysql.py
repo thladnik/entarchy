@@ -115,7 +115,93 @@ class AttributeTable(Base):
         return f"<Attribute({self.name}, {self.entity})>"
 
 
-def retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable:
+class Serializer(object):
+
+    _type: type
+    _store: str
+    _data: bytes
+    _data_size: int = 0
+
+    def __repr__(self):
+        return f'Serializer({self._type}, {self._store})'
+
+    def deserialize(self, _entarchy: Entarchy) -> Any:
+
+        # Read from file if needed
+        if self._store != 'internal':
+
+            # TODO: this is a temp fix for existing datasets
+            if self._store.startswith('ext'):
+                path = self._store
+            else:
+                parts = self._store.split('/')
+                path = os.path.join(*parts[parts.index('ext'):])
+
+            # Read binary data from file
+            with open(os.path.join(_entarchy.path, path), 'rb') as f:
+                self._data = f.read()
+
+        # Return data according to original type
+        if self._type is bytes:
+            return self._data
+        elif self._type is np.ndarray:
+            with io.BytesIO(self._data) as buffer:
+                buffer.seek(0)
+                return np.lib.format.read_array(buffer, allow_pickle=True)
+        else:
+            return pickle.loads(self._data)
+
+    def serialize(self, data: Any, _ent_path: str, _entity_uuid: str, attr_name: str, max_blob_size: int):
+
+        self._type = type(data)
+
+        # Serialize data to bytes
+        if isinstance(data, bytes):
+            self._data = data
+        elif isinstance(data, np.ndarray):
+            with io.BytesIO() as buffer:
+                np.lib.format.write_array(buffer, data, allow_pickle=True)
+                buffer.seek(0)
+                self._data = buffer.read()
+        else:
+            self._data = pickle.dumps(data)
+
+        # Save size of data to object
+        self._data_size = self._data.__sizeof__()
+
+        # Store data in file if necessary
+        if self._data_size >= max_blob_size:
+
+            # Save to file
+            _format = 'npy' if self._type is np.ndarray else 'pickle'
+
+            fp, fn = _get_attribute_fp(_ent_path, _entity_uuid, attr_name, _format)
+
+            os.makedirs(fp, exist_ok=True)
+
+            fullpath = f'{fp}/{fn}'
+            self._store = pathlib.Path(fullpath).relative_to(_ent_path).as_posix()
+
+            with open(fullpath, 'wb') as f:
+                f.write(self._data)
+                del self._data
+
+        else:
+            # print(f'> Serialize {self._data.__sizeof__()} bytes directly')
+            self._store = 'internal'
+
+    @property
+    def store(self) -> str:
+        return self._store
+
+    def __sizeof__(self) -> int:
+        if self.store == 'internal':
+            return object.__sizeof__(self)
+        else:
+            return object.__sizeof__(self) + self._data_size
+
+
+def _retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable:
     """Decorator for catching sqlalchemy.exc.OperationalError,
     which is typically emitted when a connection has been disconnected by the host.
     """
@@ -135,7 +221,6 @@ def retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable:
                 i += 1
 
         if err is not None:
-            # print(f'Failed after {retry_num} retries')
             raise err
 
         return None
@@ -227,7 +312,7 @@ def _generate_attribute_filters(entity_type_name: str,
                 if not (('[' in name) and (']' in name)):
                     raise ValueError('Malformed attribute name for parent entity traversal.')
                 parent_entity_type_name, attr_name = name.replace('[', '').split(']')
-                parent_level = get_entity_type_ancestor_distance(_session, entity_type_name, parent_entity_type_name)
+                parent_level = _get_entity_type_ancestor_distance(_session, entity_type_name, parent_entity_type_name)
 
                 if parent_level is None:
                     raise ValueError(f'Entity type "{parent_entity_type_name}" is not an ancestor of "{entity_type_name}".')
@@ -277,9 +362,9 @@ def _generate_attribute_filters(entity_type_name: str,
     return EntityTable.uuid.in_(_session.query(subquery.c.entity_uuid))
 
 
-def get_entity_type_ancestor_distance(session: sqlalchemy.orm.Session,
-                                      entity_type_name: str,
-                                      parent_entity_type_name: str) -> int | None:
+def _get_entity_type_ancestor_distance(session: sqlalchemy.orm.Session,
+                                       entity_type_name: str,
+                                       parent_entity_type_name: str) -> int | None:
     """
     Return number of parent steps required to reach `parent_entity_type_name`
     starting from `entity_type_name`. Return 0 if names are equal, or None
@@ -368,94 +453,6 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
             return float('nan')
 
     return val
-
-
-class Serializer(object):
-
-    _type: type
-    _store: str
-    _data: bytes
-    _data_size: int = 0
-
-    def __repr__(self):
-        return f'Serializer({self._type}, {self._store})'
-
-    def deserialize(self, _entarchy: Entarchy) -> Any:
-
-        # Read from file if needed
-        if self._store != 'internal':
-
-            # TODO: this is a temp fix for existing datasets
-            if self._store.startswith('ext'):
-                path = self._store
-            else:
-                parts = self._store.split('/')
-                path = os.path.join(*parts[parts.index('ext'):])
-
-            # Read binary data from file
-            with open(os.path.join(_entarchy.path, path), 'rb') as f:
-                self._data = f.read()
-
-        # Return data according to original type
-        if self._type is bytes:
-            return self._data
-        elif self._type is np.ndarray:
-            with io.BytesIO(self._data) as buffer:
-                buffer.seek(0)
-                return np.lib.format.read_array(buffer, allow_pickle=True)
-        else:
-            return pickle.loads(self._data)
-
-    def serialize(self, data: Any, _ent_path: str, _entity_uuid: str, attr_name: str, max_blob_size: int):
-
-        self._type = type(data)
-
-        # Serialize data to bytes
-        if isinstance(data, bytes):
-            self._data = data
-        elif isinstance(data, np.ndarray):
-            with io.BytesIO() as buffer:
-                np.lib.format.write_array(buffer, data, allow_pickle=True)
-                buffer.seek(0)
-                self._data = buffer.read()
-        else:
-            self._data = pickle.dumps(data)
-
-        # Save size of data to object
-        self._data_size = self._data.__sizeof__()
-
-        # Store data in file if necessary
-        if self._data_size >= max_blob_size:
-
-            # print(f'> Serialize {self._data.__sizeof__()} bytes to file')
-
-            # Save to file
-            _format = 'npy' if self._type is np.ndarray else 'pickle'
-
-            fp, fn = _get_attribute_fp(_ent_path, _entity_uuid, attr_name, _format)
-
-            os.makedirs(fp, exist_ok=True)
-
-            fullpath = f'{fp}/{fn}'
-            self._store = pathlib.Path(fullpath).relative_to(_ent_path).as_posix()
-
-            with open(fullpath, 'wb') as f:
-                f.write(self._data)
-                del self._data
-
-        else:
-            # print(f'> Serialize {self._data.__sizeof__()} bytes directly')
-            self._store = 'internal'
-
-    @property
-    def store(self) -> str:
-        return self._store
-
-    def __sizeof__(self) -> int:
-        if self.store == 'internal':
-            return object.__sizeof__(self)
-        else:
-            return object.__sizeof__(self) + self._data_size
 
 
 def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
@@ -637,7 +634,7 @@ class MySQLBackend(Backend):
 
         return self._db_triggers_enabled
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def create(self) -> bool:
 
         # Create schema
@@ -694,7 +691,7 @@ class MySQLBackend(Backend):
 
         return True
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def create_type_hierarchy(self, _hierarchy: dict[str, ...]) -> bool:
 
         with self.sql_session as session:
@@ -710,7 +707,7 @@ class MySQLBackend(Backend):
 
         return True
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def delete(self, confirm: bool = False):
 
         if not confirm:
@@ -725,7 +722,7 @@ class MySQLBackend(Backend):
 
     # Entity related methods
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def add_entities(self, _entities: list[Entity]) -> bool:
 
         with self.sql_session as session:
@@ -756,7 +753,7 @@ class MySQLBackend(Backend):
 
         return self.get_entity_attributes(_entity, [name])[0]
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_entity_attribute_names(self, _entity: Entity) -> list[str]:
 
         entity_uuid = _entity.uuid
@@ -769,7 +766,7 @@ class MySQLBackend(Backend):
 
         return names
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_entity_attributes(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
 
         entity_uuid = _entity.uuid
@@ -794,7 +791,7 @@ class MySQLBackend(Backend):
 
         return tuple(values)
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_entity_by_uuid(self,_entarchy: Entarchy, entity_uuid: str) -> Entity:
 
         with self.sql_session as session:
@@ -812,7 +809,7 @@ class MySQLBackend(Backend):
 
         return entity_type(_entarchy, _uuid=entity_uuid, _id=entity_id)
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_entity_modified_time(self, _entity: Entity) -> datetime.datetime:
 
         entity_uuid = _entity.uuid
@@ -829,7 +826,7 @@ class MySQLBackend(Backend):
 
         return row.modified
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_entities_of_type(self, entity_type: str) -> list[tuple[str, str]]:
 
         with self.sql_session as session:
@@ -843,7 +840,7 @@ class MySQLBackend(Backend):
 
             return [(row.uuid, row.id) for row in query.all()]
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_entity_parent(self, _entity: Entity) -> Union[tuple[str, str, str], None]:
         entity_uuid = _entity.uuid
 
@@ -913,7 +910,7 @@ class MySQLBackend(Backend):
     #         else:
     #             return row.entity.entity_type.name, row.entity.uuid, row.entity.id
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def has_entity_attribute(self, _entity: Entity, name: str) -> bool:
         entity_uuid = _entity.uuid
 
@@ -924,14 +921,14 @@ class MySQLBackend(Backend):
 
             return query.count() > 0
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def set_entity_attribute(self, entity_uuid, key: str, value: Any):
 
         self.set_entity_attributes(entity_uuid, [key], [value])
 
         return True, ''
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def set_entity_attributes(self, _entity: Entity, names: list[str], values: list[Any]) -> tuple[bool, str]:
 
         _entarchy = _entity.entarchy
@@ -991,7 +988,7 @@ class MySQLBackend(Backend):
 
     # Collection related methods
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_collection_count(self, _collection: Collection, creation_time: datetime.datetime = None) -> int:
 
         # Fetch result
@@ -1002,7 +999,7 @@ class MySQLBackend(Backend):
 
             return res
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_collection_entity_by_index(self, _collection: Collection, index: int, creation_time: datetime.datetime = None) -> tuple[str, str]:
 
         # Fetch result
@@ -1013,7 +1010,7 @@ class MySQLBackend(Backend):
 
         return res.uuid, res.id
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_collection_entities_by_slice(self, _collection: Collection, _slice: slice) -> list[tuple[str, str]]:
 
         entity_type_name = _collection.entity_type.__name__
@@ -1032,7 +1029,7 @@ class MySQLBackend(Backend):
         #        but it's not clear how is would work in SQLAlchemy ORM; figure out later
         return [(r.uuid, r.id) for r in res[::step]]
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_collection_parent_uuids(self, _collection: Collection) -> list[tuple[str, str]]:
 
         # Fetch result
@@ -1046,7 +1043,7 @@ class MySQLBackend(Backend):
 
         return [(r.uuid, r.parent_uuid) for r in res]
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_collection_attribute_names(self, _collection: Collection) -> list[str]:
 
         # Fetch result
@@ -1065,7 +1062,7 @@ class MySQLBackend(Backend):
 
         return names
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def get_collection_attributes(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
 
         entity_type_name = _collection.entity_type.__name__
@@ -1167,7 +1164,7 @@ class MySQLBackend(Backend):
 
         return df
 
-    @retry_on_operational_failure
+    @_retry_on_operational_failure
     def set_collection_attributes(self, _collection: Collection, df: pd.DataFrame) -> None:
 
         ent = _collection.entarchy

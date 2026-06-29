@@ -316,6 +316,13 @@ class Entity(object):
 
         return None if not self._parent else self._parent
 
+    @property
+    def path(self) -> str:
+        parent = self.parent
+        if parent is not None and not isinstance(parent, EntarchyEntity):
+            return f'{parent.path}/{self.id}'
+        return self.id
+
     def commit(self):
 
         # Remove entity from entarchy update list
@@ -454,12 +461,16 @@ class Collection(object):
         # Set series data to key attribute name
         if isinstance(value, pd.Series):
             value.name = key
-            value = pd.DataFrame(value)
+            df = pd.DataFrame(value)
+
+        # If value is a scalar, set whole collection to value for key
+        elif isinstance(value, (str, int, float, bool)):
+            df = pd.DataFrame(index=self.index, columns=[key], data=[value] * len(self.index))
 
         else:
             raise RuntimeError('Invalid key/value pair')
 
-        self.update(value)
+        self.update(df)
 
     # Set operations
 
@@ -807,20 +818,27 @@ class Collection(object):
         ctx = mp.get_context(ctx_type)
         # mp.set_start_method(ctx_type, force=True)
         print(f'Start pool ({ctx_type}) with {_worker_num} workers')
-        with (ctx.Pool(processes=_worker_num) as pool,
-              alive_progress.alive_bar(entity_count, spinner='fish2', length=20, spinner_length=20, force_tty=True) as bar):
+        with ctx.Pool(processes=_worker_num) as pool:
 
             # Map entities to process pool
             start_time = time.time()
             print(f'Start processing at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))}')
 
             t = time.perf_counter()
-            iterator = pool.imap_unordered(self.worker_wrapper, self._async_iterator(_fun, **kwargs), chunksize=_chunk_size)
-            for iter_num in range(entity_count):
+            # iterator = pool.imap_unordered(self.worker_wrapper, self._async_iterator(_fun, **kwargs), chunksize=_chunk_size)
+            iterator = pool.imap(self.worker_wrapper, self._async_iterator(_fun, **kwargs), chunksize=_chunk_size)
 
-                _ = next(iterator)
+            with alive_progress.alive_bar(entity_count,
+                                          spinner='fish2', spinner_length=20,
+                                          length=20, force_tty=True) as progress_bar:
 
-                bar()
+                for iter_num in range(entity_count):
+
+                    _ = next(iterator)
+
+                    # print('Next')
+
+                    progress_bar()
 
             pool.close()
             pool.join()
