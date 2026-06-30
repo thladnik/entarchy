@@ -61,9 +61,18 @@ class Entity(object):
 
     def __new__(cls, *args, **kwargs):
 
-        _entarchy = args[0] if len(args) > 0 else kwargs.get('_entarchy', None)
-        _uuid = args[1] if len(args) > 1 else kwargs.get('_uuid', None)
+        # _entarchy = args[0] if len(args) > 0 else kwargs.get('_entarchy', None)
+        arg0 = args[0] if len(args) > 0 else None
 
+        if isinstance(arg0, str):
+            obj = DeferredEntityCollection(cls, arg0)
+            return obj
+
+        _entarchy = arg0 if arg0 is not None else kwargs.get('_entarchy', None)
+        if _entarchy is None:
+            raise ValueError('_entarchy argument is required')
+
+        _uuid = args[1] if len(args) > 1 else kwargs.get('_uuid', None)
         if _uuid is not None and _uuid in _entarchy:
             obj = _entarchy.get_entity_by_uuid(_uuid)
 
@@ -121,7 +130,8 @@ class Entity(object):
             delattr(self, '__prev_analysis')
 
     def __hash__(self):
-        return self.uuid
+        """Use integer representation of unique identifier as hash"""
+        return uuid.UUID(self.uuid).int
 
     def __getitem__(self, key: Union[str, list[str]]) -> Union[Any, tuple[Any, ...]]:
         """Get a dynamic attribute from the entity.
@@ -269,6 +279,12 @@ class Entity(object):
         # return [globals()[c] if isinstance(c, str) else c for c in cls._child_entity_types] Does not work yet for str
         return cls._child_entity_types
 
+    @classmethod
+    def get_collection_type(cls) -> type[Collection]:
+        if cls.collection_type is None:
+            return Collection
+        return cls.collection_type
+
     @property
     def entarchy(self) -> Entarchy:
         return self._entarchy
@@ -373,19 +389,22 @@ class Entity(object):
 
 
 class EntarchyEntity(Entity):
-    pass
+    """Root entarchy entity
+    """
 
 
 class AnalysisEntity(Entity):
-    pass
+    """Analysis entity for data segregation
+    """
 
 
 class LinkEntity(Entity):
-    pass
+    """Link entity between two entities
+    """
 
 
 class Collection(object):
-    """Base class for collections of entities
+    """Base class for collection of entities
     """
 
     # TODO: implement .apply method along column axis similar to pandas DataFrame.apply() ?
@@ -395,9 +414,9 @@ class Collection(object):
 
     def __init__(self,
                  _entarchy: Entarchy,
-                 entity_type: Type[Entity],
+                 _entity_type: Type[Entity],
                  _as_tree: dict[str, ...]):
-        self._entity_type = entity_type
+        self._entity_type = _entity_type
         self._entarchy = _entarchy
         self._as_tree = _as_tree
 
@@ -991,3 +1010,57 @@ def get_ancestor_distance_from_nested(hierarchy: dict[str, Any],
     if descendant_path[: len(ancestor_path)] == ancestor_path:
         return len(descendant_path) - len(ancestor_path)
     return None
+
+
+class DeferredEntityCollection(object):
+
+    _expression: str
+
+    def __init__(self, _entity_type: type[Entity], _expression: str = ''):
+        self._entity_type = _entity_type
+        self._expression = _expression
+
+    def __repr__(self):
+        return (f'DeferredEntityCollection('
+                f'entity_type=\'{self._entity_type.__name__}\', '
+                f'expression=\'{self._expression}\''
+                f')')
+
+    def __and__(self, other: str | DeferredEntityCollection):
+        return DeferredEntityCollection(self._entity_type, f'{self._expression} AND {self._get_relexpr(other)}')
+
+    def __or__(self, other: str):
+        return DeferredEntityCollection(self._entity_type, f'{self._expression} OR {self._get_relexpr(other)}')
+
+    def __invert__(self):
+        return DeferredEntityCollection(self._entity_type, f'NOT({self._expression})')
+
+    def __sub__(self, other):
+        return DeferredEntityCollection(self._entity_type, f'({self._expression}) AND NOT({self._get_relexpr(other)})')
+
+    @property
+    def as_tree(self):
+        return query.parse_boolean_expression(self._expression)
+
+    @property
+    def entity_type(self):
+        return self._entity_type
+
+    @property
+    def expression(self):
+        return self._expression
+
+    def _get_relexpr(self, other: str | DeferredEntityCollection):
+        """Return expression string based on this object's entity_type"""
+        if isinstance(other, DeferredEntityCollection):
+            if other.entity_type == self.entity_type:
+                expr = other.expression
+            else:
+                expr = f'[{other.entity_type.__name__}]{other.expression}'
+            return expr
+
+        return other
+
+    def get_from(self, _entarchy: Entarchy) -> Collection:
+        return self._entity_type.get_collection_type()(_entarchy, self._entity_type, _as_tree=self.as_tree)
+
