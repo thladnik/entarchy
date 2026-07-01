@@ -6,14 +6,13 @@ import os.path
 import pathlib
 import pickle
 import datetime
-from os.path import relpath
 from typing import Any, Callable, List, Union
 
 import numpy as np
 import pandas as pd
 import sqlalchemy
 from sqlalchemy import Index, ForeignKey, String, create_engine, BigInteger, Double
-from sqlalchemy.dialects.mysql import LONGBLOB
+from sqlalchemy.dialects.sqlite import BLOB
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -95,7 +94,7 @@ class AttributeTable(Base):
     value_bool: Mapped[bool] = mapped_column(nullable=True)
     value_date: Mapped[datetime.date] = mapped_column(nullable=True)
     value_datetime: Mapped[datetime.datetime] = mapped_column(nullable=True)
-    value_blob: Mapped[bytes] = mapped_column(LONGBLOB, nullable=True)
+    value_blob: Mapped[bytes] = mapped_column(BLOB, nullable=True)
     data_type: Mapped[str] = mapped_column(String(500), nullable=True)
     data_size: Mapped[int] = mapped_column(BigInteger(), nullable=False, default=0)
 
@@ -270,7 +269,7 @@ def _generate_attribute_filters(entity_type_name: str,
         value = as_tree['right_operand']
 
         if _operator == 'IN':
-            raise NotImplementedError(f'IN operator not implemented for MySQL backend yet')
+            raise NotImplementedError(f'IN operator not implemented for SQLite backend yet')
             # if not isinstance(value, list):
             #     raise ValueError('Operand after IN statement should be a list of values')
             #
@@ -500,7 +499,7 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
         elif data_type == 'date':
             data_size = 3
         elif data_type == 'datetime':
-            data_size = 8  # depends on fractional seconds in current MySQL, but max. 8
+            data_size = 8  # depends on fractional seconds, but max. 8
         elif data_type == 'str':
             data_size = len(data.encode('utf-8'))
         else:
@@ -533,73 +532,32 @@ def _deserialize(data: bytes, _entarchy: Entarchy) -> Any:
     return ser.deserialize(_entarchy)
 
 
-class MySQLBackend(Backend):
+class SQLiteBackend(Backend):
     _sql_engine: sqlalchemy.Engine | None = None
     _sql_session: sqlalchemy.orm.Session | None = None
     _db_triggers_enabled: bool = None
 
-    def __init__(self, *args, dbname: str, dbhost: str, dbuser: str, dbpassword: str = None, debug: bool = False, **kwargs):
+    def __init__(self, *args, dbname: str = 'entarchy.db', debug: bool = False, **kwargs):
         Backend.__init__(self, *args, **kwargs)
-
-        # Get connection parameters
-        if dbhost is None:
-            dbname = input(f'MySQL host name [default: "localhost"]: ')
-            if dbname == '':
-                dbname = 'localhost'
-
-        if dbname is None:
-            while True:
-                dbname = input(f'New database schema name on host "{dbhost}": ')
-                if dbname == '':
-                    print('Database schema name cannot be empty.')
-                else:
-                    break
-
-        if dbuser is None:
-            dbuser = input(f'User name for database schema "{dbname}" [default: entarchy_user]: ')
-            if dbuser == '':
-                dbuser = 'entarchy_user'
-
-        if dbpassword is None:
-            import getpass
-            dbpassword = getpass.getpass(f'Password for user {dbuser}: ')
 
         self._config = {
             'dbname': dbname,
-            'dbhost': dbhost,
-            'dbuser': dbuser,
-            'dbpassword': dbpassword,
+            # 'dbhost': dbhost,
+            # 'dbuser': dbuser,
+            # 'dbpassword': dbpassword,
         }
 
         self.debug = debug
-
-    @property
-    def dbhost(self) -> str:
-        return self._config['dbhost']
 
     @property
     def dbname(self) -> str:
         return self._config['dbname']
 
     @property
-    def dbuser(self) -> str:
-        return self._config['dbuser']
-
-    @property
-    def dbpassword(self) -> str:
-        return self._config['dbpassword']
-
-    @property
-    def sql_engine(self):
+    def sql_engine(self) -> sqlalchemy.Engine:
         if not hasattr(self, '_sql_engine') or self._sql_engine is None:
-            self._sql_engine = create_engine(f'mysql+pymysql://'
-                                             f'{self.dbuser}:{self.dbpassword}'
-                                             f'@{self.dbhost}/{self.dbname}',
-                                             echo=self.debug,
-                                             pool_size=1,
-                                             pool_recycle=60,
-                                             pool_pre_ping=True,
-                                             )
+            root_path = pathlib.Path(self._root_path).as_posix()
+            self._sql_engine = create_engine(f'sqlite:///{root_path}/{self.dbname}', echo=self.debug)
 
         return self._sql_engine
 
@@ -620,18 +578,19 @@ class MySQLBackend(Backend):
     def db_triggers_enabled(self) -> bool:
         if self._db_triggers_enabled is None:
 
-            # Check if triggers are enabled
-            if self._db_triggers_enabled is None:
-                with sqlalchemy.Connection(self._sql_engine) as conn:
-                    res = conn.execute(
-                        sqlalchemy.text(
-                            'SELECT TRIGGER_NAME '
-                            'FROM information_schema.TRIGGERS '
-                            f'WHERE TRIGGER_SCHEMA = \'{self.dbname}\''
-                            'AND TRIGGER_NAME = \'attributes_touch_entities_ai\''
-                        )
-                    )
-                    self._db_triggers_enabled = len(res.fetchall()) > 0
+            # # Check if triggers are enabled
+            # if self._db_triggers_enabled is None:
+            #     with sqlalchemy.Connection(self.sql_engine) as conn:
+            #         res = conn.execute(
+            #             sqlalchemy.text(
+            #                 'SELECT TRIGGER_NAME '
+            #                 'FROM information_schema.TRIGGERS '
+            #                 f'WHERE TRIGGER_SCHEMA = \'{self.dbname}\''
+            #                 'AND TRIGGER_NAME = \'attributes_touch_entities_ai\''
+            #             )
+            #         )
+            #         self._db_triggers_enabled = len(res.fetchall()) > 0
+            self._db_triggers_enabled = False
 
         return self._db_triggers_enabled
 
@@ -640,55 +599,57 @@ class MySQLBackend(Backend):
 
         # Create schema
         print(f'> Create database {self.dbname}')
-        engine = create_engine(f'mysql+pymysql://{self.dbuser}:{self.dbpassword}@{self.dbhost}', echo=self.debug)
-        with engine.connect() as connection:
-            connection.execute(sqlalchemy.text(f'CREATE SCHEMA IF NOT EXISTS {self.dbname}'))
-        engine.dispose()
+        # root_path = pathlib.Path(self._root_path).as_posix()
+        # print(f'sqlite://{root_path}/{self.dbname}')
+        # engine = create_engine(f'sqlite:////{root_path}/{self.dbname}', echo=self.debug)
+        # with engine.connect() as connection:
+        #     connection.execute(sqlalchemy.text(f'CREATE SCHEMA IF NOT EXISTS {self.dbname}'))
+        # engine.dispose()
 
         # Create tables
         print('> Create tables')
         Base.metadata.create_all(self.sql_engine)
 
-        print('> Create triggers')
-        with self.sql_engine.connect() as connection:
-            try:
-                # TODO: this needs to use non-utc datetime
-                connection.execute(
-                    sqlalchemy.text(
-                        "CREATE TRIGGER attributes_touch_entities_ai\n"
-                        "AFTER INSERT ON attributes FOR EACH ROW\n"
-                        "UPDATE entities\n"
-                        "SET modified = UTC_TIMESTAMP(6)\n"
-                        "WHERE entities.uuid = NEW.entity_uuid\n"
-                    )
-                )
-                connection.execute(
-                    sqlalchemy.text(
-                        "CREATE TRIGGER attributes_touch_entities_au\n"
-                        "AFTER UPDATE ON attributes FOR EACH ROW\n"
-                        "UPDATE entities\n"
-                        "SET modified = UTC_TIMESTAMP(6)\n"
-                        "WHERE entities.uuid = NEW.entity_uuid\n"
-                    )
-                )
-                connection.execute(
-                    sqlalchemy.text(
-                        "CREATE TRIGGER attributes_touch_entities_ad\n"
-                        "AFTER DELETE ON attributes FOR EACH ROW\n"
-                        "UPDATE entities\n"
-                        "SET modified = UTC_TIMESTAMP(6)\n"
-                        "WHERE entities.uuid = OLD.entity_uuid\n"
-                    )
-                )
-            except:
-                # If this fails after successful creation of tables, the most likely reason is detailed here:
-                #  https://stackoverflow.com/a/56390000
-                print('WARNING: Failed to create database triggers. '
-                      'This may impact performance of attribute updates.')
-                print(10 * ' ' + 'A likely cause for this are server security settings '
-                                 'or insufficient privileges of the database user.')
-                print(10 * ' ' + f'For better performance give global \'SUPER\' privilege to dbuser \'{self.dbuser}\' ')
-                print(10 * ' ' + f'OR set log-bin-trust-function-creators=1 in MySQL config and restart the server.')
+        # print('> Create triggers')
+        # with self.sql_engine.connect() as connection:
+        #     try:
+        #         # TODO: this needs to use non-utc datetime
+        #         connection.execute(
+        #             sqlalchemy.text(
+        #                 "CREATE TRIGGER attributes_touch_entities_ai\n"
+        #                 "AFTER INSERT ON attributes FOR EACH ROW\n"
+        #                 "UPDATE entities\n"
+        #                 "SET modified = UTC_TIMESTAMP(6)\n"
+        #                 "WHERE entities.uuid = NEW.entity_uuid\n"
+        #             )
+        #         )
+        #         connection.execute(
+        #             sqlalchemy.text(
+        #                 "CREATE TRIGGER attributes_touch_entities_au\n"
+        #                 "AFTER UPDATE ON attributes FOR EACH ROW\n"
+        #                 "UPDATE entities\n"
+        #                 "SET modified = UTC_TIMESTAMP(6)\n"
+        #                 "WHERE entities.uuid = NEW.entity_uuid\n"
+        #             )
+        #         )
+        #         connection.execute(
+        #             sqlalchemy.text(
+        #                 "CREATE TRIGGER attributes_touch_entities_ad\n"
+        #                 "AFTER DELETE ON attributes FOR EACH ROW\n"
+        #                 "UPDATE entities\n"
+        #                 "SET modified = UTC_TIMESTAMP(6)\n"
+        #                 "WHERE entities.uuid = OLD.entity_uuid\n"
+        #             )
+        #         )
+        #     except:
+        #         # If this fails after successful creation of tables, the most likely reason is detailed here:
+        #         #  https://stackoverflow.com/a/56390000
+        #         print('WARNING: Failed to create database triggers. '
+        #               'This may impact performance of attribute updates.')
+        #         print(10 * ' ' + 'A likely cause for this are server security settings '
+        #                          'or insufficient privileges of the database user.')
+        #         print(10 * ' ' + f'For better performance give global \'SUPER\' privilege to dbuser \'{self.dbuser}\' ')
+        #         print(10 * ' ' + f'OR set log-bin-trust-function-creators=1 in MySQL config and restart the server.')
 
         return True
 
@@ -716,10 +677,11 @@ class MySQLBackend(Backend):
             return
 
         print('> Drop schema')
-        engine = create_engine(f'mysql+pymysql://{self.dbuser}:{self.dbpassword}@{self.dbhost}')
-        with engine.connect() as connection:
-            connection.execute(sqlalchemy.text(f'DROP SCHEMA IF EXISTS {self.dbname}'))
-            connection.commit()
+        print('WARNING: TODO - please delete sqlite DB manually')
+        # engine = create_engine(f'sqlite://{self.dbuser}:{self.dbpassword}@{self.dbhost}')
+        # with engine.connect() as connection:
+        #     connection.execute(sqlalchemy.text(f'DROP SCHEMA IF EXISTS {self.dbname}'))
+        #     connection.commit()
 
     # Entity related methods
 
@@ -1168,6 +1130,9 @@ class MySQLBackend(Backend):
     @_retry_on_operational_failure
     def set_collection_attributes(self, _collection: Collection, df: pd.DataFrame) -> None:
 
+        if df.empty or len(df.columns) == 0:
+            return
+
         ent = _collection.entarchy
 
         _dtypes = ['str', 'float', 'int', 'date', 'datetime', 'bool', 'blob']
@@ -1267,15 +1232,15 @@ class MySQLBackend(Backend):
             # Perform upsert
             with self.sql_session as session:
                 insert_attr_data = df_insert.to_dict('records')
-                insert_stmt = sqlalchemy.dialects.mysql.insert(AttributeTable).values(insert_attr_data)
+                insert_stmt = sqlalchemy.dialects.sqlite.insert(AttributeTable).values(insert_attr_data)
                 update_attr_data = {
-                    f'value_{data_type_str}': getattr(insert_stmt.inserted, f'value_{data_type_str}'),
+                    f'value_{data_type_str}': getattr(insert_stmt.excluded, f'value_{data_type_str}'),
                     # On update, reset all other value fields to None:
                     **{f'value_{dt}': None for dt in list(set(_dtypes) - {data_type_str})},
                     'data_type': data_type_str,
-                    'data_size': insert_stmt.inserted.data_size,
-                    'analysis_uuid': insert_stmt.inserted.analysis_uuid,
-                    'modified': insert_stmt.inserted.modified
+                    'data_size': insert_stmt.excluded.data_size,
+                    'analysis_uuid': insert_stmt.excluded.analysis_uuid,
+                    'modified': insert_stmt.excluded.modified
                 }
 
                 # Add modified time update if triggers are not enabled
@@ -1283,8 +1248,19 @@ class MySQLBackend(Backend):
                     update_attr_data['modified'] = datetime.datetime.now()
 
                 # Execute upsert
-                upsert_stmt = insert_stmt.on_duplicate_key_update(update_attr_data)
+                upsert_stmt = insert_stmt.on_conflict_do_update(
+                    index_elements=[AttributeTable.entity_uuid, AttributeTable.name],
+                    set_=update_attr_data,
+                )
                 session.execute(upsert_stmt)
+                session.commit()
+
+        if not self.db_triggers_enabled:
+            with self.sql_session as session:
+                session.query(EntityTable).filter(EntityTable.uuid.in_(list(df.index))).update(
+                    {EntityTable.modified: datetime.datetime.now()},
+                    synchronize_session=False,
+                )
                 session.commit()
 
     def open(self):

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+
+import pathlib
+
 import datetime
 from typing import Any, TYPE_CHECKING, Union, Iterable
 
@@ -13,6 +17,11 @@ if TYPE_CHECKING:
 class Backend(object):
     _config: dict[str, Any] = None
     _debug: bool = False
+    _root_path: os.PathLike = None
+
+    def __init__(self, root_path: os.PathLike):
+        self._root_path = root_path
+
 
     @property
     def debug(self) -> bool:

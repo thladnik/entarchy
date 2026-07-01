@@ -16,6 +16,7 @@ from .entity import AnalysisEntity, Collection, EntarchyEntity, Entity, LinkEnti
 if TYPE_CHECKING:
     from ..backend.backend import Backend
     from ..backend.mysql import MySQLBackend
+    from ..backend.sqlite import SQLiteBackend
 
 
 class Entarchy(object):
@@ -28,7 +29,8 @@ class Entarchy(object):
     _hierarchy_root_type: Type[Entity]
     max_blob_size: int = 10 * 1024 * 1024  # bytes (10MB)
 
-    _backend: MySQLBackend = None  # Backend # TODO: Make this more generic, currently only MySQLBackend is supported
+    # TODO: Make this more generic, currently only MySQLBackend is supported:
+    _backend: MySQLBackend | SQLiteBackend = None  # Backend
     _config: dict[str, Any] = None
     _is_in_context: bool = False
     _is_in_digest_mode: bool = False
@@ -101,14 +103,14 @@ class Entarchy(object):
         return f'{self.__class__.__name__}(\'{self.path}\', backend={self.backend.__class__.__qualname__})'
 
     @property
-    def backend(self) -> MySQLBackend:  # Backend:
+    def backend(self) -> MySQLBackend | SQLiteBackend:  # Backend:
 
         if not hasattr(self, '_backend') or self._backend is None:
             # Load backend
             _backend_path = self._config['backend']
             _backend_path_parts = _backend_path.split('.')
             _backend_cls = getattr(importlib.import_module('.'.join(_backend_path_parts[:-1])), _backend_path_parts[-1])
-            self._backend = _backend_cls(**self._config['backend_config'], debug=self._debug)
+            self._backend = _backend_cls(self.path, **self._config['backend_config'], debug=self._debug)
 
         return self._backend
 
@@ -162,7 +164,7 @@ class Entarchy(object):
             # Load entarchy entity
             entarchy_uuid = self._config.get('entarchy_uuid')
             if entarchy_uuid is None:
-                RuntimeError('No entarchy UUID found in configuration. Is the entarchy initialized correctly?')
+                raise RuntimeError('No entarchy UUID found in configuration. Is the entarchy initialized correctly?')
 
             self._entarchy_entity = self.backend.get_entity_by_uuid(self, entarchy_uuid)
 
@@ -198,7 +200,8 @@ class Entarchy(object):
         return hierarchy, entity_map
 
     @classmethod
-    def create(cls, path: str,
+    def create(cls,
+               path: str,
                _backend: Backend | str,
                _backend_config: dict[str, Any] = None,
                **kwargs) -> Entarchy:
@@ -219,9 +222,9 @@ class Entarchy(object):
                 _backend_cls = getattr(importlib.import_module('.'.join(_backend_path_parts[:-1])), _backend_path_parts[-1])
             else:
                 from .. import backend
-                _backend_cls = getattr(backend, _backend)(**(_backend_config or {}), debug=False)
+                _backend_cls = getattr(backend, _backend)
 
-            _backend = _backend_cls(**(_backend_config or {}), debug=False)
+            _backend = _backend_cls(path, **(_backend_config or {}), debug=False)
 
         # Resolve hierarchy and add Analysis entity
         hierarchy, entity_map = cls._resolve_hierarchy()
