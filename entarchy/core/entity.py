@@ -70,6 +70,12 @@ class Entity(object):
 
         _entarchy = arg0 if arg0 is not None else kwargs.get('_entarchy', None)
         if _entarchy is None:
+            # Pickle reconstruction calls __new__ without constructor args.
+            # In that case, create a blank instance and let pickle restore state.
+            #  (Only applies during multiprocessing map calls, where the entity is reconstructed in a new process)
+            if len(args) == 0 and len(kwargs) == 0:
+                return super().__new__(cls)
+
             raise ValueError('_entarchy argument is required')
 
         _uuid = args[1] if len(args) > 1 else kwargs.get('_uuid', None)
@@ -430,7 +436,9 @@ class Collection(object):
         return self._length
 
     def __repr__(self):
-        return f'{self.__class__.__name__}(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
+        if self.__class__.__name__ == 'Collection':
+            return f'{self.__class__.__name__}(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
+        return f'{self.__class__.__name__}(count={len(self)})'
 
     # Access methods
 
@@ -784,7 +792,9 @@ class Collection(object):
         print(f'Run function {fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {entity_count} entities')
 
-        with alive_progress.alive_bar(entity_count, spinner='fish2', force_tty=True) as bar:
+        with alive_progress.alive_bar(entity_count,
+                                      spinner='fish2', spinner_length=30,
+                                      length=30, force_tty=True) as bar:
             for entity in self:
                 fun(entity, **kwargs)
                 bar()
@@ -850,9 +860,7 @@ class Collection(object):
             with alive_progress.alive_bar(entity_count,
                                           spinner='fish2', spinner_length=20,
                                           length=20, force_tty=True) as progress_bar:
-
                 for iter_num in range(entity_count):
-
                     _ = next(iterator)
 
                     # print('Next')
@@ -956,7 +964,8 @@ class CollectionIterator(object):
     def __init__(self, _collection: Collection):
         self._collection = _collection
         self._current_index = 0
-        self._results = self._collection.entarchy.backend.get_collection_entities_by_slice(self._collection, slice(None, None, None))
+        self._results = self._collection.entarchy.backend.get_collection_entities_by_slice(self._collection,
+                                                                                           slice(None, None, None))
 
     def __next__(self):
         # No more results: reset iteration counter and offset and stop iteration
@@ -1013,7 +1022,6 @@ def get_ancestor_distance_from_nested(hierarchy: dict[str, Any],
 
 
 class DeferredEntityCollection(object):
-
     _expression: str
 
     def __init__(self, _entity_type: type[Entity], _expression: str = ''):
@@ -1063,4 +1071,3 @@ class DeferredEntityCollection(object):
 
     def get_from(self, _entarchy: Entarchy) -> Collection:
         return self._entity_type.get_collection_type()(_entarchy, self._entity_type, _as_tree=self.as_tree)
-
