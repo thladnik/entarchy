@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import atexit
 import datetime
 import time
+import traceback
 import uuid
 from typing import Any, Generator, Type, Union, TYPE_CHECKING, Callable
 
@@ -872,12 +874,20 @@ class Collection(object):
                   _use_gpu: bool = False,
                   _gpu_max_device_num: int = None,
                   _calibrate: bool = True,
+                  _locality: bool = True,
                   **kwargs) -> None:
         """Apply a function to each Entity of the collection in parallel worker processes.
 
         Results are not collected; the function is expected to write what it computes
         back onto the entity. Entities are released from the registry after being
         processed, so memory does not grow with the size of the collection.
+
+        Workers are kept alive between calls, so a sequence of map_async calls pays
+        the pool startup cost once. Call shutdown_worker_pool() to release them early.
+
+        If the function raises for individual entities, the remaining entities are
+        still processed; a summary is printed at the end and a RuntimeError carrying
+        the first traceback is raised.
 
         Args:
             _fun (Callable): Function to apply. It receives one Entity as its first
@@ -893,6 +903,9 @@ class Collection(object):
             _calibrate (bool): Measure the first few entities in this process and skip
                 the worker pool when starting it would cost more than it saves. Set to
                 False to always use the pool.
+            _locality (bool): Group entities by parent, so a worker processes entities
+                that share a parent together and can reuse the parent's cached
+                attributes. Set to False to keep the collection's own order.
             **kwargs: Passed on to the function.
 
         Returns:
@@ -917,6 +930,23 @@ class Collection(object):
             _worker_num = mp.cpu_count() - 2
         _worker_num = max(1, min(int(_worker_num), entity_count))
 
+        # Group entities by parent, so a worker sees runs of entities that share
+        #  the (often large) attributes of their parent instead of jumping between
+        #  parents in UUID order. Entities are stored with random UUID4 keys, so
+        #  the unsorted order has no locality at all.
+        parent_uuids = {}
+        if _locality:
+            try:
+                parent_uuids = dict(self.entarchy.backend.get_collection_parent_uuids(self))
+            except Exception as e:
+                print(f'WARNING: could not determine parent entities for grouping ({e}); '
+                      f'processing in default order')
+                parent_uuids = {}
+
+            if parent_uuids:
+                entity_rows = sorted(entity_rows,
+                                     key=lambda row: (parent_uuids.get(row[0]) or '', row[0]))
+
         # Resolve the GPU device count whenever GPU use is requested, not only when
         #  the count was left unset - otherwise passing it explicitly disabled the GPU
         gpu_device_count = None
@@ -926,12 +956,27 @@ class Collection(object):
                 _gpu_max_device_num = torch.cuda.device_count()
             gpu_device_count = int(_gpu_max_device_num)
 
-        # Set chunk size (crucial for performance of large collections)
+        # Chunk size decides how tasks are handed out. When entities are grouped by
+        #  parent, chunks that match the group size let a worker finish a whole group
+        #  before moving on; chunks that straddle group boundaries make workers
+        #  release a parent and load it again.
         if _chunk_size is None:
-            _chunk_size = max(1, int(entity_count / 1_000))
+            if parent_uuids:
+                group_sizes = {}
+                for _parent in parent_uuids.values():
+                    group_sizes[_parent] = group_sizes.get(_parent, 0) + 1
+                sizes = sorted(group_sizes.values())
+                typical_group = sizes[len(sizes) // 2]
+
+                # Cap so that the work still spreads over all workers
+                _chunk_size = max(1, min(typical_group, entity_count // _worker_num))
+            else:
+                _chunk_size = max(1, entity_count // (_worker_num * POOL_CHUNKS_PER_WORKER))
 
         start_time = time.time()
         print(f'Start processing at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))}')
+
+        failures: list[tuple[str, str]] = []
 
         with alive_progress.alive_bar(entity_count, length=20, force_tty=True,
                                       **console.bar_style(spinner_length=20)) as progress_bar:
@@ -942,6 +987,11 @@ class Collection(object):
             #  Skipped for GPU runs, which are heavy by definition and should not be
             #  sampled on the CPU of the parent process.
             if _calibrate and gpu_device_count is None and _worker_num > 1:
+                # A pool that is already running costs almost nothing to use again
+                pool_is_warm = _POOL_CACHE.get('key') == _worker_pool_key(self.entarchy, _worker_num)
+                startup_cost = (POOL_WARM_STARTUP_SECONDS if pool_is_warm
+                                else POOL_STARTUP_ESTIMATE_SECONDS)
+
                 sample_size = min(POOL_CALIBRATION_SAMPLE, entity_count)
                 sample_start = time.perf_counter()
                 sampled = 0
@@ -952,14 +1002,15 @@ class Collection(object):
                 #  sample rather than the full set.
                 while sampled < sample_size:
                     _uuid, _id = remaining[sampled]
-                    self._apply_to_entity(_fun, _uuid, _id, kwargs)
+                    error = self._apply_to_entity(_fun, _uuid, _id, kwargs)
+                    if error is not None:
+                        failures.append((_uuid, error))
                     progress_bar()
                     sampled += 1
 
                     seconds_per_entity = (time.perf_counter() - sample_start) / sampled
                     estimated_sequential = seconds_per_entity * (entity_count - sampled)
-                    estimated_parallel = (POOL_STARTUP_ESTIMATE_SECONDS
-                                          + estimated_sequential / _worker_num)
+                    estimated_parallel = startup_cost + estimated_sequential / _worker_num
 
                     if estimated_parallel < 0.8 * estimated_sequential:
                         break
@@ -969,48 +1020,68 @@ class Collection(object):
                 if remaining and estimated_parallel >= estimated_sequential:
                     print(f'Estimated {estimated_sequential:.1f}s of remaining work '
                           f'({1000 * seconds_per_entity:.1f}ms per entity): running in this '
-                          f'process, because starting {_worker_num} workers would cost more '
+                          f'process, because using {_worker_num} workers would cost more '
                           f'than it saves')
                     for _uuid, _id in remaining:
-                        self._apply_to_entity(_fun, _uuid, _id, kwargs)
+                        error = self._apply_to_entity(_fun, _uuid, _id, kwargs)
+                        if error is not None:
+                            failures.append((_uuid, error))
                         progress_bar()
                     remaining = []
 
             if remaining and _worker_num == 1:
                 for _uuid, _id in remaining:
-                    self._apply_to_entity(_fun, _uuid, _id, kwargs)
+                    error = self._apply_to_entity(_fun, _uuid, _id, kwargs)
+                    if error is not None:
+                        failures.append((_uuid, error))
                     progress_bar()
                 remaining = []
 
             if remaining:
-                ctx_type = 'spawn'
-                ctx = mp.get_context(ctx_type)
-                print(f'Start pool ({ctx_type}) with {_worker_num} workers')
+                pool, was_running = _get_worker_pool(self.entarchy, _worker_num)
+                print(f'{"Reuse" if was_running else "Start"} worker pool '
+                      f'({_worker_num} workers, spawn, chunk size {_chunk_size})')
 
-                # Shared counter so each worker can claim a distinct GPU device
-                worker_counter = ctx.Value('i', 0) if gpu_device_count is not None else None
+                kwargs_items = tuple(kwargs.items())
+                tasks = [(_uuid, _id, parent_uuids.get(_uuid), self.entity_type,
+                          _fun, kwargs_items, gpu_device_count)
+                         for _uuid, _id in remaining]
 
-                with ctx.Pool(processes=_worker_num,
-                              initializer=_init_map_worker,
-                              initargs=(self.entarchy, self.entity_type, _fun,
-                                        tuple(kwargs.items()), gpu_device_count,
-                                        worker_counter)) as pool:
-
-                    for _ in pool.imap(_run_map_worker, remaining, chunksize=_chunk_size):
+                try:
+                    for _uuid, error in pool.imap_unordered(_run_map_worker, tasks,
+                                                            chunksize=_chunk_size):
+                        if error is not None:
+                            failures.append((_uuid, error))
                         progress_bar()
-
-                    # Let workers exit cleanly, so they close their connections
-                    pool.close()
-                    pool.join()
+                except BaseException:
+                    # A broken pool cannot be reused; make sure the next call rebuilds it
+                    shutdown_worker_pool()
+                    raise
 
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
 
+        if failures:
+            print(f'\n{len(failures)} of {entity_count} entities failed. '
+                  f'Successful entities have been committed; re-run to retry the rest '
+                  f'(a filter such as \'NOT(EXIST(<attribute>))\' selects them).')
+            for _uuid, _ in failures[:5]:
+                print(f'  failed: {_uuid}')
+            if len(failures) > 5:
+                print(f'  ... and {len(failures) - 5} more')
+
+            raise RuntimeError(f'{_fun.__name__} failed on {len(failures)} of {entity_count} '
+                               f'entities. First traceback:\n\n{failures[0][1]}')
+
     def rename(self, name: str) -> None:
         self._name = name
 
-    def _apply_to_entity(self, fun: Callable, _uuid: str, _id: str, kwargs: dict) -> None:
-        """Apply the mapped function to one entity in the current process."""
+    def _apply_to_entity(self, fun: Callable, _uuid: str, _id: str,
+                         kwargs: dict) -> Union[str, None]:
+        """Apply the mapped function to one entity in the current process.
+
+        Returns the formatted traceback if the function raised, otherwise None.
+        """
 
         # Entities the caller already holds stay registered, so their identity is
         #  preserved; entities materialized here are released again, so a large
@@ -1021,6 +1092,9 @@ class Collection(object):
         try:
             with entity:
                 fun(entity, **kwargs)
+            return None
+        except Exception:
+            return traceback.format_exc()
         finally:
             if not was_registered:
                 self.entarchy.forget_entity(entity)
@@ -1075,46 +1149,44 @@ class Collection(object):
 #  and its database connection are reused across all tasks handled by that worker.
 _WORKER_CONTEXT: dict[str, Any] = {}
 
+# At most one reusable worker pool is kept alive, so repeated map_async calls do
+#  not each pay the pool startup cost.
+_POOL_CACHE: dict[str, Any] = {}
+
 # Rough cost of starting a process pool (spawn plus re-importing numpy/pandas/
 #  sqlalchemy in each worker), used to decide whether parallel execution can pay
 #  off at all. Measured at ~1.9 s; adjust if your environment differs markedly.
 POOL_STARTUP_ESTIMATE_SECONDS = 2.0
 
+# Cost of dispatching to a pool that is already running
+POOL_WARM_STARTUP_SECONDS = 0.05
+
 # Number of entities processed in-process to estimate the per-entity cost
 POOL_CALIBRATION_SAMPLE = 3
 
+# Chunks handed to each worker. More chunks balance load better, fewer keep
+#  entities that share a parent together in one worker.
+POOL_CHUNKS_PER_WORKER = 8
 
-def _init_map_worker(_entarchy: Entarchy,
-                     _entity_type: Type[Entity],
-                     _fun: Callable,
-                     _kwargs: tuple,
-                     _gpu_device_count: Union[int, None],
-                     _worker_counter) -> None:
+
+def _init_map_worker(_entarchy: Entarchy, _worker_counter) -> None:
     """Pool initializer: set up one Entarchy per worker process.
 
-    Previously every task carried its own pickled Entarchy, so each entity opened
-    and closed a database connection of its own. The Entarchy is now unpickled
-    once per worker and its connection is reused for every task that worker runs.
+    Only state that stays valid across map_async calls is bound here, so the pool
+    can be reused. The function, its arguments and the entity type travel with
+    each task.
     """
-    import atexit
+    worker_index = 0
+    if _worker_counter is not None:
+        with _worker_counter.get_lock():
+            worker_index = _worker_counter.value
+            _worker_counter.value += 1
 
-    # Pin one GPU device per worker. Assigning per entity instead would make every
-    #  worker touch every device, creating a CUDA context per device per process.
-    device = None
-    if _gpu_device_count is not None:
-        worker_index = 0
-        if _worker_counter is not None:
-            with _worker_counter.get_lock():
-                worker_index = _worker_counter.value
-                _worker_counter.value += 1
-        device = f'cuda:{worker_index % _gpu_device_count}' if _gpu_device_count > 0 else 'cpu'
-
+    _WORKER_CONTEXT.clear()
     _WORKER_CONTEXT.update({
         'entarchy': _entarchy,
-        'entity_type': _entity_type,
-        'fun': _fun,
-        'kwargs': dict(_kwargs),
-        'device': device,
+        'worker_index': worker_index,
+        'last_parent_uuid': None,
     })
 
     atexit.register(_close_map_worker)
@@ -1136,24 +1208,97 @@ def _close_map_worker() -> None:
             pass
 
 
-def _run_map_worker(task: tuple[str, str]) -> None:
-    """Apply the mapped function to a single entity, addressed by UUID."""
-    _uuid, _id = task
+def _run_map_worker(task: tuple) -> tuple:
+    """Apply the mapped function to a single entity, addressed by UUID.
+
+    Returns (uuid, traceback or None); failures are reported back rather than
+    raised, so one bad entity does not abandon the rest of the collection.
+    """
+    _uuid, _id, parent_uuid, entity_type, fun, kwargs_items, gpu_device_count = task
 
     _entarchy = _WORKER_CONTEXT['entarchy']
-    kwargs = _WORKER_CONTEXT['kwargs']
-    device = _WORKER_CONTEXT['device']
+    kwargs = dict(kwargs_items)
 
-    if device is not None:
-        kwargs = {**kwargs, '_use_gpu_device': device}
+    # Derive the device from the worker index, so a worker stays on one device
+    if gpu_device_count is not None:
+        kwargs['_use_gpu_device'] = (f'cuda:{_WORKER_CONTEXT["worker_index"] % gpu_device_count}'
+                                     if gpu_device_count > 0 else 'cpu')
 
-    entity = _WORKER_CONTEXT['entity_type'](_entarchy, _uuid=_uuid, _id=_id)
+    entity = entity_type(_entarchy, _uuid=_uuid, _id=_id)
+    error = None
     try:
         with entity:
-            _WORKER_CONTEXT['fun'](entity, **kwargs)
+            fun(entity, **kwargs)
+    except Exception:
+        error = traceback.format_exc()
     finally:
         # Without this the worker's registry would grow with every entity it handles
         _entarchy.forget_entity(entity)
+
+        # Tasks are ordered by parent, so once the parent changes the previous one
+        #  will not be needed again. Releasing it frees its cached attributes,
+        #  which for imaging data can be hundreds of megabytes per parent.
+        if parent_uuid is not None and parent_uuid != _WORKER_CONTEXT['last_parent_uuid']:
+            if _WORKER_CONTEXT['last_parent_uuid'] is not None:
+                _entarchy.forget_entity(_WORKER_CONTEXT['last_parent_uuid'])
+            _WORKER_CONTEXT['last_parent_uuid'] = parent_uuid
+
+    return _uuid, error
+
+
+def _worker_pool_key(_entarchy: Entarchy, worker_num: int) -> tuple:
+    """Identity of a pool. State that workers copy but cannot see change is part
+    of the key, so a stale pool is rebuilt rather than silently reused."""
+    analysis = _entarchy.current_analysis
+    return (_entarchy.path,
+            worker_num,
+            analysis.uuid if analysis is not None else None,
+            _entarchy.is_in_digest_mode)
+
+
+def _get_worker_pool(_entarchy: Entarchy, worker_num: int) -> tuple:
+    """Return (pool, was_already_running) for this entarchy and worker count."""
+    import multiprocessing as mp
+
+    key = _worker_pool_key(_entarchy, worker_num)
+    if _POOL_CACHE.get('key') == key and _POOL_CACHE.get('pool') is not None:
+        return _POOL_CACHE['pool'], True
+
+    # Only one pool is kept alive at a time
+    shutdown_worker_pool()
+
+    ctx = mp.get_context('spawn')
+    counter = ctx.Value('i', 0)
+    pool = ctx.Pool(processes=worker_num,
+                    initializer=_init_map_worker,
+                    initargs=(_entarchy, counter))
+
+    _POOL_CACHE.update({'key': key, 'pool': pool})
+    return pool, False
+
+
+def shutdown_worker_pool() -> None:
+    """Shut down the reusable map_async worker pool, if one is running.
+
+    Called automatically at interpreter exit. Call it explicitly to release
+    worker processes and their database connections early.
+    """
+    pool = _POOL_CACHE.pop('pool', None)
+    _POOL_CACHE.pop('key', None)
+
+    if pool is None:
+        return
+
+    try:
+        # close() rather than terminate(), so workers run their exit handlers
+        #  and close their database connections
+        pool.close()
+        pool.join()
+    except Exception:
+        pass
+
+
+atexit.register(shutdown_worker_pool)
 
 
 class CollectionIterator(object):

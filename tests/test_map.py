@@ -4,6 +4,14 @@ import pytest
 
 import _mp_worker
 from conftest import Session, Subject
+from entarchy.core.entity import shutdown_worker_pool
+
+
+@pytest.fixture(autouse=True)
+def _release_pool():
+    """The worker pool outlives a single call, so release it between tests."""
+    yield
+    shutdown_worker_pool()
 
 
 @pytest.fixture()
@@ -17,6 +25,23 @@ def many(ent):
             ent.add_new_entity(session)
             session['index'] = i
             session['score'] = float(i)
+    return ent
+
+
+@pytest.fixture()
+def grouped(ent):
+    """Sessions spread over three parents, to exercise locality grouping."""
+    with ent:
+        for s in range(3):
+            subject = Subject(ent, _id=f'subject_{s}', _parent=ent.root)
+            ent.add_new_entity(subject)
+            subject['label'] = f'label_{s}'
+
+            for i in range(6):
+                session = Session(ent, _id=f'sess_{s}_{i}', _parent=subject)
+                ent.add_new_entity(session)
+                session['index'] = i
+                session['score'] = float(i)
     return ent
 
 
@@ -148,7 +173,7 @@ class TestGpuDeviceAssignment:
     def test_gpu_run_skips_calibration(self, populated, capsys):
         populated.get(Session).map_async(_mp_worker.record_device, _worker_num=2,
                                          _use_gpu=True, _gpu_max_device_num=0)
-        assert 'Start pool' in capsys.readouterr().out
+        assert 'worker pool' in capsys.readouterr().out
 
 
 class TestCalibration:
@@ -159,7 +184,7 @@ class TestCalibration:
 
         output = capsys.readouterr().out
         assert 'running in this process' in output
-        assert 'Start pool' not in output
+        assert 'worker pool' not in output
 
         out = many.get(Session)[['score', 'doubled']]
         assert (out['doubled'] == out['score'] * 2).all()
@@ -168,12 +193,12 @@ class TestCalibration:
         many.get(Session).map_async(_mp_worker.double_score, _worker_num=2,
                                     _calibrate=False)
 
-        assert 'Start pool' in capsys.readouterr().out
+        assert 'worker pool' in capsys.readouterr().out
 
     def test_single_worker_never_starts_a_pool(self, many, capsys):
         many.get(Session).map_async(_mp_worker.double_score, _worker_num=1)
 
-        assert 'Start pool' not in capsys.readouterr().out
+        assert 'worker pool' not in capsys.readouterr().out
         out = many.get(Session)[['score', 'doubled']]
         assert (out['doubled'] == out['score'] * 2).all()
 
@@ -184,4 +209,169 @@ class TestCalibration:
 
         many.get(Session).map_async(_mp_worker.double_score, _worker_num=2)
 
-        assert 'Start pool' in capsys.readouterr().out
+        assert 'worker pool' in capsys.readouterr().out
+
+
+class TestPoolReuse:
+    """Item 1: the pool survives between calls, so startup is paid once."""
+
+    def test_second_call_reuses_the_pool(self, many, capsys):
+        many.get(Session).map_async(_mp_worker.double_score, _worker_num=2, _calibrate=False)
+        assert 'Start worker pool' in capsys.readouterr().out
+
+        many.get(Session).map_async(_mp_worker.double_score, _worker_num=2, _calibrate=False)
+        assert 'Reuse worker pool' in capsys.readouterr().out
+
+    def test_same_workers_serve_both_calls(self, many):
+        many.get(Session).map_async(_mp_worker.record_worker_state, _worker_num=2,
+                                    _calibrate=False)
+        first = set(many.get(Session)['pid'])
+
+        many.get(Session).map_async(_mp_worker.record_worker_state, _worker_num=2,
+                                    _calibrate=False)
+        second = set(many.get(Session)['pid'])
+
+        assert first == second
+
+    def test_warm_pool_lowers_the_startup_estimate(self, many, capsys, monkeypatch):
+        """Calibration weighs a running pool by its dispatch cost, not by the cost
+        of starting one from scratch."""
+        from entarchy.core import entity as entity_module
+        monkeypatch.setattr(entity_module, 'POOL_STARTUP_ESTIMATE_SECONDS', 1e6)
+        monkeypatch.setattr(entity_module, 'POOL_WARM_STARTUP_SECONDS', 0.0)
+
+        # Cold: starting a pool is ruled out
+        many.get(Session).map_async(_mp_worker.double_score, _worker_num=2)
+        assert 'running in this process' in capsys.readouterr().out
+
+        # Warm the pool
+        many.get(Session).map_async(_mp_worker.double_score, _worker_num=2, _calibrate=False)
+        capsys.readouterr()
+
+        # Warm: the same work is now worth dispatching
+        many.get(Session).map_async(_mp_worker.double_score, _worker_num=2)
+        assert 'Reuse worker pool' in capsys.readouterr().out
+
+    def test_changing_worker_count_rebuilds_the_pool(self, many, capsys):
+        many.get(Session).map_async(_mp_worker.record_worker_state, _worker_num=2,
+                                    _calibrate=False)
+        first = set(many.get(Session)['pid'])
+        capsys.readouterr()
+
+        many.get(Session).map_async(_mp_worker.record_worker_state, _worker_num=3,
+                                    _calibrate=False)
+        assert 'Start worker pool' in capsys.readouterr().out
+        assert set(many.get(Session)['pid']).isdisjoint(first)
+
+    def test_shutdown_releases_workers(self, many, capsys):
+        many.get(Session).map_async(_mp_worker.record_worker_state, _worker_num=2,
+                                    _calibrate=False)
+        first = set(many.get(Session)['pid'])
+
+        shutdown_worker_pool()
+        capsys.readouterr()
+
+        many.get(Session).map_async(_mp_worker.record_worker_state, _worker_num=2,
+                                    _calibrate=False)
+        assert 'Start worker pool' in capsys.readouterr().out
+        assert set(many.get(Session)['pid']).isdisjoint(first)
+
+    def test_shutdown_is_safe_without_a_pool(self):
+        shutdown_worker_pool()
+        shutdown_worker_pool()
+
+
+class TestLocality:
+    """Item 1: entities that share a parent are processed together."""
+
+    def test_all_entities_still_processed(self, grouped):
+        grouped.get(Session).map_async(_mp_worker.record_locality, _worker_num=2,
+                                       _calibrate=False)
+
+        state = grouped.get(Session)[['parent_id', 'parent_label']]
+        assert len(state) == 18
+        assert set(state['parent_id']) == {'subject_0', 'subject_1', 'subject_2'}
+
+    def test_each_worker_sees_parents_in_contiguous_runs(self, grouped):
+        grouped.get(Session).map_async(_mp_worker.record_locality, _worker_num=2,
+                                       _calibrate=False)
+
+        state = grouped.get(Session)[['parent_id', 'pid', 'order']]
+
+        for pid, block in state.groupby('pid'):
+            sequence = list(block.sort_values('order')['parent_id'])
+            transitions = sum(1 for a, b in zip(sequence, sequence[1:]) if a != b)
+            # A worker touching k parents should switch k-1 times, not bounce
+            assert transitions == len(set(sequence)) - 1
+
+    def test_parents_are_released_when_the_group_changes(self, grouped):
+        """Only the current entity and its ancestors stay registered."""
+        grouped.get(Session).map_async(_mp_worker.record_locality, _worker_num=2,
+                                       _calibrate=False)
+
+        # entity + its parent (+ the parent's own parent once touched)
+        assert max(grouped.get(Session)['registry_size']) <= 3
+
+    def test_locality_can_be_disabled(self, grouped):
+        grouped.get(Session).map_async(_mp_worker.record_locality, _worker_num=2,
+                                       _calibrate=False, _locality=False)
+        assert len(grouped.get(Session)['parent_id']) == 18
+
+    def test_chunks_are_sized_to_the_groups(self, grouped, capsys):
+        """Chunks that straddle group boundaries make workers release a parent and
+        load it again, so the default chunk size follows the group size."""
+        grouped.get(Session).map_async(_mp_worker.record_locality, _worker_num=2,
+                                       _calibrate=False)
+        assert 'chunk size 6' in capsys.readouterr().out  # 3 groups of 6 sessions
+
+    def test_chunk_size_is_capped_for_load_balance(self, ent, capsys):
+        """A single huge group must still spread over the workers."""
+        with ent:
+            subject = Subject(ent, _id='only', _parent=ent.root)
+            ent.add_new_entity(subject)
+            subject['label'] = 'x'
+            for i in range(20):
+                session = Session(ent, _id=f's{i}', _parent=subject)
+                ent.add_new_entity(session)
+                session['index'] = i
+
+        ent.get(Session).map_async(_mp_worker.record_locality, _worker_num=2,
+                                   _calibrate=False)
+
+        # 20 entities in one group, but capped at entity_count // worker_num
+        assert 'chunk size 10' in capsys.readouterr().out
+
+
+class TestErrorCollection:
+    """Item 1: one bad entity must not abandon the rest of the collection."""
+
+    def test_remaining_entities_are_still_processed(self, many):
+        with pytest.raises(RuntimeError, match='failed on'):
+            many.get(Session).map_async(_mp_worker.fail_on_odd_index, _worker_num=2,
+                                        _calibrate=False)
+
+        # The six even-indexed entities completed and were committed
+        succeeded = many.get(Session, 'EXIST(succeeded)')
+        assert sorted(succeeded['index']) == [0, 2, 4, 6, 8, 10]
+
+    def test_summary_reports_the_failures(self, many, capsys):
+        with pytest.raises(RuntimeError):
+            many.get(Session).map_async(_mp_worker.fail_on_odd_index, _worker_num=2,
+                                        _calibrate=False)
+
+        output = capsys.readouterr().out
+        assert '6 of 12 entities failed' in output
+
+    def test_error_carries_the_original_traceback(self, many):
+        with pytest.raises(RuntimeError, match='deliberate failure'):
+            many.get(Session).map_async(_mp_worker.fail_on_odd_index, _worker_num=2,
+                                        _calibrate=False)
+
+    def test_failures_in_the_in_process_path_are_collected(self, many):
+        with pytest.raises(RuntimeError, match='failed on 6 of 12'):
+            many.get(Session).map_async(_mp_worker.fail_on_odd_index, _worker_num=1)
+
+    def test_success_does_not_raise(self, many):
+        many.get(Session).map_async(_mp_worker.double_score, _worker_num=2,
+                                    _calibrate=False)
+        assert len(many.get(Session)['doubled']) == 12

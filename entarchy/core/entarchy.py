@@ -548,7 +548,7 @@ class Entarchy(object):
 
         return temp_path
 
-    def forget_entity(self, entity: Entity) -> None:
+    def forget_entity(self, entity: Union[Entity, str]) -> None:
         """Drop an entity from the in-memory registry.
 
         Used by bulk operations to keep the registry from growing with every
@@ -556,14 +556,18 @@ class Entarchy(object):
         demand the next time it is looked up by UUID.
 
         Args:
-            entity (Entity): The entity to release.
+            entity (Entity or str): The entity to release, or its UUID.
 
         Returns:
             None
         """
 
-        self.remove_entity_from_update(entity)
-        self._entities.pop(entity.uuid, None)
+        _uuid = entity if isinstance(entity, str) else entity.uuid
+
+        if _uuid in self._entities_to_update:
+            self._entities_to_update.remove(_uuid)
+
+        self._entities.pop(_uuid, None)
 
     def remove_entity_from_update(self, entity: Entity) -> None:
         """Unmark an entity for update in the backend.
