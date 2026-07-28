@@ -10,6 +10,7 @@ from typing import Any, Callable, Type, TYPE_CHECKING, Union
 import alive_progress
 import yaml
 
+from . import console
 from . import query
 from .entity import AnalysisEntity, Collection, EntarchyEntity, Entity, LinkEntity
 
@@ -58,7 +59,7 @@ class Entarchy(object):
         if self._config['implementation_version'] not in self._implementation_compat_version_list:
             raise RuntimeError(f'Implementation version in configuration '
                                f'("{self._config["implementation_version"]}") '
-                               f'is not compatible with curreng implementation version '
+                               f'is not compatible with current implementation version '
                                f'("{self._implementation_version}"). ')
 
         if self._config['hierarchy'] != self._hierarchy:
@@ -71,8 +72,6 @@ class Entarchy(object):
         self._entities_to_update: list[str] = []
         self._links: dict[tuple[str, str], str] = {}
 
-        self.roi_count = 0
-        self.roi_attr_update_count = 0
 
     def __contains__(self, item):
         if isinstance(item, Entity):
@@ -86,14 +85,23 @@ class Entarchy(object):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.commit()
+        # Only commit if the context is left without an exception,
+        #  otherwise partially processed state would be persisted
+        if exc_type is None:
+            self.commit()
         self._is_in_context = False
 
     def __getstate__(self):
         state = self.__dict__.copy()
         # Remove backend from serialization, so it may stay open on original object
         #  This prevents broken file handles or database connections
-        del state['_backend']
+        state.pop('_backend', None)
+        # Do not ship the entity registry or pending commit queues to subprocesses.
+        #  The registry grows with every entity ever loaded, which makes pickling
+        #  each map_async task O(total entities) instead of O(1).
+        state['_entities'] = {}
+        state['_entities_to_add'] = []
+        state['_entities_to_update'] = []
         return state
 
     def __hash__(self):
@@ -111,6 +119,11 @@ class Entarchy(object):
             _backend_path_parts = _backend_path.split('.')
             _backend_cls = getattr(importlib.import_module('.'.join(_backend_path_parts[:-1])), _backend_path_parts[-1])
             self._backend = _backend_cls(self.path, **self._config['backend_config'], debug=self._debug)
+
+            # Keep the resolved runtime config (e.g. interactively provided credentials,
+            #  which are intentionally not persisted to entarchy.yaml) in memory,
+            #  so worker subprocesses don't have to prompt again
+            self._config['backend_config'] = self._backend.get_runtime_config()
 
         return self._backend
 
@@ -254,6 +267,10 @@ class Entarchy(object):
         # Create instance
         ent = cls(path, **kwargs)
 
+        # Reuse the backend instance that was already configured above,
+        #  so credentials are not requested a second time
+        ent._backend = _backend
+
         # Create backend
         res = ent.backend.create()
         if not res:
@@ -270,9 +287,13 @@ class Entarchy(object):
             ent.add_new_entity(ent_entity)
 
         # Update config to include entarchy entity uuid
-        with open(os.path.join(path, 'entarchy.yaml'), 'r+') as f:
-            _config.update({'entarchy_uuid': ent_entity.uuid})
+        _config.update({'entarchy_uuid': ent_entity.uuid})
+        with open(os.path.join(path, 'entarchy.yaml'), 'w') as f:
             yaml.safe_dump(_config, f)
+
+        # Keep the in-memory config of the returned instance in sync with the file,
+        #  otherwise ent.root fails until the entarchy is reopened from disk
+        ent._config['entarchy_uuid'] = ent_entity.uuid
 
         return ent
 
@@ -299,11 +320,22 @@ class Entarchy(object):
             None
         """
 
+        # Queue the entity first, so attribute writes below are deferred and
+        #  the entity row is guaranteed to exist before its attribute rows
+        self.add_existing_entity(entity)
+        self._entities_to_add.append(entity.uuid)
+
         # Add immutable id attributes
         entity['id'] = entity.id
         entity['uuid'] = entity.uuid
-        self.add_existing_entity(entity)
-        self._entities_to_add.append(entity.uuid)
+
+        # Outside a context, persist immediately (entities first, then attributes)
+        if not self.is_in_context:
+            self.commit()
+
+    def is_pending_add(self, entity: Entity) -> bool:
+        """Check whether an entity is queued for insertion but not yet committed."""
+        return entity.uuid in self._entities_to_add
 
     def add_existing_entity(self, entity: Entity) -> None:
         """Add an entity to the entarchy system.
@@ -326,7 +358,7 @@ class Entarchy(object):
         # Add new entities
         if len(self._entities_to_add) > 0:
 
-            res = self._backend.add_entities([self._entities[_uuid] for _uuid in self._entities_to_add])
+            res = self.backend.add_entities([self._entities[_uuid] for _uuid in self._entities_to_add])
             if not res:
                 raise RuntimeError('Failed to add new entities to backend.')
 
@@ -341,8 +373,8 @@ class Entarchy(object):
         _entities_to_update = self._entities_to_update.copy()
         with alive_progress.alive_bar(monitor=f'| Update {len(_entities_to_update)} entities',
                                       monitor_end=f'Updated {len(_entities_to_update)} entities',
-                                      bar=None, spinner='fish2', spinner_length=30, stats=False,
-                                      force_tty=True) as bar:
+                                      stats=False, force_tty=True,
+                                      **console.bar_style(bar=None)) as bar:
             for _uuid in _entities_to_update:
                 self._entities[_uuid].commit()
                 bar()
@@ -375,12 +407,16 @@ class Entarchy(object):
 
         if verification_str != user_input:
             print('Abort.')
-            # return
+            return
 
         print(f'Deleting all data for analysis {path}')
 
         print('> Remove backend')
         self.backend.delete(True)
+
+        # Release open connections/file handles before removing files
+        #  (an open SQLite database file cannot be deleted on Windows)
+        self.backend.close()
 
         print('> Remove directories and files')
 
@@ -434,8 +470,9 @@ class Entarchy(object):
 
             _string_expressions = _string_expressions + (f'{k} == {v}',)
 
-        # Concat expression
-        _expression = ' AND '.join(_string_expressions)
+        # Concat expressions. Each one is parenthesized so a top-level OR inside
+        #  one expression cannot regroup with the neighboring expressions.
+        _expression = ' AND '.join(f'({e})' for e in _string_expressions if e is not None and str(e).strip() != '')
 
         # Parse to get dictionary representation
         as_tree = query.parse_boolean_expression(_expression)
@@ -542,7 +579,10 @@ class Entarchy(object):
                 self.add_new_entity(_analysis_entity)
                 self.commit()
             else:
-                _analysis_entity = AnalysisEntity(self, _id=_analysis)
+                # Reuse the persisted UUID. Creating a fresh entity object here would
+                #  generate a new random UUID each session and attribute analysis_uuid
+                #  values would no longer match the stored analysis entity.
+                _analysis_entity = AnalysisEntity(self, _uuid=existing_data[0][0], _id=_analysis)
         elif isinstance(_analysis, AnalysisEntity):
             _analysis_entity = _analysis
         else:

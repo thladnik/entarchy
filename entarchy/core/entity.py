@@ -9,6 +9,7 @@ import alive_progress
 import numpy as np
 import pandas as pd
 
+from . import console
 from . import query
 
 if TYPE_CHECKING:
@@ -32,6 +33,18 @@ class Entity(object):
                  _id: str = None,
                  _parent: Entity = None,
                  _init_cache: dict[str, Any] = None):
+
+        # __new__ may have returned an already-registered instance (identity map).
+        #  In that case, __init__ runs again on that instance and must NOT reset its
+        #  state - doing so would wipe the attribute cache and silently discard any
+        #  pending, uncommitted attribute updates. Only merge in new cache values.
+        if getattr(self, '_entity_initialized', False):
+            if _init_cache is not None:
+                if not isinstance(_init_cache, dict):
+                    raise TypeError('_init_cache must be a dictionary of attribute names and values.')
+                for k, v in _init_cache.items():
+                    self._attribute_cache.setdefault(k, v)
+            return
 
         self._entarchy = _entarchy
         self._uuid = _uuid
@@ -58,6 +71,8 @@ class Entity(object):
             if not isinstance(_init_cache, dict):
                 raise TypeError('_init_cache must be a dictionary of attribute names and values.')
             self._attribute_cache.update(_init_cache)
+
+        self._entity_initialized = True
 
     def __new__(cls, *args, **kwargs):
 
@@ -110,6 +125,10 @@ class Entity(object):
         if not isinstance(item, str):
             raise TypeError('Item must be a string')
 
+        # Cached attributes exist by definition; saves a database query
+        if item in self._attribute_cache:
+            return True
+
         return self.entarchy.backend.has_entity_attribute(self, item)
 
     def __enter__(self):
@@ -124,8 +143,10 @@ class Entity(object):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # Commit any pending changes
-        self.commit()
+        # Commit any pending changes, unless the context is left with an exception
+        #  (in that case partially processed state must not be persisted)
+        if exc_type is None:
+            self.commit()
 
         # Reset context flag
         self._is_in_context = False
@@ -251,6 +272,13 @@ class Entity(object):
             key = [key]
             value = [value]
 
+        # Reject identity rewrites up front, before any cache state is touched
+        #  (they are only written once, while the entity is queued for insertion)
+        for k in key:
+            if k in ('id', 'uuid') and not self.entarchy.is_pending_add(self):
+                raise RuntimeError(f'Attribute "{k}" is the entity identity '
+                                   f'and cannot be modified on {self}.')
+
         # Update attribute(s) in cache and mark for update
         for k, v in zip(key, value):
 
@@ -262,6 +290,7 @@ class Entity(object):
         self.entarchy.add_entity_for_update(self)
 
         # If not in context, update immediately
+        #  (commit() defers entities that are still queued for insertion)
         if not self.is_in_context and not self.entarchy.is_in_context:
             self.commit()
 
@@ -346,6 +375,12 @@ class Entity(object):
         return self.id
 
     def commit(self):
+
+        # Attributes cannot be written before the entity row exists. Entities that
+        #  are still queued for insertion stay on the update list; Entarchy.commit()
+        #  inserts them first and commits their attributes right after.
+        if self.entarchy.is_pending_add(self):
+            return
 
         # Remove entity from entarchy update list
         self.entarchy.remove_entity_from_update(self)
@@ -681,12 +716,23 @@ class Collection(object):
 
     def dataframe_of(self, attribute_names: list[str] = None, reload_cached: bool = False) -> pd.DataFrame:
 
-        original_attribute_order = attribute_names.copy()
+        # Default to all attributes of the collection
+        if attribute_names is None:
+            attribute_names = self.columns
+
+        original_attribute_order = list(attribute_names)
 
         # Check for parent attributes in attribute_names and separate them from regular attributes,
-        #  because they need to be fetched separately
+        #  because they need to be fetched separately.
+        # 'uuid' is the cache index, not a column - handle it as a derived column below.
         parent_attribute_names = [n for n in attribute_names if n.startswith('../') or n.startswith('[')]
-        attribute_names = list(set(attribute_names) - set(parent_attribute_names))
+        uuid_requested = 'uuid' in attribute_names
+        attribute_names = list(set(attribute_names) - set(parent_attribute_names) - {'uuid'})
+
+        # Make sure the cache index (entity uuids) is initialized even if no
+        #  regular attribute triggers a load (e.g. only 'uuid' was requested)
+        if len(self._cache.index) == 0 and len(attribute_names) == 0:
+            self._load_attributes(['id'])
 
         # If not all attributes are in cache, fetch the missing ones
         loaded_attributes = set(attribute_names) & set(self._cache.columns.tolist())
@@ -764,9 +810,17 @@ class Collection(object):
 
             df = pd.concat([self._cache[attribute_names], parent_df], axis=1, copy=True)
 
+            if uuid_requested:
+                df['uuid'] = df.index
+
             return df[original_attribute_order]
 
-        return self._cache[original_attribute_order].copy()
+        df = self._cache[attribute_names].copy()
+
+        if uuid_requested:
+            df['uuid'] = df.index
+
+        return df[original_attribute_order]
 
         # TODO: return final DataFrame in custom order
         # if self._query_custom_orderby:
@@ -783,8 +837,11 @@ class Collection(object):
     def keys(self) -> list[str]:
         return self.columns
 
-    def map(self, fun: Callable, **kwargs) -> Any:
+    def map(self, fun: Callable, **kwargs) -> list:
         """Sequentially apply a function to each Entity of the collection (kwargs are passed onto the function)
+
+        Returns:
+            list: the return values of fun for each entity, in collection order.
         """
 
         entity_count = len(self)
@@ -792,12 +849,14 @@ class Collection(object):
         print(f'Run function {fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {entity_count} entities')
 
-        with alive_progress.alive_bar(entity_count,
-                                      spinner='fish2', spinner_length=30,
-                                      length=30, force_tty=True) as bar:
+        results = []
+        with alive_progress.alive_bar(entity_count, length=30, force_tty=True,
+                                      **console.bar_style()) as bar:
             for entity in self:
-                fun(entity, **kwargs)
+                results.append(fun(entity, **kwargs))
                 bar()
+
+        return results
 
     def map_async(self,
                   _fun: Callable,
@@ -857,9 +916,8 @@ class Collection(object):
             # iterator = pool.imap_unordered(self.worker_wrapper, self._async_iterator(_fun, **kwargs), chunksize=_chunk_size)
             iterator = pool.imap(self.worker_wrapper, self._async_iterator(_fun, **kwargs), chunksize=_chunk_size)
 
-            with alive_progress.alive_bar(entity_count,
-                                          spinner='fish2', spinner_length=20,
-                                          length=20, force_tty=True) as progress_bar:
+            with alive_progress.alive_bar(entity_count, length=20, force_tty=True,
+                                          **console.bar_style(spinner_length=20)) as progress_bar:
                 for iter_num in range(entity_count):
                     _ = next(iterator)
 
@@ -903,11 +961,12 @@ class Collection(object):
                                'Cannot update parent attributes through collection of child items '
                                '(attributes starting with "../" or "[EntityTypeName]").')
 
+        # Send to backend first - if it rejects the update, the cache stays
+        #  consistent with the database
+        self.entarchy.backend.set_collection_attributes(self, df)
+
         # Update cache
         self._cache.update(df)
-
-        # Send to backend
-        self.entarchy.backend.set_collection_attributes(self, df)
 
     def where(self, *_string_expressions: str, **_equalities):
         _collection = self.entarchy.get(self.entity_type, *_string_expressions, **_equalities)
@@ -947,6 +1006,10 @@ class Collection(object):
                 _use_gpu_device = 'cpu'
 
             kwargs['_use_gpu_device'] = _use_gpu_device
+
+        # Register the transferred entity in the (empty) registry of the
+        #  reconstructed entarchy, so identity mapping works inside the worker
+        entity.entarchy.add_existing_entity(entity)
 
         # Run
         with entity:
@@ -1035,10 +1098,10 @@ class DeferredEntityCollection(object):
                 f')')
 
     def __and__(self, other: str | DeferredEntityCollection):
-        return DeferredEntityCollection(self._entity_type, f'{self._expression} AND {self._get_relexpr(other)}')
+        return DeferredEntityCollection(self._entity_type, f'({self._expression}) AND ({self._get_relexpr(other)})')
 
     def __or__(self, other: str):
-        return DeferredEntityCollection(self._entity_type, f'{self._expression} OR {self._get_relexpr(other)}')
+        return DeferredEntityCollection(self._entity_type, f'({self._expression}) OR ({self._get_relexpr(other)})')
 
     def __invert__(self):
         return DeferredEntityCollection(self._entity_type, f'NOT({self._expression})')
