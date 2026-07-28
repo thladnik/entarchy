@@ -270,6 +270,9 @@ class Entarchy(object):
         # Reuse the backend instance that was already configured above,
         #  so credentials are not requested a second time
         ent._backend = _backend
+        # Keep the runtime config (incl. values that are not persisted, such as the
+        #  database password) in memory, so worker processes can connect without prompting
+        ent._config['backend_config'] = _backend.get_runtime_config()
 
         # Create backend
         res = ent.backend.create()
@@ -544,6 +547,23 @@ class Entarchy(object):
             os.makedirs(temp_path, exist_ok=True)
 
         return temp_path
+
+    def forget_entity(self, entity: Entity) -> None:
+        """Drop an entity from the in-memory registry.
+
+        Used by bulk operations to keep the registry from growing with every
+        processed entity. The entity object stays usable and is reloaded on
+        demand the next time it is looked up by UUID.
+
+        Args:
+            entity (Entity): The entity to release.
+
+        Returns:
+            None
+        """
+
+        self.remove_entity_from_update(entity)
+        self._entities.pop(entity.uuid, None)
 
     def remove_entity_from_update(self, entity: Entity) -> None:
         """Unmark an entity for update in the backend.

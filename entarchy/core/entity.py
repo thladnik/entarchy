@@ -871,17 +871,39 @@ class Collection(object):
                   _chunk_size: int = None,
                   _use_gpu: bool = False,
                   _gpu_max_device_num: int = None,
+                  _calibrate: bool = True,
                   **kwargs) -> None:
-        """
-        Concurrently apply a function to each Entity of the collection (kwargs are passed onto the function)
+        """Apply a function to each Entity of the collection in parallel worker processes.
 
-        worker_num: int number of subprocess workers to spawn for parallel execution
-        chunk_size: int (optional) size of chunks for batched execution of function to decrease overhead
-            (note that for batch execution the first argument
-            of fun is going to be of type List[Entity] instead of Entity)
+        Results are not collected; the function is expected to write what it computes
+        back onto the entity. Entities are released from the registry after being
+        processed, so memory does not grow with the size of the collection.
+
+        Args:
+            _fun (Callable): Function to apply. It receives one Entity as its first
+                argument, followed by **kwargs. It must be importable by name, because
+                workers are started with the 'spawn' method.
+            _worker_num (int): Number of worker processes (default: CPU count - 2,
+                at least 1, never more than the number of entities).
+            _chunk_size (int): Number of tasks handed to a worker at a time.
+            _use_gpu (bool): Pass a '_use_gpu_device' keyword to the function, pinning
+                one CUDA device per worker.
+            _gpu_max_device_num (int): Number of CUDA devices to distribute across
+                (default: torch.cuda.device_count()).
+            _calibrate (bool): Measure the first few entities in this process and skip
+                the worker pool when starting it would cost more than it saves. Set to
+                False to always use the pool.
+            **kwargs: Passed on to the function.
+
+        Returns:
+            None
         """
 
-        entity_count = len(self)
+        import multiprocessing as mp
+
+        # Address entities by UUID rather than shipping pickled Entity objects
+        entity_rows = self.entarchy.backend.get_collection_entities_by_slice(self, slice(None, None, None))
+        entity_count = len(entity_rows)
 
         print(f'Run function {_fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {entity_count} {self.entity_type.__name__} entities')
@@ -890,50 +912,96 @@ class Collection(object):
             print('No entities to operate on in collection')
             return
 
-        # Prepare pool and entities
-        import multiprocessing as mp
+        # Worker count must stay positive; cpu_count() - 2 is <= 0 on small machines
         if _worker_num is None:
             _worker_num = mp.cpu_count() - 2
-            if entity_count < _worker_num:
-                _worker_num = entity_count
+        _worker_num = max(1, min(int(_worker_num), entity_count))
+
+        # Resolve the GPU device count whenever GPU use is requested, not only when
+        #  the count was left unset - otherwise passing it explicitly disabled the GPU
+        gpu_device_count = None
+        if _use_gpu:
+            if _gpu_max_device_num is None:
+                import torch
+                _gpu_max_device_num = torch.cuda.device_count()
+            gpu_device_count = int(_gpu_max_device_num)
 
         # Set chunk size (crucial for performance of large collections)
         if _chunk_size is None:
-            _chunk_size = int(entity_count / 1_000)
-            if _chunk_size == 0:
-                _chunk_size = 1
+            _chunk_size = max(1, int(entity_count / 1_000))
 
-        # Set _gpu_max_device_num if necessary
-        if _use_gpu and _gpu_max_device_num is None:
-            import torch
-            kwargs['_use_gpu'] = _use_gpu
-            kwargs['_gpu_max_device_num'] = torch.cuda.device_count()
+        start_time = time.time()
+        print(f'Start processing at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))}')
 
-        ctx_type = 'spawn'
-        ctx = mp.get_context(ctx_type)
-        # mp.set_start_method(ctx_type, force=True)
-        print(f'Start pool ({ctx_type}) with {_worker_num} workers')
-        with ctx.Pool(processes=_worker_num) as pool:
+        with alive_progress.alive_bar(entity_count, length=20, force_tty=True,
+                                      **console.bar_style(spinner_length=20)) as progress_bar:
 
-            # Map entities to process pool
-            start_time = time.time()
-            print(f'Start processing at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))}')
+            remaining = entity_rows
 
-            t = time.perf_counter()
-            # iterator = pool.imap_unordered(self.worker_wrapper, self._async_iterator(_fun, **kwargs), chunksize=_chunk_size)
-            iterator = pool.imap(self.worker_wrapper, self._async_iterator(_fun, **kwargs), chunksize=_chunk_size)
+            # Estimate the cost of the work before paying for a process pool.
+            #  Skipped for GPU runs, which are heavy by definition and should not be
+            #  sampled on the CPU of the parent process.
+            if _calibrate and gpu_device_count is None and _worker_num > 1:
+                sample_size = min(POOL_CALIBRATION_SAMPLE, entity_count)
+                sample_start = time.perf_counter()
+                sampled = 0
+                estimated_sequential = estimated_parallel = 0.0
 
-            with alive_progress.alive_bar(entity_count, length=20, force_tty=True,
-                                          **console.bar_style(spinner_length=20)) as progress_bar:
-                for iter_num in range(entity_count):
-                    _ = next(iterator)
-
-                    # print('Next')
-
+                # Sampled entities are processed, not wasted, but they run serially.
+                #  Stop as soon as the pool is a clear win, so long jobs pay for one
+                #  sample rather than the full set.
+                while sampled < sample_size:
+                    _uuid, _id = remaining[sampled]
+                    self._apply_to_entity(_fun, _uuid, _id, kwargs)
                     progress_bar()
+                    sampled += 1
 
-            pool.close()
-            pool.join()
+                    seconds_per_entity = (time.perf_counter() - sample_start) / sampled
+                    estimated_sequential = seconds_per_entity * (entity_count - sampled)
+                    estimated_parallel = (POOL_STARTUP_ESTIMATE_SECONDS
+                                          + estimated_sequential / _worker_num)
+
+                    if estimated_parallel < 0.8 * estimated_sequential:
+                        break
+
+                remaining = remaining[sampled:]
+
+                if remaining and estimated_parallel >= estimated_sequential:
+                    print(f'Estimated {estimated_sequential:.1f}s of remaining work '
+                          f'({1000 * seconds_per_entity:.1f}ms per entity): running in this '
+                          f'process, because starting {_worker_num} workers would cost more '
+                          f'than it saves')
+                    for _uuid, _id in remaining:
+                        self._apply_to_entity(_fun, _uuid, _id, kwargs)
+                        progress_bar()
+                    remaining = []
+
+            if remaining and _worker_num == 1:
+                for _uuid, _id in remaining:
+                    self._apply_to_entity(_fun, _uuid, _id, kwargs)
+                    progress_bar()
+                remaining = []
+
+            if remaining:
+                ctx_type = 'spawn'
+                ctx = mp.get_context(ctx_type)
+                print(f'Start pool ({ctx_type}) with {_worker_num} workers')
+
+                # Shared counter so each worker can claim a distinct GPU device
+                worker_counter = ctx.Value('i', 0) if gpu_device_count is not None else None
+
+                with ctx.Pool(processes=_worker_num,
+                              initializer=_init_map_worker,
+                              initargs=(self.entarchy, self.entity_type, _fun,
+                                        tuple(kwargs.items()), gpu_device_count,
+                                        worker_counter)) as pool:
+
+                    for _ in pool.imap(_run_map_worker, remaining, chunksize=_chunk_size):
+                        progress_bar()
+
+                    # Let workers exit cleanly, so they close their connections
+                    pool.close()
+                    pool.join()
 
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
@@ -941,12 +1009,21 @@ class Collection(object):
     def rename(self, name: str) -> None:
         self._name = name
 
-    def _async_iterator(self, fun: Callable, **kwargs) -> Generator[Any, None, None]:
-        """Generator that yields results of applying a function to each entity in the collection concurrently.
-        """
-        kwargs = tuple([(k, v) for k, v in kwargs.items()])
-        for i, entity in enumerate(self):
-            yield fun, i, entity, kwargs
+    def _apply_to_entity(self, fun: Callable, _uuid: str, _id: str, kwargs: dict) -> None:
+        """Apply the mapped function to one entity in the current process."""
+
+        # Entities the caller already holds stay registered, so their identity is
+        #  preserved; entities materialized here are released again, so a large
+        #  in-process run does not accumulate the whole collection in memory
+        was_registered = _uuid in self.entarchy
+
+        entity = self.entity_type(self.entarchy, _uuid=_uuid, _id=_id)
+        try:
+            with entity:
+                fun(entity, **kwargs)
+        finally:
+            if not was_registered:
+                self.entarchy.forget_entity(entity)
 
     def to_dict(self) -> Generator[dict[str, Any]]:
         """
@@ -992,44 +1069,91 @@ class Collection(object):
 
         return collection_type(self.entarchy, self.entity_type, new_tree)
 
-    @staticmethod
-    def worker_wrapper(args):
-        """Subprocess wrapper function for concurrent execution, which handles the MySQL session
-        and provides feedback on execution time to parent process
-        """
 
-        start_time = time.perf_counter()
+# Per-worker state for Collection.map_async.
+#  Built once per worker process by _init_map_worker, so that the Entarchy object
+#  and its database connection are reused across all tasks handled by that worker.
+_WORKER_CONTEXT: dict[str, Any] = {}
 
-        # Unpack args
-        fun: Callable = args[0]
-        i: int = args[1]
-        entity: Entity = args[2]
-        kwargs = {k: v for k, v in args[3]}
+# Rough cost of starting a process pool (spawn plus re-importing numpy/pandas/
+#  sqlalchemy in each worker), used to decide whether parallel execution can pay
+#  off at all. Measured at ~1.9 s; adjust if your environment differs markedly.
+POOL_STARTUP_ESTIMATE_SECONDS = 2.0
 
-        # Set GPU device if applicable
-        _use_gpu = kwargs.pop('_use_gpu', False)
-        if _use_gpu:
-            _gpu_max_device_num = kwargs.pop('_gpu_max_device_num')
-            if _gpu_max_device_num > 0:
-                _use_gpu_device = f'cuda:{i % _gpu_max_device_num}'
-            else:
-                _use_gpu_device = 'cpu'
+# Number of entities processed in-process to estimate the per-entity cost
+POOL_CALIBRATION_SAMPLE = 3
 
-            kwargs['_use_gpu_device'] = _use_gpu_device
 
-        # Register the transferred entity in the (empty) registry of the
-        #  reconstructed entarchy, so identity mapping works inside the worker
-        entity.entarchy.add_existing_entity(entity)
+def _init_map_worker(_entarchy: Entarchy,
+                     _entity_type: Type[Entity],
+                     _fun: Callable,
+                     _kwargs: tuple,
+                     _gpu_device_count: Union[int, None],
+                     _worker_counter) -> None:
+    """Pool initializer: set up one Entarchy per worker process.
 
-        # Run
+    Previously every task carried its own pickled Entarchy, so each entity opened
+    and closed a database connection of its own. The Entarchy is now unpickled
+    once per worker and its connection is reused for every task that worker runs.
+    """
+    import atexit
+
+    # Pin one GPU device per worker. Assigning per entity instead would make every
+    #  worker touch every device, creating a CUDA context per device per process.
+    device = None
+    if _gpu_device_count is not None:
+        worker_index = 0
+        if _worker_counter is not None:
+            with _worker_counter.get_lock():
+                worker_index = _worker_counter.value
+                _worker_counter.value += 1
+        device = f'cuda:{worker_index % _gpu_device_count}' if _gpu_device_count > 0 else 'cpu'
+
+    _WORKER_CONTEXT.update({
+        'entarchy': _entarchy,
+        'entity_type': _entity_type,
+        'fun': _fun,
+        'kwargs': dict(_kwargs),
+        'device': device,
+    })
+
+    atexit.register(_close_map_worker)
+
+
+def _close_map_worker() -> None:
+    """Release the worker's database connection when the pool shuts down."""
+    _entarchy = _WORKER_CONTEXT.get('entarchy')
+    if _entarchy is None:
+        return
+
+    # Access the attribute, not the property, so a worker that never touched the
+    #  database does not open a connection just to close it
+    backend = _entarchy._backend
+    if backend is not None:
+        try:
+            backend.close()
+        except Exception:
+            pass
+
+
+def _run_map_worker(task: tuple[str, str]) -> None:
+    """Apply the mapped function to a single entity, addressed by UUID."""
+    _uuid, _id = task
+
+    _entarchy = _WORKER_CONTEXT['entarchy']
+    kwargs = _WORKER_CONTEXT['kwargs']
+    device = _WORKER_CONTEXT['device']
+
+    if device is not None:
+        kwargs = {**kwargs, '_use_gpu_device': device}
+
+    entity = _WORKER_CONTEXT['entity_type'](_entarchy, _uuid=_uuid, _id=_id)
+    try:
         with entity:
-            fun(entity, **kwargs)
-
-        # Close backend to avoid broken file handles and dangling open database connections in subprocesses after fork
-        #  (especially important for MySQL backend, which does not allow sharing connections between processes)
-        entity.entarchy.backend.close()
-
-        return time.perf_counter() - start_time
+            _WORKER_CONTEXT['fun'](entity, **kwargs)
+    finally:
+        # Without this the worker's registry would grow with every entity it handles
+        _entarchy.forget_entity(entity)
 
 
 class CollectionIterator(object):
