@@ -48,3 +48,7 @@ dev = ['pip-tools', 'pytest', 'build', 'twine']
 
 [project.urls]
 Homepage = 'https://github.com/thladnik/entarchy'
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+markers = ['slow: tests that spawn subprocess workers']
