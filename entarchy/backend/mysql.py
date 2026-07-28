@@ -6,8 +6,10 @@ import os.path
 import pathlib
 import pickle
 import datetime
-from os.path import relpath
+import time
+import warnings
 from typing import Any, Callable, List, Union
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
@@ -42,7 +44,7 @@ class EntityTable(Base):
     __tablename__ = 'entities'
 
     uuid: Mapped[str] = mapped_column(String(36), primary_key=True)
-    parent_uuid: Mapped[uuid] = mapped_column(ForeignKey('entities.uuid'), nullable=True)
+    parent_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), nullable=True)
     entity_type_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'))
 
     id: Mapped[str] = mapped_column(String(500))
@@ -195,10 +197,9 @@ class Serializer(object):
         return self._store
 
     def __sizeof__(self) -> int:
-        if self.store == 'internal':
-            return object.__sizeof__(self)
-        else:
-            return object.__sizeof__(self) + self._data_size
+        # Always include the payload size, so the data_size column reflects
+        #  the actual storage cost for internally stored blobs as well
+        return object.__sizeof__(self) + self._data_size
 
 
 def _retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable:
@@ -219,6 +220,15 @@ def _retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable
             except OperationalError as e:
                 err = e
                 i += 1
+
+                # Roll the session back, otherwise the retry reuses a session
+                #  that is still in a failed transaction state
+                try:
+                    self.sql_session.rollback()
+                except Exception:
+                    pass
+
+                time.sleep(min(2 ** i, 5))
 
         if err is not None:
             raise err
@@ -256,27 +266,32 @@ def _generate_attribute_filters(entity_type_name: str,
     _operator = as_tree['operator'].upper()
 
     # Handle connectives
-    if _operator in ('AND', 'OR'):
-        # TODO: implement XOR? Very costly to do like this in SQL // see entarchy.core.query.combine_trees
-        #        Requires at least OR + 2xAND + NOT
-        _op_fun = {'AND': sqlalchemy.and_, 'OR': sqlalchemy.or_}[_operator]
-        return _op_fun(_generate_attribute_filters(entity_type_name, _session, as_tree['left_operand']),
-                       _generate_attribute_filters(entity_type_name, _session, as_tree['right_operand']))
+    if _operator in ('AND', 'OR', 'XOR'):
+        left = _generate_attribute_filters(entity_type_name, _session, as_tree['left_operand'])
+        right = _generate_attribute_filters(entity_type_name, _session, as_tree['right_operand'])
+
+        if _operator == 'AND':
+            return sqlalchemy.and_(left, right)
+        elif _operator == 'OR':
+            return sqlalchemy.or_(left, right)
+        # XOR: (left OR right) AND NOT (left AND right)
+        return sqlalchemy.and_(sqlalchemy.or_(left, right),
+                               sqlalchemy.not_(sqlalchemy.and_(left, right)))
 
     # Handle comparisons
-    elif _operator in ('IN', '<=', '<', '==', '>', '>='):
+    elif _operator in ('IN', '<=', '<', '==', '!=', '>', '>='):
 
         name = as_tree['left_operand']
         value = as_tree['right_operand']
 
         if _operator == 'IN':
-            raise NotImplementedError(f'IN operator not implemented for MySQL backend yet')
-            # if not isinstance(value, list):
-            #     raise ValueError('Operand after IN statement should be a list of values')
-            #
-            # attribute_value_col = getattr(AttributeTable, f'value_{value[0].__class__.__name__}')
-            #
-            # comparison = attribute_value_col.in_(value)
+            if not isinstance(value, list) or len(value) == 0:
+                raise ValueError('Operand after IN statement should be a non-empty list of values')
+
+            # Determine the correct column based on the type of the first value
+            attribute_value_col = getattr(AttributeTable, f'value_{value[0].__class__.__name__}')
+
+            comparison = attribute_value_col.in_(value)
         else:
             # Determine the correct column based on value type
             attribute_value_col = getattr(AttributeTable, f'value_{value.__class__.__name__}')
@@ -285,6 +300,7 @@ def _generate_attribute_filters(entity_type_name: str,
                 '<': operator.lt,
                 '<=': operator.le,
                 '==': operator.eq,
+                '!=': operator.ne,
                 '>=': operator.ge,
                 '>': operator.gt
             }[_operator]
@@ -429,16 +445,25 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
 
     # Load blob
     if row.data_type == 'blob':
+        ser = None
         try:
-            ser: Serializer = pickle.loads(row.value_blob)
+            ser = pickle.loads(row.value_blob)
             return ser.deserialize(_entity.entarchy)
         except Exception as e:
 
             print(f'Failed to deserialize blob attribute "{row.name}" of entity "{_entity}".')
             print('This may be caused by missing files on disk if the blob was stored externally, '
                   'or by corrupted data in the database.')
-            print('Store: ', ser._store)
-            print('Type:', ser._type)
+            # Only report serializer details if unpickling got that far;
+            #  referencing them unconditionally would raise a second,
+            #  misleading exception inside this handler
+            if isinstance(ser, Serializer):
+                print('Store: ', getattr(ser, '_store', '<unknown>'))
+                print('Type:', getattr(ser, '_type', '<unknown>'))
+            elif ser is not None:
+                print(f'Stored object is of unexpected type {type(ser).__name__} '
+                      f'(possibly written by a defective set_collection_attributes; '
+                      f'see entarchy.tools.repair_blobs).')
 
             raise e
 
@@ -448,7 +473,10 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
     # Check for inf and NaNs
     if row.data_type == 'float' and val is None:
         if row.float_is_inf:
-            return float('inf')
+            # Sign of infinity is kept in the (otherwise unused) value_int column;
+            #  legacy rows without a sign default to +inf
+            sign = -1.0 if (row.value_int is not None and row.value_int < 0) else 1.0
+            return sign * float('inf')
         elif row.float_is_nan:
             return float('nan')
 
@@ -467,13 +495,15 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
     if isinstance(data, np.generic):
         data = data.item()
 
-    # If previous data type war float, reset flags
+    # If previous data type was float, reset flags
     if row.data_type == 'float':
         row.float_is_inf = False
         row.float_is_nan = False
+        row.value_int = None  # may hold the sign of a previous inf value
 
     # Set (potential) previous value to None
-    row.__setattr__(f'value_{row.data_type}', None)
+    if row.data_type is not None:
+        row.__setattr__(f'value_{row.data_type}', None)
 
     # TODO: with ext storage for blobs, we should also delete previous files on disk
 
@@ -488,6 +518,8 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
         # Some SQL dialects don't support inf float values
         if data_type == 'float' and math.isinf(data):
             row.float_is_inf = True
+            # Preserve the sign of infinity in the otherwise unused value_int column
+            row.value_int = 1 if data > 0 else -1
             data = None
         elif data_type == 'float' and math.isnan(data):
             row.float_is_nan = True
@@ -543,9 +575,9 @@ class MySQLBackend(Backend):
 
         # Get connection parameters
         if dbhost is None:
-            dbname = input(f'MySQL host name [default: "localhost"]: ')
-            if dbname == '':
-                dbname = 'localhost'
+            dbhost = input(f'MySQL host name [default: "localhost"]: ')
+            if dbhost == '':
+                dbhost = 'localhost'
 
         if dbname is None:
             while True:
@@ -560,9 +592,15 @@ class MySQLBackend(Backend):
             if dbuser == '':
                 dbuser = 'entarchy_user'
 
+        # Passwords are not persisted to entarchy.yaml. Resolution order:
+        #  explicit argument (incl. legacy configs) > ENTARCHY_DB_PASSWORD > prompt
+        if dbpassword is None:
+            dbpassword = os.environ.get('ENTARCHY_DB_PASSWORD')
+
         if dbpassword is None:
             import getpass
-            dbpassword = getpass.getpass(f'Password for user {dbuser}: ')
+            dbpassword = getpass.getpass(f'Password for user {dbuser} '
+                                         f'(set ENTARCHY_DB_PASSWORD to skip this prompt): ')
 
         self._config = {
             'dbname': dbname,
@@ -572,6 +610,12 @@ class MySQLBackend(Backend):
         }
 
         self.debug = debug
+
+    def get_config(self) -> dict[str, Any]:
+        # Persistable configuration: never write the password to entarchy.yaml
+        _config = super().get_config()
+        _config.pop('dbpassword', None)
+        return _config
 
     @property
     def dbhost(self) -> str:
@@ -590,11 +634,14 @@ class MySQLBackend(Backend):
         return self._config['dbpassword']
 
     @property
+    def _server_url(self) -> str:
+        """Connection URL for the server (without schema). Credentials are URL-escaped."""
+        return f'mysql+pymysql://{quote_plus(self.dbuser)}:{quote_plus(self.dbpassword)}@{self.dbhost}'
+
+    @property
     def sql_engine(self):
         if not hasattr(self, '_sql_engine') or self._sql_engine is None:
-            self._sql_engine = create_engine(f'mysql+pymysql://'
-                                             f'{self.dbuser}:{self.dbpassword}'
-                                             f'@{self.dbhost}/{self.dbname}',
+            self._sql_engine = create_engine(f'{self._server_url}/{self.dbname}',
                                              echo=self.debug,
                                              pool_size=1,
                                              pool_recycle=60,
@@ -622,7 +669,7 @@ class MySQLBackend(Backend):
 
             # Check if triggers are enabled
             if self._db_triggers_enabled is None:
-                with sqlalchemy.Connection(self._sql_engine) as conn:
+                with self.sql_engine.connect() as conn:
                     res = conn.execute(
                         sqlalchemy.text(
                             'SELECT TRIGGER_NAME '
@@ -640,7 +687,7 @@ class MySQLBackend(Backend):
 
         # Create schema
         print(f'> Create database {self.dbname}')
-        engine = create_engine(f'mysql+pymysql://{self.dbuser}:{self.dbpassword}@{self.dbhost}', echo=self.debug)
+        engine = create_engine(self._server_url, echo=self.debug)
         with engine.connect() as connection:
             connection.execute(sqlalchemy.text(f'CREATE SCHEMA IF NOT EXISTS {self.dbname}'))
         engine.dispose()
@@ -713,13 +760,16 @@ class MySQLBackend(Backend):
 
         if not confirm:
             raise RuntimeError('Failed to delete backend. Confirmation not provided.')
-            return
+
+        # Release the main engine's connections first
+        self.close()
 
         print('> Drop schema')
-        engine = create_engine(f'mysql+pymysql://{self.dbuser}:{self.dbpassword}@{self.dbhost}')
+        engine = create_engine(self._server_url)
         with engine.connect() as connection:
             connection.execute(sqlalchemy.text(f'DROP SCHEMA IF EXISTS {self.dbname}'))
             connection.commit()
+        engine.dispose()
 
     # Entity related methods
 
@@ -923,9 +973,9 @@ class MySQLBackend(Backend):
             return query.count() > 0
 
     @_retry_on_operational_failure
-    def set_entity_attribute(self, entity_uuid, key: str, value: Any):
+    def set_entity_attribute(self, _entity: Entity, key: str, value: Any):
 
-        self.set_entity_attributes(entity_uuid, [key], [value])
+        self.set_entity_attributes(_entity, [key], [value])
 
         return True, ''
 
@@ -952,6 +1002,11 @@ class MySQLBackend(Backend):
 
             # Update existing attributes
             for n, row in existing_rows.items():
+
+                # id and uuid mirror the entity's identity and may never be rewritten
+                if n in ('id', 'uuid'):
+                    raise RuntimeError(f'Attribute "{n}" is the entity identity '
+                                       f'and cannot be modified on {_entity}.')
 
                 # Updates to existing rows are only allowed if attribute is mutable or if digest mode is enabled
                 if not (row.mutable or _entity.entarchy.is_in_digest_mode):
@@ -1014,21 +1069,33 @@ class MySQLBackend(Backend):
     @_retry_on_operational_failure
     def get_collection_entities_by_slice(self, _collection: Collection, _slice: slice) -> list[tuple[str, str]]:
 
-        entity_type_name = _collection.entity_type.__name__
-
         # Calculate indices
-        count = self.get_collection_count(_collection, entity_type_name)
+        count = self.get_collection_count(_collection)
         start, stop, step = _slice.indices(count)
+
+        # Determine the contiguous row range to fetch. For negative steps,
+        #  slice.indices returns start >= stop and the range must be flipped
+        #  (a negative LIMIT is invalid SQL).
+        if step > 0:
+            offset, limit = start, stop - start
+        else:
+            offset, limit = stop + 1, start - stop
+
+        if limit <= 0:
+            return []
 
         # Fetch result
         with self.sql_session as session:
             query = _build_query_from_collection(_collection, session)
 
-            res = query.order_by(EntityTable.uuid).offset(start).limit(stop - start).all()
+            res = query.order_by(EntityTable.uuid).offset(offset).limit(limit).all()
+
+        if step < 0:
+            res = res[::-1]
 
         # TODO: there should be a way to directly query the n-th row using 'ROW_NUMBER() % n'
         #        but it's not clear how is would work in SQLAlchemy ORM; figure out later
-        return [(r.uuid, r.id) for r in res[::step]]
+        return [(r.uuid, r.id) for r in res[::abs(step)]]
 
     @_retry_on_operational_failure
     def get_collection_parent_uuids(self, _collection: Collection) -> list[tuple[str, str]]:
@@ -1087,28 +1154,25 @@ class MySQLBackend(Backend):
                     if attribute_types[row.name] != row.data_type:
                         # TODO: add runtime resolution of problem
                         #        option: always use scalars where available
-                        RuntimeWarning(f'Attribute "{row.name}" has multiple data types in the selected collection. '
-                                       f'Using {row.data_type} (not {attribute_types[row.name]}.')
+                        warnings.warn(f'Attribute "{row.name}" has multiple data types in the selected collection. '
+                                      f'Using {row.data_type} (not {attribute_types[row.name]}).',
+                                      RuntimeWarning)
 
                 attribute_types[row.name] = row.data_type
+
+            missing_names = [n for n in names if n not in attribute_types]
+            if len(missing_names) > 0:
+                raise AttributeError(f'Attribute(s) {missing_names} not found '
+                                     f'on any entity in {_collection}.')
 
             # Construct query to fetch attributes
             #  Build cases which return correct value field based on attr_name's data_type
             cases = []
+            column_labels = ['uuid']
+            float_attribute_names = []
             for n in names:
                 # Get data type
                 data_type = attribute_types[n]
-
-                # Leave out blob format substring
-                if data_type.startswith('blob'):
-                    if data_type.startswith('blob_ext'):
-                        cases.append(
-                            sqlalchemy.func.max(sqlalchemy.case(
-                                (AttributeTable.name == n, getattr(AttributeTable, f'value_{data_type}')),
-                                else_=None)).label(n)
-                        )
-
-                        continue
 
                 # Use the appropriate column for the data_type
                 cases.append(
@@ -1116,6 +1180,19 @@ class MySQLBackend(Backend):
                         (AttributeTable.name == n, getattr(AttributeTable, f'value_{data_type}')),
                         else_=None)).label(n)
                 )
+                column_labels.append(n)
+
+                # For float attributes, also fetch the nan/inf marker columns.
+                #  Special float values are stored as NULL + flag (value_int carries
+                #  the sign of inf) and would otherwise be lost in collection reads.
+                if data_type == 'float':
+                    float_attribute_names.append(n)
+                    for flag_col, flag_label in ((AttributeTable.float_is_nan, f'{n}__isnan'),
+                                                 (AttributeTable.float_is_inf, f'{n}__isinf'),
+                                                 (AttributeTable.value_int, f'{n}__infsign')):
+                        cases.append(sqlalchemy.func.max(sqlalchemy.case(
+                            (AttributeTable.name == n, flag_col), else_=None)).label(flag_label))
+                        column_labels.append(flag_label)
 
             # Construct query
             attribute_query = (
@@ -1129,7 +1206,7 @@ class MySQLBackend(Backend):
             )
 
         # Create DataFrame from query result
-        df = pd.DataFrame(columns=['uuid', *names], data=attribute_query.all())
+        df = pd.DataFrame(columns=column_labels, data=attribute_query.all())
 
         # Convert all types correctly (default result will likely contain bytestring values
         for n in names:
@@ -1150,15 +1227,31 @@ class MySQLBackend(Backend):
                 elif data_type == 'bool':
                     df[n] = df[n].astype(pd.BooleanDtype())
                 elif data_type == 'date':
-                    df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode()), format='%Y-%m-%d')
+                    df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode() if isinstance(s, bytes) else s),
+                                           format='%Y-%m-%d')
                 elif data_type == 'datetime':
-                    df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode()), format='%Y-%m-%d %H:%M:%S')
+                    df[n] = pd.to_datetime(df[n].apply(lambda s: s.decode() if isinstance(s, bytes) else s),
+                                           format='%Y-%m-%d %H:%M:%S')
                 # Load blobs
                 elif data_type == 'blob':
                     df[n] = df[n].apply(lambda s: _deserialize(s, _collection.entarchy) if s is not None else None)
 
-            except ValueError:
-                raise RuntimeWarning(f'Failed to cast attribute {n} to type {data_type}')
+            except ValueError as e:
+                raise RuntimeError(f'Failed to cast attribute {n} to type {data_type}') from e
+
+        # Reconstruct special float values (nan/inf) from their marker columns
+        for n in float_attribute_names:
+            isnan = df.pop(f'{n}__isnan').astype('boolean').fillna(False).to_numpy(dtype=bool)
+            isinf = df.pop(f'{n}__isinf').astype('boolean').fillna(False).to_numpy(dtype=bool)
+            infsign = df.pop(f'{n}__infsign').to_numpy(dtype='float64', na_value=np.nan)
+
+            if isnan.any() or isinf.any():
+                # Fall back to a plain float64 column so nan/inf are representable
+                #  (in pd.Float64Dtype both would collapse to <NA>). Entities that
+                #  do not have the attribute at all are nan in this representation.
+                values = df[n].to_numpy(dtype='float64', na_value=np.nan)
+                values[isinf] = np.where(infsign[isinf] < 0, -np.inf, np.inf)
+                df[n] = values
 
         # Set row index to primary key
         df.set_index('uuid', drop=True, inplace=True)
@@ -1167,6 +1260,9 @@ class MySQLBackend(Backend):
 
     @_retry_on_operational_failure
     def set_collection_attributes(self, _collection: Collection, df: pd.DataFrame) -> None:
+
+        if df.empty or len(df.columns) == 0:
+            return
 
         ent = _collection.entarchy
 
@@ -1178,6 +1274,11 @@ class MySQLBackend(Backend):
 
         # Do an upsert for each attribute to be updated
         for attr_name in df.columns:
+
+            # id and uuid mirror the entity's identity and may never be rewritten
+            if attr_name in ('id', 'uuid'):
+                raise RuntimeError(f'Attribute "{attr_name}" is the entity identity '
+                                   f'and cannot be modified through a collection.')
 
             # Create df for insert
             df_insert = pd.DataFrame(df[attr_name])
@@ -1217,6 +1318,22 @@ class MySQLBackend(Backend):
             df_insert['data_type'] = data_type_str
             df_insert['analysis_uuid'] = _analysis_uuid
 
+            # Handle special float values: nan/inf are stored as NULL plus marker flags
+            #  (value_int carries the sign of inf), mirroring _write_attribute_data.
+            #  MySQL rejects nan/inf values outright, so this is required for correctness.
+            if data_type_str == 'float':
+                _values = df_insert[attr_name].to_numpy(dtype='float64', na_value=np.nan)
+                _isinf = np.isinf(_values)
+                _isnan = np.isnan(_values)
+                df_insert['float_is_nan'] = _isnan
+                df_insert['float_is_inf'] = _isinf
+                df_insert['value_int'] = [int(np.sign(v)) if np.isinf(v) else None for v in _values]
+                df_insert[attr_name] = [None if (np.isnan(v) or np.isinf(v)) else float(v) for v in _values]
+            else:
+                # Reset markers in case the attribute previously held special float values
+                df_insert['float_is_nan'] = False
+                df_insert['float_is_inf'] = False
+
             # Serialize data
             if data_type_str == 'blob':
                 # Create serialize function for each attribute
@@ -1231,8 +1348,11 @@ class MySQLBackend(Backend):
 
                 # Apply to each row
                 df_insert['__serializer'] = df_insert.apply(_serialize_blob, axis=1)
-                # Dump serializer to bytes for storage
-                df_insert[attr_name] = df_insert.apply(pickle.dumps, axis=1)
+                # Dump each serializer to bytes for storage.
+                #  NOTE: this must pickle the Serializer objects, NOT the whole row
+                #  (df_insert.apply(pickle.dumps, axis=1) stored pickled pandas Series,
+                #  which the read path cannot deserialize).
+                df_insert[attr_name] = df_insert['__serializer'].apply(pickle.dumps)
 
             # Save attribute size
             def _get_attribute_size(series: pd.Series) -> int:
@@ -1275,8 +1395,15 @@ class MySQLBackend(Backend):
                     'data_type': data_type_str,
                     'data_size': insert_stmt.inserted.data_size,
                     'analysis_uuid': insert_stmt.inserted.analysis_uuid,
-                    'modified': insert_stmt.inserted.modified
+                    'modified': insert_stmt.inserted.modified,
+                    'float_is_nan': insert_stmt.inserted.float_is_nan,
+                    'float_is_inf': insert_stmt.inserted.float_is_inf,
                 }
+
+                # For floats, value_int carries the sign of inf values and must
+                #  override the generic value-column reset above
+                if data_type_str == 'float':
+                    update_attr_data['value_int'] = insert_stmt.inserted.value_int
 
                 # Add modified time update if triggers are not enabled
                 if not self.db_triggers_enabled:
@@ -1287,13 +1414,26 @@ class MySQLBackend(Backend):
                 session.execute(upsert_stmt)
                 session.commit()
 
+        # Update entity modified times if triggers are not enabled
+        if not self.db_triggers_enabled:
+            with self.sql_session as session:
+                session.query(EntityTable).filter(EntityTable.uuid.in_(list(df.index))).update(
+                    {EntityTable.modified: datetime.datetime.now()},
+                    synchronize_session=False,
+                )
+                session.commit()
+
     def open(self):
         # Just access the property to create the engine if it doesn't exist yet
         # _ = self.sql_engine
         pass
 
     def close(self):
-        self.sql_session.close()
-        self.sql_engine.dispose()
-        del self._sql_session
-        del self._sql_engine
+        # Only tear down what actually exists; close() must be safe to call
+        #  regardless of whether a session/engine was ever created
+        if getattr(self, '_sql_session', None) is not None:
+            self._sql_session.close()
+            self._sql_session = None
+        if getattr(self, '_sql_engine', None) is not None:
+            self._sql_engine.dispose()
+            self._sql_engine = None

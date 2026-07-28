@@ -32,6 +32,14 @@ class Backend(object):
         self._debug = value
 
     def get_config(self) -> dict[str, Any]:
+        """Configuration in its persistable form (written to entarchy.yaml).
+
+        Backends must exclude secrets (e.g. passwords) from this representation.
+        """
+        return self._config.copy() if self._config is not None else {}
+
+    def get_runtime_config(self) -> dict[str, Any]:
+        """Full in-memory configuration, including values that must not be persisted."""
         return self._config.copy() if self._config is not None else {}
 
     def close(self):
