@@ -452,6 +452,7 @@ class Collection(object):
 
     _as_tree: dict[str, ...]
     _length: int = None
+    _name = None
 
     def __init__(self,
                  _entarchy: Entarchy,
@@ -471,6 +472,8 @@ class Collection(object):
         return self._length
 
     def __repr__(self):
+        if self.name is not None:
+            return self.name
         if self.__class__.__name__ == 'Collection':
             return f'{self.__class__.__name__}(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
         return f'{self.__class__.__name__}(count={len(self)})'
@@ -706,6 +709,10 @@ class Collection(object):
     def init_time(self) -> datetime.datetime:
         return self._init_time
 
+    @property
+    def name(self):
+        return self._name
+
     def _load_attributes(self, attribute_names: list[str]):
 
         # Load attributes from backend
@@ -930,6 +937,9 @@ class Collection(object):
 
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
+
+    def rename(self, name: str) -> None:
+        self._name = name
 
     def _async_iterator(self, fun: Callable, **kwargs) -> Generator[Any, None, None]:
         """Generator that yields results of applying a function to each entity in the collection concurrently.
