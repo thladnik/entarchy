@@ -258,9 +258,16 @@ full-tree parse.
 
 ## Open questions
 
-- **Compression policy.** Off by default is the safe choice, since imaging traces
-  compress poorly and CPU is the bottleneck; worth measuring on real data.
+- **Compression policy for the array blocks.** Off by default is the safe choice,
+  since imaging traces compress poorly and CPU is the bottleneck.
   `--compression zlib` is available and untested against real recordings.
+
+  Settled for the *metadata*, which is always compressed. The columns are fixed
+  width numpy strings, so every row is padded to the longest value in its column
+  and one long `value_str` widens all of it; a 36 byte uuid becomes 144 in UCS4.
+  That padding is pure redundancy: a 1994 attribute export went from 2185 kB to
+  65 kB. At 3 million attribute rows it is the difference between roughly 3 GB
+  and 100 MB, and `meta.asdf` is only read when the index is rebuilt.
 - **Whether Option B is still wanted.** The archive path already contains the
   encoder and the `asdf:` store form, so the remaining work for a live ASDF blob
   layer is the write side plus a migration. The case for it is weaker now that

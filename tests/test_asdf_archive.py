@@ -318,6 +318,46 @@ class TestRaggedPacking:
         assert asdf_store.decode(asdf_store.encode([])) == []
 
 
+class TestMetadataCompression:
+    """Columnar metadata is mostly string padding, so it must not ship raw."""
+
+    def test_meta_is_compressed_by_default(self, archived, tmp_path):
+        destination = (tmp_path / 'archive').as_posix()
+
+        with asdf.open(os.path.join(destination, META_NAME)) as handle:
+            compressions = {block.header['compression']
+                            for block in handle._blocks.blocks}
+
+        assert compressions == {b'zlib'}
+
+    def test_uncompressed_meta_is_much_larger(self, source, tmp_path):
+        compressed = (tmp_path / 'meta_zlib').as_posix()
+        raw = (tmp_path / 'meta_raw').as_posix()
+
+        archive_tool.export(source, compressed, verbose=False)
+        archive_tool.export(source, raw, meta_compression=None, verbose=False)
+
+        compressed_size = os.path.getsize(os.path.join(compressed, META_NAME))
+        raw_size = os.path.getsize(os.path.join(raw, META_NAME))
+
+        assert compressed_size < raw_size / 4
+
+    def test_compressed_meta_still_rebuilds(self, source, archived, tmp_path):
+        ent, _ = archived
+        destination = (tmp_path / 'archive').as_posix()
+        expected = _ids(ent.get(Roi))
+
+        ent.backend.close()
+        os.remove(os.path.join(destination, INDEX_NAME))
+        archive_tool.rebuild_index(destination, verbose=False)
+
+        rebuilt = DeepArchy(destination)
+        try:
+            assert _ids(rebuilt.get(Roi)) == expected
+        finally:
+            rebuilt.backend.close()
+
+
 class TestOpenFileCache:
     """Block files are cached per process; eviction must stay correct and rare."""
 

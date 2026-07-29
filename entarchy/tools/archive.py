@@ -220,10 +220,21 @@ def _select_uuids(source, collection) -> Union[set, None]:
     return selected
 
 
+# Metadata columns are fixed width numpy strings, so every row is padded to the
+#  longest value in its column - 36 bytes of uuid become 144 in UCS4, and one long
+#  value_str widens the whole column. That padding is pure redundancy and compresses
+#  away almost entirely: 2185 kB to 65 kB on a 1994 attribute export. meta.asdf is
+#  only read when the index is rebuilt, so the cost of decompressing it is rare.
+#  Array blocks are left alone by default: imaging traces compress poorly and are
+#  read on the hot path.
+META_COMPRESSION = 'zlib'
+
+
 def export(source: Union[str, Any],
            destination: str,
            collection=None,
            compression: str = None,
+           meta_compression: str = META_COMPRESSION,
            skip_broken: bool = False,
            overwrite: bool = False,
            verbose: bool = True) -> dict:
@@ -235,15 +246,15 @@ def export(source: Union[str, Any],
 
     try:
         return _export(source_ent, destination, collection=collection, compression=compression,
-                       skip_broken=skip_broken, overwrite=overwrite, verbose=verbose,
-                       asdf_module=asdf)
+                       meta_compression=meta_compression, skip_broken=skip_broken,
+                       overwrite=overwrite, verbose=verbose, asdf_module=asdf)
     finally:
         if opened_here:
             source_ent.backend.close()
 
 
-def _export(source_ent, destination, collection, compression, skip_broken, overwrite, verbose,
-            asdf_module):
+def _export(source_ent, destination, collection, compression, meta_compression, skip_broken,
+            overwrite, verbose, asdf_module):
     destination = str(pathlib.Path(destination).absolute())
 
     if os.path.exists(destination):
@@ -352,7 +363,7 @@ def _export(source_ent, destination, collection, compression, skip_broken, overw
         'attribute_blobs': _blob_pointer_tree(attribute_rows),
     }
     meta_path = os.path.join(destination, META_NAME)
-    _write_asdf(asdf_module, meta_tree, meta_path, compression)
+    _write_asdf(asdf_module, meta_tree, meta_path, meta_compression)
     stats['bytes'] += os.path.getsize(meta_path)
 
     _write_config(source_ent, destination)
@@ -651,7 +662,10 @@ def main(argv=None):
     export_parser.add_argument('--type', help='entity type to select, e.g. Roi '
                                               '(requires --entarchy-class)')
     export_parser.add_argument('--query', help='filter expression, used with --type')
-    export_parser.add_argument('--compression', help='per-array compression, e.g. zlib or lz4')
+    export_parser.add_argument('--compression',
+                               help='compression for the array blocks, e.g. zlib or lz4. Off by '
+                                    'default: imaging traces compress poorly and are read often. '
+                                    f'The metadata is always compressed ({META_COMPRESSION}).')
     export_parser.add_argument('--skip-broken', action='store_true',
                                help='leave unreadable blob attributes out instead of failing')
     export_parser.add_argument('--overwrite', action='store_true',
