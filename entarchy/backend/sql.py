@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import sqlalchemy
 from sqlalchemy import Index, ForeignKey, LargeBinary, String, create_engine, BigInteger, Double
-from sqlalchemy.dialects.mysql import LONGBLOB
+from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME, LONGBLOB
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -32,6 +32,13 @@ from .. import AnalysisEntity, Collection, Entarchy, Entity
 # MySQL's generic BLOB tops out at 64 KB, which is far too small for the
 #  serialized arrays stored here, so that dialect gets LONGBLOB instead.
 _BLOB_TYPE = LargeBinary().with_variant(LONGBLOB(), 'mysql')
+
+# MySQL's DATETIME keeps whole seconds only and rounds on insert, so a row written
+#  at 12:30:05.7 is stored as 12:30:06 - in the future relative to the moment it was
+#  created. Collections filter on "created <= collection init time", so entities
+#  added moments earlier would drop out of every query for up to a second.
+#  Fractional seconds are requested explicitly; SQLite keeps full precision anyway.
+_DATETIME_TYPE = sqlalchemy.DateTime().with_variant(MYSQL_DATETIME(fsp=6), 'mysql')
 
 
 class Base(DeclarativeBase):
@@ -68,8 +75,9 @@ class EntityTable(Base):
     children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent', remote_side=[parent_uuid])
     attributes: Mapped[List['AttributeTable']] = relationship('AttributeTable', back_populates='entity')
 
-    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now)
-    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now, onupdate=datetime.datetime.now)
+    created: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now)
+    modified: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now,
+                                                       onupdate=datetime.datetime.now)
 
     __table_args__ = (
         Index('ix_unique_id_per_parent_and_entity_type', 'parent_uuid', 'entity_type_pk', 'id', unique=True),
@@ -89,8 +97,9 @@ class Link(Base):
     entity_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), nullable=True)
     entity = relationship('EntityTable', foreign_keys=[entity_uuid])
 
-    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now)
-    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now, onupdate=datetime.datetime.now)
+    created: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now)
+    modified: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now,
+                                                       onupdate=datetime.datetime.now)
 
 
 class AttributeTable(Base):
@@ -107,7 +116,7 @@ class AttributeTable(Base):
     value_float: Mapped[float] = mapped_column(Double(), nullable=True)
     value_bool: Mapped[bool] = mapped_column(nullable=True)
     value_date: Mapped[datetime.date] = mapped_column(nullable=True)
-    value_datetime: Mapped[datetime.datetime] = mapped_column(nullable=True)
+    value_datetime: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, nullable=True)
     value_blob: Mapped[bytes] = mapped_column(_BLOB_TYPE, nullable=True)
     data_type: Mapped[str] = mapped_column(String(500), nullable=True)
     data_size: Mapped[int] = mapped_column(BigInteger(), nullable=False, default=0)
@@ -117,8 +126,9 @@ class AttributeTable(Base):
 
     mutable = mapped_column(sqlalchemy.Boolean, default=True)
 
-    created: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now)
-    modified: Mapped[datetime.datetime] = mapped_column(default=datetime.datetime.now, onupdate=datetime.datetime.now)
+    created: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now)
+    modified: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now,
+                                                       onupdate=datetime.datetime.now)
 
     __table_args__ = (
         Index('ix_unique_name_per_entity_uuid', 'entity_uuid', 'name', unique=True),
@@ -1236,8 +1246,17 @@ class SQLBackend(Backend):
                 _isnan = np.isnan(_values)
                 df_insert['float_is_nan'] = _isnan
                 df_insert['float_is_inf'] = _isinf
-                df_insert['value_int'] = [int(np.sign(v)) if np.isinf(v) else None for v in _values]
-                df_insert[attr_name] = [None if (np.isnan(v) or np.isinf(v)) else float(v) for v in _values]
+
+                # These columns mix None with numbers. Assigning a plain list lets
+                #  pandas infer float64 and turn every None into NaN, which SQLite
+                #  stores happily but MySQL rejects outright ("nan can not be used
+                #  with MySQL"), so the None values are preserved explicitly.
+                df_insert['value_int'] = pd.Series(
+                    [int(np.sign(v)) if np.isinf(v) else None for v in _values],
+                    index=df_insert.index, dtype=object)
+                df_insert[attr_name] = pd.Series(
+                    [None if (np.isnan(v) or np.isinf(v)) else float(v) for v in _values],
+                    index=df_insert.index, dtype=object)
             else:
                 # Reset markers in case the attribute previously held special float values
                 df_insert['float_is_nan'] = False

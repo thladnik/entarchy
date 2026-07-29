@@ -85,3 +85,11 @@ pip install pytest
 pytest                # everything
 pytest -m "not slow"  # skip multiprocessing tests
 ```
+
+The MySQL backend is covered by integration tests, skipped unless a server is
+configured. The user needs `CREATE` and `DROP` on schemas matching the prefix;
+each test creates its own schema and drops it again:
+
+```sh
+ENTARCHY_MYSQL_HOST=localhost ENTARCHY_MYSQL_USER=me ENTARCHY_DB_PASSWORD=secret ENTARCHY_MYSQL_SCHEMA_PREFIX=entarchy_test_ pytest
+```
