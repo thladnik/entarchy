@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import atexit
 import datetime
+import functools
+import html
+import sys
 import time
 import traceback
 import uuid
@@ -239,6 +242,46 @@ class Entity(object):
 
     def __repr__(self):
         return f'{self.__class__.__name__}(id=\'{self.id}\' uuid=\'{self.uuid}\')'
+
+    def _repr_html_(self) -> str:
+        """Rich representation for notebooks.
+
+        Lists attribute names but deliberately does not read their values: a single
+        entity can hold hundreds of megabytes of array data, which must not be
+        loaded just because it was the last expression in a cell.
+        """
+        try:
+            rows = [('type', self.__class__.__name__),
+                    ('id', self.id),
+                    ('uuid', self.uuid)]
+
+            try:
+                rows.append(('path', self.path))
+            except Exception:
+                pass
+
+            names = sorted(self.keys())
+            shown = names[:_HTML_MAX_ATTRIBUTES]
+            listing = ', '.join(html.escape(str(n)) for n in shown)
+            if len(names) > len(shown):
+                listing += f' <span style="color:#888">... and {len(names) - len(shown)} more</span>'
+
+            body = ''.join(
+                f'<tr><td style="text-align:right;color:#888;padding-right:8px">{html.escape(str(k))}</td>'
+                f'<td style="font-family:monospace">{html.escape(str(v))}</td></tr>'
+                for k, v in rows)
+
+            return (f'<div>'
+                    f'<table style="border:none">{body}'
+                    f'<tr><td style="text-align:right;color:#888;padding-right:8px;vertical-align:top">'
+                    f'{len(names)} attributes</td><td>{listing}</td></tr>'
+                    f'</table>'
+                    f'<div style="color:#888;font-size:90%">read values with '
+                    f'<code>entity[&#39;name&#39;]</code></div>'
+                    f'</div>')
+        except Exception:
+            # A repr must never break a notebook session
+            return _fallback_html(self)
 
     def __setitem__(self, key: Union[str, list[str]], value: Any):
         """Set a dynamic attribute on the entity.
@@ -479,6 +522,72 @@ class Collection(object):
         if self.__class__.__name__ == 'Collection':
             return f'{self.__class__.__name__}(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
         return f'{self.__class__.__name__}(count={len(self)})'
+
+    def _repr_html_(self) -> str:
+        """Rich representation for notebooks.
+
+        Shows the entity type, the number of matches and the first few entities.
+        Attribute values are not loaded: use preview() or dataframe_of() for those,
+        so the cost is always something the user asked for.
+        """
+        try:
+            count = len(self)
+            title = self.name or self.entity_type.__name__
+
+            rows = self.entarchy.backend.get_collection_entities_by_slice(
+                self, slice(0, _HTML_PREVIEW_ROWS))
+
+            if count == 0:
+                body = ('<div style="color:#888;font-size:90%">no matching entities</div>')
+            else:
+                cells = ''.join(
+                    f'<tr><td style="font-family:monospace;padding-right:12px">{html.escape(str(_id))}</td>'
+                    f'<td style="font-family:monospace;color:#888">{html.escape(str(_uuid))}</td></tr>'
+                    for _uuid, _id in rows)
+                more = (f'<div style="color:#888;font-size:90%">showing {len(rows)} of {count}</div>'
+                        if count > len(rows) else '')
+                body = (f'<table style="border:none">'
+                        f'<tr><th style="text-align:left;color:#888">id</th>'
+                        f'<th style="text-align:left;color:#888">uuid</th></tr>'
+                        f'{cells}</table>{more}')
+
+            return (f'<div>'
+                    f'<b>{html.escape(str(title))}</b> '
+                    f'<span style="color:#888">&middot; {count} '
+                    f'{html.escape(self.entity_type.__name__)} '
+                    f'{"entity" if count == 1 else "entities"}</span>'
+                    f'{body}'
+                    f'<div style="color:#888;font-size:90%">'
+                    f'<code>.preview()</code> for attribute values, '
+                    f'<code>.dataframe_of([...])</code> for a full DataFrame</div>'
+                    f'</div>')
+        except Exception:
+            # A repr must never break a notebook session
+            return _fallback_html(self)
+
+    def preview(self, n: int = 10, attribute_names: list[str] = None) -> pd.DataFrame:
+        """Return the first n entities as a DataFrame, for interactive inspection.
+
+        Args:
+            n (int): Number of entities to show.
+            attribute_names (list of str): Attributes to include. Defaults to the
+                scalar attributes of the collection, so large blobs are not loaded.
+
+        Returns:
+            pandas.DataFrame
+        """
+
+        rows = self.entarchy.backend.get_collection_entities_by_slice(self, slice(0, n))
+        if len(rows) == 0:
+            return pd.DataFrame()
+
+        subset = self.entarchy.get(self.entity_type,
+                                   ' OR '.join(f'uuid == "{_uuid}"' for _uuid, _ in rows))
+
+        if attribute_names is None:
+            attribute_names = [name for name in subset.columns if name != 'uuid']
+
+        return subset.dataframe_of(attribute_names)
 
     # Access methods
 
@@ -930,6 +1039,26 @@ class Collection(object):
             _worker_num = mp.cpu_count() - 2
         _worker_num = max(1, min(int(_worker_num), entity_count))
 
+        # Anything defined in a notebook cell or the REPL lives in a __main__ that
+        #  spawned workers cannot import. Pickled by reference it makes every worker
+        #  die while unpickling, and the pool replaces them forever, so the session
+        #  hangs with no error. Ship such objects by value, or stay in this process.
+        interactive = [obj for obj in (self.entarchy, self.entity_type, _fun)
+                       if _defined_interactively(obj)]
+        by_value = False
+        if interactive:
+            if _cloudpickle_available():
+                by_value = True
+            else:
+                names = ', '.join(sorted({getattr(o, '__name__', type(o).__name__)
+                                          for o in interactive}))
+                print(f'WARNING: {names} defined interactively and cloudpickle is not '
+                      f'installed, so worker processes could not reconstruct it.')
+                print(f'         Running in this process instead. To use {_worker_num} '
+                      f'workers, either "pip install cloudpickle" or move the definitions '
+                      f'into an importable module.')
+                _worker_num = 1
+
         # Group entities by parent, so a worker sees runs of entities that share
         #  the (often large) attributes of their parent instead of jumping between
         #  parents in UUID order. Entities are stored with random UUID4 keys, so
@@ -1038,13 +1167,18 @@ class Collection(object):
                 remaining = []
 
             if remaining:
-                pool, was_running = _get_worker_pool(self.entarchy, _worker_num)
+                pool, was_running = _get_worker_pool(self.entarchy, _worker_num, by_value)
                 print(f'{"Reuse" if was_running else "Start"} worker pool '
-                      f'({_worker_num} workers, spawn, chunk size {_chunk_size})')
+                      f'({_worker_num} workers, spawn, chunk size {_chunk_size}'
+                      f'{", by value" if by_value else ""})')
 
-                kwargs_items = tuple(kwargs.items())
-                tasks = [(_uuid, _id, parent_uuids.get(_uuid), self.entity_type,
-                          _fun, kwargs_items, gpu_device_count)
+                # The function and its arguments are identical for every task, so
+                #  they are serialized once and shared by all of them
+                job = _for_workers((_fun, tuple(kwargs.items())), by_value)
+                entity_type_name = self.entity_type.__name__
+
+                tasks = [(_uuid, _id, parent_uuids.get(_uuid), entity_type_name,
+                          job, gpu_device_count)
                          for _uuid, _id in remaining]
 
                 try:
@@ -1153,6 +1287,20 @@ _WORKER_CONTEXT: dict[str, Any] = {}
 #  not each pay the pool startup cost.
 _POOL_CACHE: dict[str, Any] = {}
 
+# Limits for the notebook representations, which must stay cheap: they run
+#  automatically whenever an object is the last expression in a cell.
+_HTML_MAX_ATTRIBUTES = 40
+_HTML_PREVIEW_ROWS = 5
+
+
+def _fallback_html(obj: Any) -> str:
+    """Last resort for _repr_html_, when even repr() cannot be produced."""
+    try:
+        text = repr(obj)
+    except Exception:
+        text = f'<{type(obj).__name__} (repr failed)>'
+    return f'<pre>{html.escape(text)}</pre>'
+
 # Rough cost of starting a process pool (spawn plus re-importing numpy/pandas/
 #  sqlalchemy in each worker), used to decide whether parallel execution can pay
 #  off at all. Measured at ~1.9 s; adjust if your environment differs markedly.
@@ -1167,6 +1315,60 @@ POOL_CALIBRATION_SAMPLE = 3
 # Chunks handed to each worker. More chunks balance load better, fewer keep
 #  entities that share a parent together in one worker.
 POOL_CHUNKS_PER_WORKER = 8
+
+
+def _defined_interactively(obj: Any) -> bool:
+    """Was this object defined in an interactive session (a notebook cell or REPL)?
+
+    Such objects live in a __main__ that worker processes cannot import, so
+    pickling them by reference produces a worker that dies while unpickling.
+    """
+    main_module = sys.modules.get('__main__')
+    if main_module is not None and hasattr(main_module, '__file__'):
+        # __main__ is a real script, which spawned workers can re-import
+        return False
+
+    # Instances resolve __module__ through their class
+    return getattr(obj, '__module__', None) == '__main__'
+
+
+def _cloudpickle_available() -> bool:
+    try:
+        import cloudpickle  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@functools.lru_cache(maxsize=8)
+def _loads_by_value(data: bytes) -> Any:
+    import cloudpickle
+
+    return cloudpickle.loads(data)
+
+
+class _ByValue:
+    """Ships an object to workers by value instead of by reference.
+
+    multiprocessing pickles by reference, which fails for anything defined in a
+    notebook cell. Wrapping it here serializes the definition itself, so workers
+    can reconstruct it without importing __main__.
+    """
+    __slots__ = ('_data',)
+
+    def __init__(self, payload: Any):
+        import cloudpickle
+
+        # Serialized once in the parent; every task then ships the same bytes
+        self._data = cloudpickle.dumps(payload)
+
+    def __reduce__(self):
+        return _loads_by_value, (self._data,)
+
+
+def _for_workers(payload: Any, by_value: bool) -> Any:
+    """Wrap a payload if it has to travel by value."""
+    return _ByValue(payload) if by_value else payload
 
 
 def _init_map_worker(_entarchy: Entarchy, _worker_counter) -> None:
@@ -1214,9 +1416,17 @@ def _run_map_worker(task: tuple) -> tuple:
     Returns (uuid, traceback or None); failures are reported back rather than
     raised, so one bad entity does not abandon the rest of the collection.
     """
-    _uuid, _id, parent_uuid, entity_type, fun, kwargs_items, gpu_device_count = task
+    _uuid, _id, parent_uuid, entity_type_name, job, gpu_device_count = task
+
+    # A _ByValue payload has already turned back into the plain tuple here
+    fun, kwargs_items = job
 
     _entarchy = _WORKER_CONTEXT['entarchy']
+
+    # Resolve the type through the entarchy rather than shipping the class, so the
+    #  worker uses the same class object as the rest of its entity map
+    entity_type = _entarchy.get_entity_type(entity_type_name)
+
     kwargs = dict(kwargs_items)
 
     # Derive the device from the worker index, so a worker stays on one device
@@ -1256,7 +1466,7 @@ def _worker_pool_key(_entarchy: Entarchy, worker_num: int) -> tuple:
             _entarchy.is_in_digest_mode)
 
 
-def _get_worker_pool(_entarchy: Entarchy, worker_num: int) -> tuple:
+def _get_worker_pool(_entarchy: Entarchy, worker_num: int, by_value: bool = False) -> tuple:
     """Return (pool, was_already_running) for this entarchy and worker count."""
     import multiprocessing as mp
 
@@ -1271,7 +1481,7 @@ def _get_worker_pool(_entarchy: Entarchy, worker_num: int) -> tuple:
     counter = ctx.Value('i', 0)
     pool = ctx.Pool(processes=worker_num,
                     initializer=_init_map_worker,
-                    initargs=(_entarchy, counter))
+                    initargs=(_for_workers(_entarchy, by_value), counter))
 
     _POOL_CACHE.update({'key': key, 'pool': pool})
     return pool, False

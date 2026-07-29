@@ -44,7 +44,11 @@ mysql = [
     'SQLAlchemy',
     'PyMySQL',
 ]
-dev = ['pip-tools', 'pytest', 'build', 'twine']
+# Needed to run map_async on functions defined in a notebook cell, which worker
+#  processes cannot import
+notebook = ['cloudpickle']
+dev = ['pip-tools', 'pytest', 'build', 'twine',
+       'cloudpickle', 'nbformat', 'nbclient', 'ipykernel']
 
 [project.urls]
 Homepage = 'https://github.com/thladnik/entarchy'
