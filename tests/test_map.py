@@ -223,6 +223,9 @@ class TestPoolReuse:
         assert 'Reuse worker pool' in capsys.readouterr().out
 
     def test_same_workers_serve_both_calls(self, many):
+        """No new processes appear for the second call. Which of the two workers
+        picks up a given chunk is a race, so compare the union rather than the
+        individual sets: a rebuilt pool would push the total above worker_num."""
         many.get(Session).map_async(_mp_worker.record_worker_state, _worker_num=2,
                                     _calibrate=False)
         first = set(many.get(Session)['pid'])
@@ -231,7 +234,7 @@ class TestPoolReuse:
                                     _calibrate=False)
         second = set(many.get(Session)['pid'])
 
-        assert first == second
+        assert len(first | second) <= 2
 
     def test_warm_pool_lowers_the_startup_estimate(self, many, capsys, monkeypatch):
         """Calibration weighs a running pool by its dispatch cost, not by the cost
