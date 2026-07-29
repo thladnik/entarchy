@@ -25,6 +25,7 @@ from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME, LONGBLOB
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from . import asdf_store
 from .backend import Backend
 from .. import AnalysisEntity, Collection, Entarchy, Entity
 
@@ -149,6 +150,13 @@ class Serializer(object):
         return f'Serializer({self._type}, {self._store})'
 
     def deserialize(self, _entarchy: Entarchy) -> Any:
+
+        # Archive storage. The value sits in an ASDF block file that records its
+        #  own type, so it comes back complete and none of the logic below applies
+        if self._store.startswith(asdf_store.STORE_PREFIX):
+            relative_path, key = asdf_store.parse_store(self._store)
+            return asdf_store.read_blob(_entarchy.path, relative_path, key,
+                                        memmap=getattr(_entarchy.backend, 'memmap', False))
 
         # Read from file if needed
         if self._store != 'internal':
