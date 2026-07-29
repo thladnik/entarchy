@@ -575,6 +575,21 @@ class Entarchy(object):
 
         return len(released)
 
+    def to_asdf(self, destination: str, **kwargs) -> dict:
+        """Write this entarchy to a self-describing ASDF archive.
+
+        The archive is itself an entarchy - `Entarchy(destination)` opens it -
+        so analysis and figure code reads it without modification. It is
+        read-only; `entarchy.tools.archive import` turns one back into a
+        writable entarchy.
+
+        Returns:
+            dict: counts of what was written, including a portability report.
+        """
+        from ..tools import archive
+
+        return archive.export(self, destination, **kwargs)
+
     def forget_entity(self, entity: Union[Entity, str]) -> None:
         """Drop an entity from the in-memory registry.
 

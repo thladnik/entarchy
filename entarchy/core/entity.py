@@ -1233,6 +1233,17 @@ class Collection(object):
             if not was_registered:
                 self.entarchy.forget_entity(entity)
 
+    def to_asdf(self, destination: str, **kwargs) -> dict:
+        """Write this collection, and its ancestors, to an ASDF archive.
+
+        The archive is itself an entarchy, so `Entarchy(destination)` opens it
+        and every query and DataFrame call works there unchanged. Ancestors come
+        along so that parent lookups still resolve. See entarchy.tools.archive.
+        """
+        from ..tools import archive
+
+        return archive.export(self.entarchy, destination, collection=self, **kwargs)
+
     def to_dict(self) -> Generator[dict[str, Any]]:
         """
         Return a generator of dictionaries of all dynamic attributes for each entity in the collection.
