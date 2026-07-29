@@ -103,12 +103,25 @@ class TestWorkerReuse:
         assert cold_starts <= worker_num
         assert state['backend_was_open'].astype(bool).sum() >= len(state) - worker_num
 
-    def test_work_is_spread_over_processes(self, many):
+    def test_work_runs_in_worker_processes(self, many):
+        """Deterministic: every task ran in a child, and never in more processes
+        than the pool has workers."""
+        import os
+
         many.get(Session).map_async(_mp_worker.record_worker_state,
                                     _worker_num=2, _calibrate=False)
 
         pids = set(many.get(Session)['pid'])
-        assert len(pids) > 1
+        assert os.getpid() not in pids
+        assert 1 <= len(pids) <= 2
+
+    def test_work_is_spread_over_processes(self, many):
+        """Which worker takes a chunk is a race, so hand out single tasks and hold
+        each one briefly; otherwise one worker can drain the queue on its own."""
+        many.get(Session).map_async(_mp_worker.record_worker_state, _worker_num=2,
+                                    _calibrate=False, _chunk_size=1, sleep=0.05)
+
+        assert len(set(many.get(Session)['pid'])) > 1
 
     def test_worker_registry_does_not_grow(self, many):
         """Entities are released after processing, so the registry stays small."""

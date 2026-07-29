@@ -10,12 +10,19 @@ def double_score(session):
     session['doubled'] = float(session['score']) * 2.0
 
 
-def record_worker_state(session):
+def record_worker_state(session, sleep: float = 0.0):
     """Record whether this worker already had an open backend when the task started.
 
     The first task handled by a worker finds no connection; every later task in the
     same worker must reuse the one opened by its predecessor.
+
+    `sleep` holds the task briefly, so a single worker cannot drain the queue
+    before its peers are scheduled.
     """
+    if sleep:
+        import time
+        time.sleep(sleep)
+
     entarchy = session.entarchy
 
     # Read the raw attribute, not the property, so this check does not itself
