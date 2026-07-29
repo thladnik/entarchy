@@ -361,6 +361,96 @@ class TestDigestMode:
             subject['raw'] = 2
 
 
+class TestDatetimePrecisionMigration:
+    """Entarchies created before the fix have whole-second timestamp columns."""
+
+    @staticmethod
+    def downgrade(schema_name):
+        """Recreate the old column definitions, to stand in for an existing database."""
+        connection = pymysql.connect(host=HOST, user=USER, password=PASSWORD, database=schema_name)
+        connection.autocommit(True)
+        try:
+            with connection.cursor() as cursor:
+                for table, column, null in [('entities', 'created', 'NOT NULL'),
+                                            ('entities', 'modified', 'NOT NULL'),
+                                            ('attributes', 'created', 'NOT NULL'),
+                                            ('attributes', 'modified', 'NOT NULL'),
+                                            ('attributes', 'value_datetime', 'NULL')]:
+                    cursor.execute(f'ALTER TABLE {table} MODIFY {column} DATETIME {null}')
+        finally:
+            connection.close()
+
+    def url_for(self, schema_name):
+        from urllib.parse import quote_plus
+        return (f'mysql+pymysql://{quote_plus(USER)}:{quote_plus(PASSWORD)}'
+                f'@{HOST}/{schema_name}')
+
+    def test_new_entarchies_already_have_precision(self, ent, schema_name):
+        from entarchy.tools import migrate_datetime_precision
+
+        findings = migrate_datetime_precision.inspect(self.url_for(schema_name))
+
+        assert findings
+        assert not any(f['needs_migration'] for f in findings)
+
+    def test_detects_and_fixes_old_columns(self, ent, schema_name):
+        from entarchy.tools import migrate_datetime_precision
+
+        self.downgrade(schema_name)
+        url = self.url_for(schema_name)
+
+        findings = migrate_datetime_precision.inspect(url)
+        assert sum(f['needs_migration'] for f in findings) == 5
+
+        # Dry run changes nothing
+        migrate_datetime_precision.migrate(url, apply_changes=False)
+        assert sum(f['needs_migration'] for f in migrate_datetime_precision.inspect(url)) == 5
+
+        assert migrate_datetime_precision.migrate(url, apply_changes=True) == 5
+        assert not any(f['needs_migration'] for f in migrate_datetime_precision.inspect(url))
+
+    def test_migration_restores_visibility_of_new_entities(self, ent, schema_name):
+        """The defect the migration exists for: entities written moments ago are
+        rounded into the future and disappear from collections."""
+        from entarchy.tools import migrate_datetime_precision
+
+        self.downgrade(schema_name)
+
+        reopened = LabArchy(ent.path)
+        try:
+            missing = 0
+            for attempt in range(12):
+                with reopened:
+                    subject = Subject(reopened, _id=f'subject_{attempt}', _parent=reopened.root)
+                    reopened.add_new_entity(subject)
+
+                if len(reopened.get(Subject, f'id == "subject_{attempt}"')) == 0:
+                    missing += 1
+
+            assert missing > 0, 'expected the rounding defect to hide at least one entity'
+        finally:
+            reopened.backend.close()
+
+        migrate_datetime_precision.migrate(self.url_for(schema_name), apply_changes=True)
+
+        reopened = LabArchy(ent.path)
+        try:
+            for attempt in range(12):
+                with reopened:
+                    subject = Subject(reopened, _id=f'after_{attempt}', _parent=reopened.root)
+                    reopened.add_new_entity(subject)
+
+                assert len(reopened.get(Subject, f'id == "after_{attempt}"')) == 1
+        finally:
+            reopened.backend.close()
+
+    def test_sqlite_is_a_no_op(self, tmp_path, capsys):
+        from entarchy.tools import migrate_datetime_precision
+
+        assert migrate_datetime_precision.migrate(f'sqlite:///{(tmp_path / "x.db").as_posix()}') == 0
+        assert 'full precision already' in capsys.readouterr().out
+
+
 @pytest.mark.slow
 class TestParallel:
 
