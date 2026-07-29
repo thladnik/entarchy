@@ -46,6 +46,38 @@ python -m entarchy.tools.repair_blobs /path/to/entarchy_dir --apply
 The tool also accepts a SQLite file path or a full SQLAlchemy URL for
 MySQL-backed entarchies.
 
+### Notebooks
+
+Runnable examples live in [`examples/`](examples):
+
+- `01_getting_started.ipynb` — schema, entities, queries, DataFrames
+- `02_parallel_analysis.ipynb` — `map_async`, worker pools, failure handling
+
+Collections and entities render as tables in a notebook. Both representations are
+deliberately cheap: they show identity and attribute *names* without loading
+values, since a single entity can hold hundreds of megabytes of arrays. Use
+`collection.preview()` or `collection.dataframe_of([...])` to read values.
+
+**One caveat for parallel work.** Worker processes are started with `spawn`, so
+they must import the function being mapped. A function defined in a notebook cell
+lives in a `__main__` that workers cannot import. entarchy detects this and either
+
+- sends the definition by value, if `cloudpickle` is installed
+  (`pip install entarchy[notebook]`), or
+- prints a warning and runs the work in the current process.
+
+Either way it completes; without the check the worker pool would restart dying
+workers indefinitely and the kernel would appear to hang. For production
+pipelines, keep analysis functions in an importable module.
+
+Worker processes stay alive between `map_async` calls and hold open database
+connections. In a long-lived kernel, release them with:
+
+```python
+from entarchy.core.entity import shutdown_worker_pool
+shutdown_worker_pool()
+```
+
 ### Running tests
 
 ```sh
