@@ -1,6 +1,9 @@
 # Proposal: an ASDF-based storage layer for entarchy
 
-Status: draft for discussion
+Status: **Option C implemented** (`entarchy.tools.archive`,
+`entarchy.backend.archive`, `entarchy.backend.asdf_store`). Options A and B
+remain proposals; see "What was built" below for how the implementation differs
+from what this document originally described.
 Measured against: asdf 5.3.1, ASDF Standard 1.6.0, numpy 2.x, Windows 11 / Python 3.10
 
 ## Summary
@@ -162,6 +165,11 @@ without entarchy, a database server, or the pickle classes.
 
 Cheap to build, independent of Options A and B, and useful immediately.
 
+As first described, this had a defect: an archive only `asdf.open()` could read
+is useless to the analysis and figure code, which is written against entarchy's
+API. The implementation therefore makes the archive *an entarchy* rather than a
+foreign format — see below.
+
 ## Recommended plan
 
 1. **Option C first.** Small, self-contained, no risk to existing data, and it
@@ -173,28 +181,98 @@ Cheap to build, independent of Options A and B, and useful immediately.
 3. **Option A only if** the usage pattern changes to single-writer, read-mostly
    datasets under roughly 10 000 entities, where the open cost is tolerable.
 
+## What was built
+
+An archive is a normal entarchy directory whose backend happens to be
+`ArchiveBackend`:
+
+    archive/
+        entarchy.yaml     names entarchy.backend.archive.ArchiveBackend
+        index.sqlite      queryable metadata, normal entarchy schema
+        meta.asdf         the same metadata, columnar and self-describing
+        blocks/*.asdf     the arrays, one file per parent group
+
+`Entarchy(path)` resolves its backend from a dotted path in `entarchy.yaml`, so
+this needs no change anywhere above the backend layer: queries, filter
+expressions, DataFrames, parent traversal and `map_async` all work against an
+archive as written. `ArchiveBackend` subclasses `SQLiteBackend`, points the
+engine at `index.sqlite` (opened `mode=ro` where the driver allows it) and
+rejects the eight write methods.
+
+None of the three objections that ruled out Option A apply, because the target
+is read-only: there are no concurrent writers, no updates, and queries never
+touch ASDF.
+
+Three decisions worth recording, each forced by a measurement rather than taste.
+
+**Metadata is columnar.** One YAML node per attribute row would reintroduce the
+full-tree parse this document argues against. `meta.asdf` stores one array per
+column plus a null mask, so a dataset of any size costs a fixed handful of
+blocks. An outside reader gets clean columns; `rebuild` reconstructs
+`index.sqlite` from it, which is what makes the index a cache rather than a
+second source of truth.
+
+**Ragged collections are packed.** The original note above was wrong to describe
+`bs_cluster_full_indices` as needing a schema: it is a list, and ASDF handles
+plain Python containers natively. The real problem is that a list of arrays
+becomes one binary *block* per array. Measured on one ROI's attribute — 1000
+bootstrap iterations, each a list of index arrays:
+
+| encoding | blocks | size | write | read |
+|---|---:|---:|---:|---:|
+| naive (list of arrays) | 2 967 | 1 212 kB | 1 726 ms | 1 451 ms |
+| concatenated + offsets | 3 | 767 kB | 39 ms | 29 ms |
+| pickle (what it replaces) | — | 836 kB | 13 ms | 8 ms |
+
+`asdf_store` concatenates such lists and keeps their boundaries in an offsets
+array. Values come back bit-identical. Pickle is still the fastest of the three;
+ASDF buys portability and self-description, not speed.
+
+**Tuples and bytes are tagged.** YAML has neither. A tuple round-trips to a list
+silently, which is exactly the kind of quiet type drift that breaks analysis code
+far from the cause, so both are marked explicitly and restored on read.
+
+Two things that were not obvious in advance:
+
+- asdf returns `NDArrayType` proxies, not `ndarray`. They behave like arrays
+  arithmetically but fail `isinstance`, and pickling one raises
+  `TypeError: cannot pickle 'weakref.ReferenceType' object` — which is what
+  entarchy's own `Serializer` does when it does not recognise a value as an
+  array. Decoded values are materialised into real arrays.
+- Block files are opened per process and cached, since opening costs roughly
+  0.4 ms per tree entry (`lazy_tree=True` helps by about a third, not enough to
+  change the design) against 0.3 ms for the array read itself. Memory mapping is
+  off by default: a mapped array stops being readable once its file is closed,
+  and cached files are closed on eviction.
+- That cache has to be bigger than the number of groups a read pass touches, or
+  every read evicts a file the next one wants. Reading 600 ROIs spread over 12
+  groups: 1.31 ms per entity from a live entarchy, 1.93 ms from an archive with
+  room for all 12, and 16.94 ms with room for 8. The default is 64 and
+  `ArchiveBackend(open_file_limit=...)` raises it. So an archive costs about 1.5x
+  a live entarchy per attribute read, not the 13x a too-small cache produced.
+
+Answering the granularity question this document left open: **one file per parent
+group**, matching the locality grouping `map_async` uses. One file per entity
+makes 100 000 files; one file for everything makes every array read pay a
+full-tree parse.
+
 ## Open questions
 
-- **Granularity for Option B.** One file per entity is simple and matches the
-  current sharding, but 100 000 small files is unkind to some filesystems and to
-  backup tools. One file per parent group (a layer, a recording) matches the
-  locality grouping `map_async` now uses and would be far friendlier, at the cost
-  of write coordination between workers processing the same group.
 - **Compression policy.** Off by default is the safe choice, since imaging traces
   compress poorly and CPU is the bottleneck; worth measuring on real data.
-- **Non-array objects.** ASDF handles numpy and plain YAML-able structures well.
-  Attributes that are currently arbitrary pickled Python objects (the
-  `bs_cluster_full_indices` lists, for instance) need either a schema or a
-  documented fallback.
+  `--compression zlib` is available and untested against real recordings.
+- **Whether Option B is still wanted.** The archive path already contains the
+  encoder and the `asdf:` store form, so the remaining work for a live ASDF blob
+  layer is the write side plus a migration. The case for it is weaker now that
+  archives cover the portability argument.
 - **Dependency weight.** `asdf` pulls in `jmespath`, `semantic-version` and
-  `attrs`. Reasonable, but it should be an optional extra rather than a hard
-  dependency.
+  `attrs`. It is an optional extra (`pip install entarchy[asdf]`), and everything
+  else works without it.
 
 ## What I would need from you
 
-- Whether archival and citability (Option C) or the blob layer (Option B) is the
-  more pressing motivation, since that decides the order.
-- Whether ~100 000 files is acceptable for Option B, or whether it should be one
-  file per layer or recording.
 - Whether anything currently reads the `ext/` tree directly, which would
-  constrain how far the layout can change.
+  constrain how far the layout can change under Option B.
+- Whether real datasets hit the pickle fallback often. The exporter lists every
+  attribute it could not encode natively; if that list is long on your data,
+  those attributes are worth reshaping at the point they are written.

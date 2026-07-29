@@ -46,6 +46,62 @@ python -m entarchy.tools.repair_blobs /path/to/entarchy_dir --apply
 The tool also accepts a SQLite file path or a full SQLAlchemy URL for
 MySQL-backed entarchies.
 
+### Archiving to ASDF
+
+An entarchy, or a collection out of one, can be exported to a self-describing
+[ASDF](https://asdf-standard.readthedocs.io) archive:
+
+```sh
+python -m entarchy.tools.archive export /path/to/entarchy /path/to/archive
+```
+
+```python
+ent.to_asdf('/path/to/archive')
+ent.get(Roi, 'has_receptive_field == True').to_asdf('/path/to/figure_3_data')
+```
+
+An archive **is** an entarchy directory, so analysis and figure code opens it
+unchanged:
+
+```python
+ent = MyArchy('/path/to/archive')
+rois = ent.get(Roi, '[Animal]strain == "wt" AND good == True')
+rois.dataframe_of(['index', 'quality'])
+```
+
+    archive/
+        entarchy.yaml     names entarchy.backend.archive.ArchiveBackend
+        index.sqlite      queryable metadata, normal entarchy schema
+        meta.asdf         the same metadata, columnar and self-describing
+        blocks/*.asdf     the arrays, one file per parent group
+
+Queries run against `index.sqlite`, which has indexes and a query planner; ASDF
+has neither, and its YAML tree is parsed in full on open. Only array reads touch
+ASDF, where the cost is flat regardless of file size. Exporting a collection
+brings its ancestors along, so parent lookups and `[Parent]attr` filters still
+resolve.
+
+`index.sqlite` is a cache, not a second source of truth. `meta.asdf` holds
+everything needed to rebuild it, which is what keeps the archive readable
+without entarchy:
+
+```sh
+python -m entarchy.tools.archive rebuild /path/to/archive
+```
+
+Archives are read-only. To carry on working with the data, import it back:
+
+```sh
+python -m entarchy.tools.archive import /path/to/archive /path/to/new_entarchy
+```
+
+Values that ASDF cannot express natively — custom classes, pandas objects,
+object arrays — fall back to pickled blocks, and the export prints exactly which
+attributes those were. An archive containing them can only be read where those
+classes are importable, so the warning is worth acting on.
+
+Requires `asdf` (`pip install entarchy[asdf]`); everything else works without it.
+
 ### Notebooks
 
 Runnable examples live in [`examples/`](examples):

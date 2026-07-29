@@ -47,8 +47,10 @@ mysql = [
 # Needed to run map_async on functions defined in a notebook cell, which worker
 #  processes cannot import
 notebook = ['cloudpickle']
+# Needed to write and read ASDF archives (entarchy.tools.archive)
+asdf = ['asdf']
 dev = ['pip-tools', 'pytest', 'build', 'twine',
-       'cloudpickle', 'nbformat', 'nbclient', 'ipykernel']
+       'cloudpickle', 'nbformat', 'nbclient', 'ipykernel', 'asdf']
 
 [project.urls]
 Homepage = 'https://github.com/thladnik/entarchy'
