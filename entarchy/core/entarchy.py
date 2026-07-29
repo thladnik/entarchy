@@ -548,6 +548,33 @@ class Entarchy(object):
 
         return temp_path
 
+    def clear_registry(self) -> int:
+        """Drop cached entities from the in-memory registry to free memory.
+
+        Every entity ever loaded is kept in a registry, so that two lookups of the
+        same UUID return the same object. In a long-running session (a notebook
+        left open, or a script sweeping a large collection) this accumulates, along
+        with whatever array data those entities have cached.
+
+        Entities with uncommitted changes are kept, so nothing is ever lost.
+        Released entities stay usable and are reloaded on demand.
+
+        Returns:
+            int: The number of entities released.
+        """
+
+        pending = set(self._entities_to_add) | set(self._entities_to_update)
+
+        released = [_uuid for _uuid in self._entities if _uuid not in pending]
+        for _uuid in released:
+            del self._entities[_uuid]
+
+        if len(pending) > 0:
+            print(f'Released {len(released)} entities, '
+                  f'kept {len(pending)} with uncommitted changes')
+
+        return len(released)
+
     def forget_entity(self, entity: Union[Entity, str]) -> None:
         """Drop an entity from the in-memory registry.
 

@@ -2,6 +2,7 @@
 import os
 import pickle
 
+import numpy as np
 import pytest
 import yaml
 
@@ -111,6 +112,66 @@ class TestRegistry:
     def test_unknown_uuid_raises(self, populated):
         with pytest.raises(RuntimeError, match='does not exist'):
             populated.get_entity_by_uuid('aaaaaaaa-0000-0000-0000-000000000000')
+
+
+class TestClearRegistry:
+
+    def test_releases_cached_entities(self, populated):
+        entities = list(populated.get(Session))
+        assert len(populated._entities) >= len(entities)
+
+        released = populated.clear_registry()
+
+        assert released >= len(entities)
+        assert len(populated._entities) == 0
+
+    def test_released_entities_are_reloaded_on_demand(self, populated):
+        entity = populated.get(Session)[0]
+        uuid, index = entity.uuid, entity['index']
+
+        populated.clear_registry()
+
+        reloaded = populated.get_entity_by_uuid(uuid)
+        assert reloaded.uuid == uuid
+        assert reloaded['index'] == index
+
+    def test_frees_cached_attribute_data(self, populated):
+        entity = populated.get(Session)[0]
+        entity['big'] = np.zeros(1000)
+        assert 'big' in entity._attribute_cache
+
+        populated.clear_registry()
+
+        # The registry no longer holds the entity, so its cache can be collected
+        assert entity.uuid not in populated._entities
+
+    def test_keeps_entities_with_uncommitted_changes(self, populated):
+        with populated:
+            entity = populated.get(Session)[0]
+            entity['pending'] = 1
+
+            populated.clear_registry()
+
+            assert entity.uuid in populated._entities
+
+        # The pending write survived and was committed on context exit
+        entity._attribute_cache.clear()
+        assert entity['pending'] == 1
+
+    def test_keeps_entities_queued_for_insertion(self, ent):
+        with ent:
+            subject = Subject(ent, _id='new', _parent=ent.root)
+            ent.add_new_entity(subject)
+
+            ent.clear_registry()
+            assert subject.uuid in ent._entities
+
+        subject._attribute_cache.clear()
+        assert subject['id'] == 'new'
+
+    def test_is_safe_on_an_empty_registry(self, ent):
+        ent.clear_registry()
+        assert ent.clear_registry() >= 0
 
 
 class TestPickling:
