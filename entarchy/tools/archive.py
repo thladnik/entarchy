@@ -300,21 +300,25 @@ def _export(source_ent, destination, collection, compression, meta_compression, 
         for row in entity_rows:
             groups.setdefault(row['parent_uuid'], []).append(row['uuid'])
 
+        type_name_by_pk = {row['pk']: row['name'] for row in type_rows}
+
         attribute_rows: list[dict] = []
         for group_index, (parent_uuid, member_uuids) in enumerate(sorted(
                 groups.items(), key=lambda item: (item[0] is not None, item[0] or ''))):
 
-            group_rows, blobs = _export_group(
+            group_rows, blobs, relative_path, content_types = _export_group(
                 session, source_ent, member_uuids, parent_uuid, entity_by_uuid,
-                group_index, report, stats, skip_broken)
+                type_name_by_pk, group_index, report, stats, skip_broken)
 
             if len(blobs) > 0:
-                relative_path = _group_file_name(parent_uuid, entity_by_uuid, group_index)
                 full_path = os.path.join(destination, relative_path)
 
                 tree = {'entarchy_archive': {'version': ARCHIVE_FORMAT_VERSION,
                                              'encoding_version': asdf_store.ENCODING_VERSION,
-                                             'group_parent_uuid': parent_uuid or '',
+                                             'entity_types': sorted(content_types),
+                                             'parent_uuid': parent_uuid or '',
+                                             'parent_id': (entity_by_uuid[parent_uuid]['id']
+                                                           if parent_uuid in entity_by_uuid else ''),
                                              'entity_count': len(member_uuids)},
                         'blobs': blobs}
                 _write_asdf(asdf_module, tree, full_path, compression)
@@ -386,24 +390,44 @@ def _write_asdf(asdf, tree: dict, path: str, compression: str = None) -> None:
         handle.close()
 
 
-def _group_file_name(parent_uuid, entity_by_uuid, group_index: int) -> str:
+def _group_file_name(parent_uuid, parent_id: str, content_types: set, group_index: int) -> str:
+    """Name a block file after what it holds, not after the parent it hangs from.
+
+    A group is the children of one entity, so naming it after the parent reads as
+    if it held the parent's own data - "animal_01.asdf" actually holding a
+    recording's arrays. The type of the contents goes first, with the parent kept
+    as context, because that is the question being asked when someone opens the
+    directory: which file has the ROIs of plane0?
+    """
+    types = _sanitize('-'.join(sorted(content_types))) if content_types else 'entities'
+
     if parent_uuid is None:
-        return f'{BLOCK_DIR}/root.asdf'
+        return f'{BLOCK_DIR}/{group_index:04d}_{types}_at_root.asdf'
 
-    parent = entity_by_uuid.get(parent_uuid)
-    label = _sanitize(parent['id']) if parent is not None else 'group'
-
-    # The uuid fragment keeps names unique when two groups share an id
-    return f'{BLOCK_DIR}/{group_index:04d}_{label}_{str(parent_uuid)[:8]}.asdf'
+    # The uuid fragment keeps names unique when two parents share an id
+    return (f'{BLOCK_DIR}/{group_index:04d}_{types}_in_{_sanitize(parent_id)}'
+            f'_{str(parent_uuid)[:8]}.asdf')
 
 
 def _export_group(session, source_ent, member_uuids, parent_uuid, entity_by_uuid,
-                  group_index, report, stats, skip_broken) -> tuple[list[dict], dict]:
+                  type_name_by_pk, group_index, report, stats,
+                  skip_broken) -> tuple[list[dict], dict, str, set]:
     """Copy one group's attribute rows, moving blob payloads into ASDF."""
-    relative_path = _group_file_name(parent_uuid, entity_by_uuid, group_index)
-
     rows = session.query(AttributeTable).filter(
         AttributeTable.entity_uuid.in_(list(member_uuids))).all()
+
+    # Name the file after the entities that actually contribute payloads, which is
+    #  needed before the first Serializer pointer is written
+    content_types = set()
+    for row in rows:
+        if row.data_type == 'blob' and row.value_blob is not None:
+            entity = entity_by_uuid.get(row.entity_uuid)
+            if entity is not None:
+                content_types.add(type_name_by_pk.get(entity['entity_type_pk'], 'Entity'))
+
+    parent = entity_by_uuid.get(parent_uuid)
+    relative_path = _group_file_name(parent_uuid, parent['id'] if parent else 'group',
+                                     content_types, group_index)
 
     exported: list[dict] = []
     blobs: dict[str, Any] = {}
@@ -438,7 +462,7 @@ def _export_group(session, source_ent, member_uuids, parent_uuid, entity_by_uuid
 
         exported.append(record)
 
-    return exported, blobs
+    return exported, blobs, relative_path, content_types
 
 
 def _archive_serializer(value_type: type, relative_path: str, key: str, data_size: int) -> Serializer:

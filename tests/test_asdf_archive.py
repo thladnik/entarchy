@@ -125,6 +125,29 @@ class TestLayout:
         #  the root holds the animal - far fewer files than the 17 entities
         assert 0 < len(block_files) <= 8
 
+    def test_block_files_are_named_after_their_contents(self, archived, tmp_path):
+        """A file holding a layer's ROIs must not read as if it held the layer."""
+        destination = (tmp_path / 'archive').as_posix()
+        block_files = sorted(os.listdir(os.path.join(destination, BLOCK_DIR)))
+
+        roi_files = [name for name in block_files if name.split('_')[1] == 'Roi']
+        assert len(roi_files) == 4  # one per layer
+
+        # The parent stays in the name as context, after the contents
+        assert all('_in_plane' in name for name in roi_files)
+        assert any(name.split('_')[1] == 'Layer' for name in block_files)
+
+    def test_block_file_records_its_contents(self, archived, tmp_path):
+        destination = (tmp_path / 'archive').as_posix()
+        block_files = sorted(os.listdir(os.path.join(destination, BLOCK_DIR)))
+        roi_file = next(name for name in block_files if name.split('_')[1] == 'Roi')
+
+        with asdf.open(os.path.join(destination, BLOCK_DIR, roi_file)) as handle:
+            header = handle['entarchy_archive']
+
+        assert header['entity_types'] == ['Roi']
+        assert header['parent_id'].startswith('plane')
+
     def test_config_names_archive_backend(self, archived):
         ent, _ = archived
         assert type(ent.backend).__name__ == 'ArchiveBackend'
