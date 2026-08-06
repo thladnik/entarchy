@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 
 import pathlib
@@ -41,6 +42,15 @@ class Backend(object):
     def get_runtime_config(self) -> dict[str, Any]:
         """Full in-memory configuration, including values that must not be persisted."""
         return self._config.copy() if self._config is not None else {}
+
+    @contextlib.contextmanager
+    def batch(self):
+        """Collect the writes inside this block into one transaction, if supported.
+
+        Backends that cannot batch simply run the block as-is, so callers may
+        always use it.
+        """
+        yield
 
     def close(self):
         raise NotImplementedError('')
