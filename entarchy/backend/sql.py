@@ -447,6 +447,26 @@ def _get_entity_type_ancestor_distance(session: sqlalchemy.orm.Session,
     return None
 
 
+# SQLite refuses any statement carrying more than SQLITE_MAX_VARIABLE_NUMBER bound
+#  parameters - 32766 since 3.32, and 999 before that. The attribute upsert binds one
+#  parameter per column per row, so a single statement covering a large collection
+#  goes over: at the width of the attributes table that is about 1900 entities, which
+#  is well inside the range entarchy is built for. MySQL has no equivalent limit, since
+#  PyMySQL interpolates literals rather than binding, but bounding the statement size
+#  keeps it clear of max_allowed_packet as well.
+MAX_BOUND_PARAMETERS = 30_000
+
+
+def _chunk_by_bound_parameters(records: list[dict], columns: int):
+    """Split rows so that no single statement exceeds the bound parameter limit."""
+    if len(records) == 0:
+        return
+
+    rows_per_statement = max(1, MAX_BOUND_PARAMETERS // max(1, columns))
+    for start in range(0, len(records), rows_per_statement):
+        yield records[start:start + rows_per_statement]
+
+
 def _get_namehash(name: str) -> str:
     return hashlib.sha224(name.encode()).hexdigest()
 
@@ -1320,43 +1340,55 @@ class SQLBackend(Backend):
             if not self.db_triggers_enabled:
                 df_insert['modified'] = datetime.datetime.now()
 
-            # Perform upsert
+            # Perform upsert, in chunks small enough for the dialect to accept
             with self.sql_session as session:
                 insert_attr_data = df_insert.to_dict('records')
-                insert_stmt = self._insert_statement(insert_attr_data)
-                proposed = self._inserted_values(insert_stmt)
 
-                update_attr_data = {
-                    f'value_{data_type_str}': getattr(proposed, f'value_{data_type_str}'),
-                    # On update, reset all other value fields to None:
-                    **{f'value_{dt}': None for dt in list(set(_dtypes) - {data_type_str})},
-                    'data_type': data_type_str,
-                    'data_size': proposed.data_size,
-                    'analysis_uuid': proposed.analysis_uuid,
-                    'modified': proposed.modified,
-                    'float_is_nan': proposed.float_is_nan,
-                    'float_is_inf': proposed.float_is_inf,
-                }
+                # Sized from the table, not the DataFrame: SQLAlchemy fills in
+                #  columns the DataFrame never carries (mutable, created) from the
+                #  model defaults, and those bind parameters too
+                for chunk in _chunk_by_bound_parameters(insert_attr_data,
+                                                        len(AttributeTable.__table__.columns)):
+                    insert_stmt = self._insert_statement(chunk)
+                    proposed = self._inserted_values(insert_stmt)
 
-                # For floats, value_int carries the sign of inf values and must
-                #  override the generic value-column reset above
-                if data_type_str == 'float':
-                    update_attr_data['value_int'] = proposed.value_int
+                    update_attr_data = {
+                        f'value_{data_type_str}': getattr(proposed, f'value_{data_type_str}'),
+                        # On update, reset all other value fields to None:
+                        **{f'value_{dt}': None for dt in list(set(_dtypes) - {data_type_str})},
+                        'data_type': data_type_str,
+                        'data_size': proposed.data_size,
+                        'analysis_uuid': proposed.analysis_uuid,
+                        'modified': proposed.modified,
+                        'float_is_nan': proposed.float_is_nan,
+                        'float_is_inf': proposed.float_is_inf,
+                    }
 
-                # Add modified time update if triggers are not enabled
-                if not self.db_triggers_enabled:
-                    update_attr_data['modified'] = datetime.datetime.now()
+                    # For floats, value_int carries the sign of inf values and must
+                    #  override the generic value-column reset above
+                    if data_type_str == 'float':
+                        update_attr_data['value_int'] = proposed.value_int
 
-                # Execute upsert
-                session.execute(self._upsert_statement(insert_stmt, update_attr_data))
+                    # Add modified time update if triggers are not enabled
+                    if not self.db_triggers_enabled:
+                        update_attr_data['modified'] = datetime.datetime.now()
+
+                    # Execute upsert
+                    session.execute(self._upsert_statement(insert_stmt, update_attr_data))
+
                 session.commit()
 
         if not self.db_triggers_enabled:
             with self.sql_session as session:
-                session.query(EntityTable).filter(EntityTable.uuid.in_(list(df.index))).update(
-                    {EntityTable.modified: datetime.datetime.now()},
-                    synchronize_session=False,
-                )
+                # IN binds one parameter per uuid, so this needs chunking too
+                uuids = list(df.index)
+                for start in range(0, len(uuids), MAX_BOUND_PARAMETERS):
+                    session.query(EntityTable).filter(
+                        EntityTable.uuid.in_(uuids[start:start + MAX_BOUND_PARAMETERS])
+                    ).update(
+                        {EntityTable.modified: datetime.datetime.now()},
+                        synchronize_session=False,
+                    )
                 session.commit()
 
     def open(self):

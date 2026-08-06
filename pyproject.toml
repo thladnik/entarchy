@@ -57,4 +57,4 @@ Homepage = 'https://github.com/thladnik/entarchy'
 
 [tool.pytest.ini_options]
 testpaths = ['tests']
-markers = ['slow: tests that spawn subprocess workers']
+markers = ['slow: tests that spawn subprocess workers or build large collections']
