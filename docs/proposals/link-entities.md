@@ -251,24 +251,21 @@ Same endpoint types, so `symmetric` must be declared. Compute densely in memory,
 persist only what survives thresholding.
 
 ```python
-ent.define_link_type('correlated', Roi, Roi, symmetric=True,
-                     description='Pearson r of dF/F, retained where p < 0.01')
+ent.define_link_type('correlated', Roi, Roi, symmetric=True, cardinality='sparse',
+                     description='Pearson r of dF/F, retained where |r| > 0.6')
 
 for layer in ent.get(Layer):
     rois = layer.rois
-    traces = np.stack([roi['dff'] for roi in rois])
-    uuids = [roi.uuid for roi in rois]
+    r = np.corrcoef(np.stack([roi['dff'] for roi in rois]))
 
-    r = np.corrcoef(traces)
-    i, j = np.triu_indices(len(rois), k=1)
-    keep = np.abs(r[i, j]) > 0.6
-
-    ent.link_from_frame(pd.DataFrame({
-        'linker_uuid': [uuids[a] for a in i[keep]],
-        'linked_uuid': [uuids[b] for b in j[keep]],
-        'r': r[i, j][keep],
-    }), 'correlated')
+    ent.link_from_matrix(rois, rois, r, 'correlated',
+                         where=lambda v: abs(v) > 0.6,
+                         value_name='r', symmetric=True)
 ```
+
+`link_from_matrix` takes the predicate as a required argument, so the
+thresholding step cannot be omitted — see the guard rails section below for why
+that matters more than it looks.
 
 Found from either end, because the kind is symmetric:
 
@@ -420,7 +417,7 @@ One link per ROI rather than one per pair. A different kind, so the opposite
 orientation is not a conflict.
 
 ```python
-ent.define_link_type('preferred_stimulus', Roi, Phase)
+ent.define_link_type('preferred_stimulus', Roi, Phase, cardinality='one_per_linker')
 
 for roi in ent.get(Roi, 'has_receptive_field == True'):
     responses = roi.links('mean_response').dataframe_of(['mean_dff'])
@@ -513,6 +510,77 @@ collection ↔ collection relationships are matrices.** Example 2 shows the hybr
 which is usually what you actually want: compute densely, threshold, persist the
 survivors as links.
 
+## Guard rails against accidental density
+
+Nothing in the design so far stops someone omitting the threshold in example 2
+and writing every pair. That needs fixing, because the failure mode is quiet.
+
+The catastrophic case is the safe one: 5 × 10⁹ pairs needs roughly 500 GB just to
+build the DataFrame, so it dies in pandas before reaching the database. The
+damage happens in the middle, where the write *succeeds slowly*:
+
+| pairwise over | links | storage | write time now | after the bulk insert fix |
+|---|---:|---:|---:|---:|
+| 400 ROIs, one layer | 79,800 | 0.16 GB | 13 min | ~2 min |
+| 3,200 ROIs | 5.1 × 10⁶ | 10 GB | 14 h | ~2 h |
+| 10,000 ROIs | 5.0 × 10⁷ | 100 GB | 6 days | ~21 h |
+
+Note that fixing the bulk insert sharpens this rather than softening it. A
+runaway write is currently so slow it would be noticed and killed; at 1.5 ms per
+link it fills a disk overnight instead. The per-layer loop in example 2 hides it
+further, since each iteration looks modest and only the total is ruinous.
+
+Five measures, which catch different mistakes:
+
+**Cardinality declared on the kind.** The registry already exists, so expected
+shape belongs in it:
+
+```python
+ent.define_link_type('correlated', Roi, Roi, symmetric=True, cardinality='sparse')
+ent.define_link_type('preferred_stimulus', Roi, Phase, cardinality='one_per_linker')
+```
+
+`one_per_linker` is exactly enforceable with a unique index on
+`(link_type, linker_uuid)` — not a heuristic — and would catch the example 9 bug
+of writing 300 preferred stimuli per ROI. `sparse` is the default and enables the
+density check; `dense` switches the checks off, deliberately and on the record.
+
+**Density, not just count.** 500,000 sparse links across a large dataset is
+legitimate; 80,000 links that are 100% of the available pairs is a misuse. On a
+bulk write, compare `len(df)` against `unique_linkers × unique_linked` and refuse
+above ~0.5 for a sparse kind, naming the density and pointing at the matrix form.
+
+**A count ceiling with explicit override**, following the existing
+`backend.delete(confirm=True)` idiom:
+
+```python
+ent.link_from_frame(df, 'correlated')                     # raises above ~100k
+ent.link_from_frame(df, 'correlated', confirm_count=79_800)
+```
+
+Requiring the actual number rather than `force=True` means the caller has looked
+at it.
+
+**Make thresholding structural.** The strongest measure, because it removes the
+mistake rather than detecting it — hand over the matrix and a predicate instead
+of a pre-built frame:
+
+```python
+ent.link_from_matrix(rois, rois, r, 'correlated',
+                     where=lambda v: abs(v) > 0.6, symmetric=True)
+```
+
+The threshold is a required argument, so it cannot be forgotten, and the helper
+reports how many pairs survived before writing anything. Example 2 should be
+written this way.
+
+**`dry_run=True`** on the bulk paths, reporting count, estimated storage and
+estimated time without writing. The thing to reach for the first time a new
+linking script runs.
+
+Every one of these needs a single-argument override. Someone who genuinely wants
+200,000 links should get them without editing configuration.
+
 ## What this reuses, and what has to be built
 
 Reused unchanged: the attribute table and all typed columns, the `Serializer` and
@@ -528,6 +596,8 @@ To be built:
 | registry: define / validate / introspect | small | one query per bulk validation |
 | `ent.link`, `Entity.links` | small | `Entity.__matmul__` stays unimplemented; it should raise a message pointing at `ent.link` rather than the current bare NotImplementedError |
 | `link_from_frame` and bulk helpers | medium | blocked on the two bugs below |
+| `link_from_matrix` with required predicate | small | removes the example 2 failure mode |
+| cardinality: `one_per_linker` index, density and count checks, `dry_run` | small | see the guard rails section |
 | `LinkCollection` + `_build_query_from_collection` branch | medium | join `links` before the existing filters |
 | `@Type.attr` / `@linker.` / `@linked.` syntax | medium | parser plus one branch in `_generate_attribute_filters`, structurally the same as the existing `[Type]attr` case |
 | `EXIST_LINK(kind)` filter | small | |
