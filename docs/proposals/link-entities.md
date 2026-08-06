@@ -70,12 +70,16 @@ anywhere. That is the same property the ASDF archive format was built to protect
 
 ```
 link_types
-  link_type       VARCHAR  PRIMARY KEY
-  linker_type_pk  FK entity_types   NULL = any
-  linked_type_pk  FK entity_types   NULL = any
-  symmetric       BOOL     DEFAULT false
-  description     VARCHAR  NULL
+  link_type         VARCHAR  PRIMARY KEY
+  linker_type_pk    FK entity_types  NULL     -- endpoint is an ordinary entity
+  linker_link_type  FK link_types    NULL     -- endpoint is a link of this kind
+  linked_type_pk    FK entity_types  NULL
+  linked_link_type  FK link_types    NULL
+  symmetric         BOOL     DEFAULT false
+  description       VARCHAR  NULL
   created
+  -- per endpoint, at most one of (type_pk, link_type) is set;
+  -- both null means a deliberate wildcard
 
 links
   link_uuid       CHAR(36) PRIMARY KEY        -- also the carrier entity's uuid
@@ -107,6 +111,21 @@ block files by parent and `map_async` orders work by parent for worker locality.
 Parentless links would collapse into a single group and lose both. It also keeps
 `../` traversal meaningful from a link.
 
+It beats the alternative of using the nearest common ancestor, for a reason that
+only shows up at scale. In example 1 the linker is the Phase, so 300 phases ×
+400 ROIs groups into 300 files of 400 links each — roughly 0.16 s to open one.
+Nearest common ancestor would be the Recording, giving a single file with 120,000
+tree entries, which at the measured 0.4 ms per entry is about 48 seconds to open
+before any array can be read.
+
+The consequence to remember: an archive holding many links has many block files,
+so `ArchiveBackend(open_file_limit=...)` should be raised above the default 64
+when a read pass sweeps all of them.
+
+Links are children of their linker, so they never appear in an existing entity's
+ancestor chain — a Roi's ancestors are still Layer, Recording, Animal. Existing
+`[ParentType]attr` traversal is unaffected.
+
 **`link_type` is part of the unique key**, which is what allows one phase/ROI pair
 to carry both a `mean_response` and a `peak_latency` link. The current table's
 composite primary key `(linker_uuid, linked_uuid)` forbids that outright.
@@ -135,6 +154,17 @@ ent.define_link_type('mean_response', Phase, Roi,
 Exact type match. The hierarchy is containment rather than subtyping, so there is
 no inheritance to accommodate; `None` is an explicit wildcard for kinds that
 deliberately accept anything.
+
+**Endpoints that are themselves links are constrained by kind, not by type.**
+Every link shares the entity type `LinkEntity`, so constraining by entity type
+would permit an `adaptation` link between a `mean_response` and a `correlated` —
+precisely the confusion the registry exists to prevent, at the one place the
+mechanism cannot see. Hence the paired `*_link_type` columns:
+
+```python
+ent.define_link_type('adaptation', 'mean_response', 'mean_response', directed=True)
+# constrains both endpoints to mean_response links, not merely to "some link"
+```
 
 The one hole in first-use registration is that if the *first* use is the mistake,
 the registry learns the mistake. Mitigated by making the registry visible
@@ -165,8 +195,7 @@ Two consequences worth building in deliberately:
 `ent.link(roi, phase, 'mean_response')` stores Phase → Roi rather than raising.
 When the endpoint types differ, the intended orientation is unambiguous, so
 strictness there would be pedantry. It errors only if the pair matches the
-declaration in neither order. This also rescues `@` as sugar, since `roi @ phase`
-and `phase @ roi` both land correctly.
+declaration in neither order.
 
 **Query syntax follows the flag.** For directed kinds, `@linker.attr` and
 `@linked.attr` are meaningful. For symmetric kinds they are not — canonical
@@ -403,19 +432,33 @@ for roi in ent.get(Roi, 'has_receptive_field == True'):
 
 ### 10. Links between links
 
-Because the carrier is an entity and endpoints are entity uuids, this needs no
-extra machinery:
+Supported deliberately. The carrier is an entity and endpoints are
+`entities.uuid` foreign keys, so this needs no schema change — *refusing* it
+would cost extra code.
 
 ```python
-ent.define_link_type('adaptation', LinkEntity, LinkEntity, directed=True,
+ent.define_link_type('adaptation', 'mean_response', 'mean_response', directed=True,
                      description='response to a repeated stimulus vs. its first presentation')
 
 ent.link(response_repeat_2, response_repeat_1, 'adaptation')['ratio'] = 0.68
 ```
 
-Whether this is a good idea in practice is an open question, but it falls out of
-the design rather than being designed in, and it is the natural home for
-"how did this pairwise quantity change between conditions".
+The endpoints are constrained by *kind*, which is why the registry needs the
+`*_link_type` columns; constraining by entity type would allow an `adaptation`
+between a `mean_response` and a `correlated`.
+
+Deferred until there is a concrete use: addressing a link endpoint's attributes
+in a filter, e.g. `@mean_response.mean_dff > 0.3`. That is real parser work, and
+storage plus constraints are useful without it.
+
+Two consequences to accept knowingly:
+
+- **Deletion becomes recursive.** Refusing to delete an entity that still has
+  links means deleting a ROI requires clearing its responses first, which
+  requires clearing any adaptation links above those. The refusal has to explain
+  a chain of unbounded depth.
+- **Paths get deep.** With `parent = linker`, a link-of-a-link sits two levels
+  below the ROI, so `entity.path` grows accordingly. Cosmetic.
 
 ### 11. Analysis over links, free
 
@@ -483,7 +526,7 @@ To be built:
 |---|---|---|
 | `link_types` + `links` schema | small | redefinition, no data migration |
 | registry: define / validate / introspect | small | one query per bulk validation |
-| `ent.link`, `Entity.links`, `__matmul__` | small | |
+| `ent.link`, `Entity.links` | small | `Entity.__matmul__` stays unimplemented; it should raise a message pointing at `ent.link` rather than the current bare NotImplementedError |
 | `link_from_frame` and bulk helpers | medium | blocked on the two bugs below |
 | `LinkCollection` + `_build_query_from_collection` branch | medium | join `links` before the existing filters |
 | `@Type.attr` / `@linker.` / `@linked.` syntax | medium | parser plus one branch in `_generate_attribute_filters`, structurally the same as the existing `[Type]attr` case |
@@ -521,32 +564,73 @@ though that is an estimate rather than a measurement.
 This second one is not link-specific — it is the same cost paid ingesting 100,000
 ROIs today.
 
-## Open questions
+## Decisions
 
-- **Should `parent = linker` or nearest common ancestor?** Linker is O(1) and
-  gives good archive/`map_async` locality when links are created per-linker.
-  Nearest common ancestor (the Recording, for phase → roi) is more principled and
-  groups better when links fan across many linkers, but costs a lookup per link.
-  Linker is the current recommendation; worth revisiting if the first real use
-  fans the other way.
-- **Deleting an endpoint.** Links must not outlive their endpoints. Cascade
-  delete, or refuse to delete an entity that still has links? Refusing is safer
-  and matches the fact that entarchy has no general delete for entities today.
-- **Should `LinkEntity` endpoints be materialised eagerly?** `link.linker` and
-  `link.linked` as properties are convenient but each is an entity load; a
-  collection-level prefetch will be wanted for anything iterating many links.
-- **Is `link → link` (example 10) worth supporting deliberately**, or should the
-  registry refuse `LinkEntity` endpoints until there is a concrete use?
+Settled, and reflected above.
 
-## What I would need from you
+- **`parent = linker`**, not nearest common ancestor. O(1), and it produces the
+  block-file granularity the archive format wants (see the schema notes).
+- **Deleting an entity that still has links is refused**, rather than cascading.
+  Safer, and it matches the fact that entarchy has no general entity delete
+  today. With link → link supported, the refusal walks a chain.
+- **Link endpoints are prefetched at collection level.** `link.linker` and
+  `link.linked` as per-link properties would be one entity load each; anything
+  iterating a `LinkCollection` needs them resolved in bulk.
+- **`link → link` is supported** (example 10), with endpoints constrained by kind
+  rather than entity type. The registry columns go in now, while the table is
+  being created; the filter syntax for addressing a link endpoint's attributes
+  waits for a real use.
+- **No `@` operator.** `ent.link(...)` is the only way to create a link. Creating
+  a database row from an operator is surprising, and `@` would collide with
+  matrix multiplication if entities ever gain array-like behaviour.
+- **All eleven example kinds are plausible for real use**, so the query language
+  is built up front rather than deferred — endpoint filters are what make links
+  worth having, and every example above depends on them.
 
-- Which of the examples above are real for your work in the next few months, and
-  which are speculative. That decides whether to build the full query syntax up
-  front or start with kind plus endpoint filters.
-- Whether cross-recording and cross-animal links (examples 4 and 5) need to work
-  across *entarchies*, or only within one. Across would be a substantially larger
-  design.
-- Whether you want `@` sugar at all, or prefer `ent.link(...)` to be the only way
-  to create one. Creating a database row from an operator is convenient but
-  surprising, and `@` collides with matrix multiplication if entities ever become
-  array-like.
+## Not in scope: links across entarchies
+
+Tempting for cross-animal or cross-experiment work, but it fails in five ways,
+in increasing order of severity:
+
+1. **No referential integrity.** `links` has a foreign key into `entities` in one
+   database. Across two, a dangling reference is undetectable until read, and the
+   delete guard above is blind to the far side.
+2. **No transactional consistency.** Two databases, no two-phase commit.
+3. **Backend heterogeneity.** One entarchy on SQLite and one on MySQL cannot be
+   joined at all.
+4. **The query engine would silently half-work.** `@Roi.has_receptive_field ==
+   True` compiles to a SQL subquery; if the endpoint lives elsewhere that is a
+   cross-database join — impossible on SQLite, and on MySQL only when both
+   schemas sit on one server with the right grants. A filter language that
+   behaves differently depending on deployment is worse than one that refuses.
+5. **It breaks archive self-containment.** A cross-entarchy link must name the
+   other entarchy: by path, which breaks on any move or copy, or by uuid plus a
+   discovery registry, which means archives need an external resolver. That
+   directly undoes the property the ASDF archive format was built to guarantee.
+
+The need behind the idea is real, and there are two better answers.
+
+**Put the animals in one entarchy.** The hierarchy already roots at Animal, so
+several animals in one entarchy is the intended design, and cross-animal links
+are then ordinary links. For entarchies that are already separate, the thing to
+build is a **merge tool** — uuid4 collisions are not a practical concern, and it
+is adjacent to the existing `import_archive` code. That converts a distributed
+reference problem into a one-time data operation.
+
+**Otherwise store the correspondence as a plain attribute**, and be explicit
+that it is a weak reference nothing enforces:
+
+```python
+roi['external_match'] = {'entarchy_uuid': '…', 'roi_uuid': '…', 'confidence': 0.9}
+```
+
+Honest about what it is, rather than dressed as a link and implying an integrity
+guarantee that does not exist.
+
+## Remaining questions
+
+- **Merge tool: wanted?** Only if per-experiment entarchies already exist that
+  need relating. If new work goes into one entarchy per project, this is moot.
+- **Does refusing deletion need an escape hatch** — a `delete_links=True` that
+  clears the chain — or is manual cleanup acceptable given how rarely entities
+  are deleted?
