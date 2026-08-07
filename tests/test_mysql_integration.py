@@ -532,6 +532,82 @@ class TestLinkSchema:
         assert populated.backend.count_links_of_type('mean_response') == 0
 
 
+class TestLinkWrites:
+    """Creating links against a real server.
+
+    The bulk path inserts entity and link rows through the core rather than the
+    ORM, so the statements it builds are dialect specific in a way the ORM
+    normally hides.
+    """
+
+    def test_single_link_round_trip(self, populated):
+        subject = populated.get(Subject)[0]
+        session_entity = populated.get(Session)[0]
+
+        with populated:
+            link = populated.link(subject, session_entity, 'mean_response',
+                                  mean_dff=0.42)
+
+        assert link.link_type == 'mean_response'
+        assert fresh_read(link, 'mean_dff') == 0.42
+        assert populated.get_link(subject, session_entity,
+                                  'mean_response').uuid == link.uuid
+
+    def test_bulk_write(self, populated):
+        subject = populated.get(Subject)[0]
+        sessions = list(populated.get(Session))
+
+        result = populated.link_from_frame(pd.DataFrame({
+            'linker_uuid': [subject.uuid] * len(sessions),
+            'linked_uuid': [s.uuid for s in sessions],
+            'mean_dff': [float(i) for i in range(len(sessions))],
+            'label': [f'row_{i}' for i in range(len(sessions))],
+        }), 'mean_response')
+
+        assert result.created == len(sessions)
+        assert populated.backend.count_links_of_type('mean_response') == len(sessions)
+
+        first = populated.get_link(subject, sessions[0], 'mean_response')
+        assert fresh_read(first, 'label') == 'row_0'
+
+    def test_bulk_write_is_idempotent(self, populated):
+        subject = populated.get(Subject)[0]
+        sessions = list(populated.get(Session))
+        frame = pd.DataFrame({'linker_uuid': [subject.uuid] * len(sessions),
+                              'linked_uuid': [s.uuid for s in sessions]})
+
+        populated.link_from_frame(frame, 'mean_response')
+        again = populated.link_from_frame(frame, 'mean_response')
+
+        assert again.created == 0
+        assert again.already_present == len(sessions)
+
+    def test_symmetric_links_store_once(self, populated):
+        sessions = list(populated.get(Session))
+        populated.define_link_type('correlated', Session, Session, symmetric=True)
+
+        with populated:
+            populated.link(sessions[0], sessions[1], 'correlated', r=0.9)
+            populated.link(sessions[1], sessions[0], 'correlated')
+
+        assert populated.backend.count_links_of_type('correlated') == 1
+        assert populated.get_link(sessions[1], sessions[0], 'correlated')['r'] == 0.9
+
+    def test_blob_attribute_on_a_link(self, populated):
+        """Links get the full attribute machinery, LONGBLOB included."""
+        subject = populated.get(Subject)[0]
+        session_entity = populated.get(Session)[0]
+
+        with populated:
+            link = populated.link(subject, session_entity, 'mean_response',
+                                  trace=np.arange(1000, dtype=np.float32))
+
+        restored = fresh_read(link, 'trace')
+        assert isinstance(restored, np.ndarray)
+        assert restored.dtype == np.float32
+        assert len(restored) == 1000
+
+
 @pytest.mark.slow
 class TestParallel:
 

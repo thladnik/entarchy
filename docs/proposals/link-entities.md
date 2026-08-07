@@ -1,7 +1,13 @@
 # Proposal: dynamic link entities
 
-Status: **schema and registry implemented**; the write API, `LinkCollection` and
-the query syntax are still proposals. Both prerequisites listed below are done.
+Status: **schema, registry and write API implemented**; `LinkCollection` and the
+query syntax are still proposals. Both prerequisites listed below are done.
+
+Bulk link creation measures **0.758 ms per link** (12,000 links with two
+attributes each, SQLite), so example 1's 120,000 links take about 1.5 minutes and
+1,467 bytes each. That is against 10.46 ms per entity when this started: the
+transaction batching took it to ~3 ms, and `link_from_frame` inserting through
+the core rather than the ORM took it the rest of the way.
 Measured against: entarchy at `559998a`, SQLite 3.40.1, MySQL 8.0.46, Windows 11 / Python 3.10
 
 ## Summary

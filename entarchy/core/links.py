@@ -24,12 +24,41 @@ CARDINALITIES = ('sparse', 'one_per_linker', 'dense')
 DEFAULT_CARDINALITY = 'sparse'
 
 
+# Writing more links than this in one call needs the count stated explicitly.
+#  A runaway pairwise write is quiet: the truly enormous case dies building the
+#  frame, but the middle of the range succeeds slowly and fills a disk.
+MAX_LINKS_WITHOUT_CONFIRMATION = 100_000
+
+# Fraction of the available pairs above which a 'sparse' kind is refused, and the
+#  size below which density is not worth checking at all.
+#
+# Density alone is a bad signal: a link from one recording to each of its five
+#  ROIs is 100% of the available pairs and entirely reasonable, and so is any
+#  small cross product. What makes a dense write worth refusing is that the
+#  per-link overhead becomes the dominant cost - roughly 2 kB against 4 bytes for
+#  the same value in a matrix - and that only matters once there are many of them.
+MAX_SPARSE_DENSITY = 0.5
+MIN_COUNT_FOR_DENSITY_CHECK = 10_000
+
+# Roughly what a link costs, measured at 1812 B on SQLite and 1956-2091 B on
+#  MySQL with a few attributes. Used only to describe a refused or dry-run write.
+APPROXIMATE_BYTES_PER_LINK = 2000
+
+
 class LinkError(RuntimeError):
     """Base for everything raised about links."""
 
 
 class LinkTypeError(LinkError):
     """A link does not match what its kind is declared to connect."""
+
+
+class LinkDensityError(LinkError):
+    """A write is dense enough that it should probably be a matrix."""
+
+
+class LinkCardinalityError(LinkError):
+    """A write would break the cardinality its kind declares."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,6 +174,75 @@ def canonical_pair(spec: LinkTypeSpec, linker_uuid: str, linked_uuid: str) -> tu
         return linked_uuid, linker_uuid
 
     return linker_uuid, linked_uuid
+
+
+@dataclasses.dataclass
+class LinkWriteResult:
+    """What a bulk link write did, or would have done for a dry run."""
+    link_type: str
+    requested: int = 0
+    created: int = 0
+    already_present: int = 0
+    duplicates_dropped: int = 0
+    dry_run: bool = False
+    link_uuids: list = dataclasses.field(default_factory=list)
+
+    @property
+    def estimated_bytes(self) -> int:
+        return self.created * APPROXIMATE_BYTES_PER_LINK
+
+    def __str__(self):
+        verb = 'would create' if self.dry_run else 'created'
+        parts = [f'{self.link_type}: {verb} {self.created} link(s) of {self.requested} '
+                 f'requested']
+        if self.already_present:
+            parts.append(f'{self.already_present} already present')
+        if self.duplicates_dropped:
+            parts.append(f'{self.duplicates_dropped} duplicate(s) in the input')
+        parts.append(f'~{self.estimated_bytes / 1024 ** 2:.1f} MB')
+
+        return ', '.join(parts)
+
+
+def check_write_size(spec: LinkTypeSpec, count: int, linker_count: int, linked_count: int,
+                     confirm_count: int = None) -> None:
+    """Refuse a write that looks like it forgot to be sparse.
+
+    Two separate guards. The count ceiling catches sheer volume and is cleared by
+    stating the number, so the caller has to have looked at it. The density check
+    catches a large write that is most of every possible pair, where the two
+    kilobytes an entity costs have swamped the four bytes of value it carries.
+
+    Density is only consulted once the write is large, because on its own it says
+    nothing: one recording linked to each of its five ROIs is 100% of the
+    available pairs and perfectly reasonable.
+    """
+    if confirm_count is not None and confirm_count != count:
+        raise LinkDensityError(
+            f'confirm_count={confirm_count} does not match the {count} link(s) this '
+            f'would write. Pass the actual number.')
+
+    if spec.cardinality != 'dense' and count >= MIN_COUNT_FOR_DENSITY_CHECK:
+        available = linker_count * linked_count
+        if available > 0:
+            density = count / available
+            if density > MAX_SPARSE_DENSITY:
+                raise LinkDensityError(
+                    f'This would write {count} links of "{spec.name}" between '
+                    f'{linker_count} and {linked_count} entities, which is '
+                    f'{density:.0%} of every possible pair. At that density the link '
+                    f'overhead dominates: about '
+                    f'{count * APPROXIMATE_BYTES_PER_LINK / 1024 ** 2:.0f} MB as links '
+                    f'against {available * 4 / 1024 ** 2:.1f} MB for the same values in '
+                    f'a float32 matrix on the nearest common ancestor. Links buy '
+                    f'queryability for that; if the trade is worth it here, declare the '
+                    f'kind with cardinality="dense".')
+
+    if confirm_count is None and count > MAX_LINKS_WITHOUT_CONFIRMATION:
+        raise LinkDensityError(
+            f'This would write {count} links of "{spec.name}", about '
+            f'{count * APPROXIMATE_BYTES_PER_LINK / 1024 ** 3:.1f} GB. If that is '
+            f'intended, pass confirm_count={count}.')
 
 
 def resolve_endpoint(value: Any, entity_type_names: set, link_type_names: set) -> Endpoint:

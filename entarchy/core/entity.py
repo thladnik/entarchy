@@ -223,22 +223,33 @@ class Entity(object):
         return res[0]
 
     def __matmul__(self, other) -> LinkEntity:
-        """Create a link entity between this entity and another entity.
+        """Not supported: a link needs its kind naming.
+
+        Deliberately left out. Creating a database row from an operator is
+        surprising, and a link between two entities is ambiguous whenever more
+        than one kind connects those types.
+        """
+        raise TypeError(
+            'Use entarchy.link(linker, linked, kind) to create a link. There is no @ '
+            'operator: a link has a kind, and two entities may be connected by several.')
+
+    def links(self, link_type: str = None, direction: str = 'both') -> list[LinkEntity]:
+        """The links touching this entity.
 
         Args:
-            other (Entity): The target entity to link to.
+            link_type: restrict to one kind, or None for all of them.
+            direction: 'out' for links where this entity is the linker, 'in' for
+                those where it is the linked end, 'both' by default. For a
+                symmetric kind the two are an artifact of uuid ordering, so only
+                'both' is meaningful there.
         """
+        return self.entarchy.get_links_for(self, link_type=link_type, direction=direction)
 
-        raise NotImplementedError('Links are not implemented yet.')
+    def link_types(self) -> list[str]:
+        """Which kinds of link touch this entity."""
+        rows = self.entarchy.backend.get_links_for_entity(self.uuid)
 
-        if not isinstance(other, Entity):
-            raise TypeError('Can only create link to another Entity instance.')
-
-        link_entity = LinkEntity(_entarchy=self.entarchy)
-
-        self.entarchy.add_new_entity(link_entity)
-
-        return link_entity
+        return sorted({row['link_type'] for row in rows})
 
     def __repr__(self):
         return f'{self.__class__.__name__}(id=\'{self.id}\' uuid=\'{self.uuid}\')'
@@ -485,8 +496,61 @@ class AnalysisEntity(Entity):
 
 
 class LinkEntity(Entity):
-    """Link entity between two entities
+    """A relationship between two entities, carrying data of its own.
+
+    Every link is a LinkEntity regardless of its kind, because kinds are data
+    rather than classes. `link_type` says which kind this one is; `linker` and
+    `linked` are its endpoints.
+
+    For a symmetric kind the two endpoints are stored in uuid order, so which is
+    which carries no meaning - use `other_end(entity)` rather than assuming.
     """
+
+    _link_row: dict = None
+
+    @property
+    def row(self) -> dict:
+        if self._link_row is None:
+            self._link_row = self.entarchy.backend.get_link_row(self.uuid)
+            if self._link_row is None:
+                raise RuntimeError(f'{self} has no link row. It may have been created '
+                                   f'as a plain entity rather than through Entarchy.link.')
+
+        return self._link_row
+
+    @property
+    def link_type(self) -> str:
+        return self.row['link_type']
+
+    @property
+    def linker(self) -> Entity:
+        return self.entarchy.get_entity_by_uuid(self.row['linker_uuid'])
+
+    @property
+    def linked(self) -> Entity:
+        return self.entarchy.get_entity_by_uuid(self.row['linked_uuid'])
+
+    def other_end(self, entity: Union[Entity, str]) -> Entity:
+        """The endpoint that is not the one given.
+
+        The way to traverse a symmetric link, where linker and linked are an
+        artifact of uuid ordering rather than meaning.
+        """
+        entity_uuid = entity if isinstance(entity, str) else entity.uuid
+
+        if entity_uuid == self.row['linker_uuid']:
+            return self.linked
+        if entity_uuid == self.row['linked_uuid']:
+            return self.linker
+
+        raise ValueError(f'{entity_uuid} is not an endpoint of {self}.')
+
+    def __repr__(self):
+        row = self._link_row
+        if row is None:
+            return f'LinkEntity(uuid=\'{self.uuid}\')'
+        return (f'LinkEntity({row["link_type"]}: {row["linker_uuid"][:8]} -> '
+                f'{row["linked_uuid"][:8]})')
 
 
 class Collection(object):

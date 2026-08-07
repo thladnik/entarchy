@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import inspect as _inspect
 import os
 import pathlib
 import pprint
 import sys
+import uuid
 from typing import Any, Callable, Type, TYPE_CHECKING, Union
 
 import alive_progress
@@ -71,7 +73,12 @@ class Entarchy(object):
         self._entities: dict[str, Entity] = {}
         self._entities_to_add: list[str] = []
         self._entities_to_update: list[str] = []
-        self._links: dict[tuple[str, str], str] = {}
+        # Link rows wait for their carrier entities to exist, so they are queued
+        #  and inserted between the entity insert and the attribute writes.
+        #  The index lets a second link() for the same pair inside one block find
+        #  the first, which is not yet in the database to be queried for.
+        self._links_to_add: list[dict] = []
+        self._pending_link_index: dict[tuple, str] = {}
 
 
     def __contains__(self, item):
@@ -103,6 +110,8 @@ class Entarchy(object):
         state['_entities'] = {}
         state['_entities_to_add'] = []
         state['_entities_to_update'] = []
+        state['_links_to_add'] = []
+        state['_pending_link_index'] = {}
         return state
 
     def __hash__(self):
@@ -377,6 +386,13 @@ class Entarchy(object):
                 # Reset list
                 self._entities_to_add = []
 
+            # Link rows reference their carrier entity, so they follow the insert
+            #  above and precede the attribute writes that hang off them
+            if len(self._links_to_add) > 0:
+                self.backend.add_links(self._links_to_add)
+                self._links_to_add = []
+                self._pending_link_index = {}
+
             # Commit updates for entities with attribute changes
             #  Note to future self: USE COPY, otherwise iterator is going to
             #  skip entries as tthe length of the list changes while updaed elements are removed
@@ -630,6 +646,145 @@ class Entarchy(object):
 
         return self.backend.add_link_type(spec)
 
+    def _endpoint_of(self, entity: Entity) -> links.Endpoint:
+        """What an entity is, for the purposes of a link constraint."""
+        if isinstance(entity, LinkEntity):
+            return links.Endpoint(link_type=entity.link_type)
+
+        return links.Endpoint(entity_type=type(entity).__name__)
+
+    def _link_spec_for_write(self, name: str, linker: links.Endpoint,
+                             linked: links.Endpoint) -> links.LinkTypeSpec:
+        """The kind, registering it from the endpoints if this is its first use."""
+        spec = self.backend.get_link_type(name)
+        if spec is not None:
+            return spec
+
+        if links.requires_direction_declaration(linker, linked):
+            raise links.LinkTypeError(
+                f'Link type "{name}" has not been defined, and both endpoints are '
+                f'{linker}, so its direction cannot be inferred. Define it first:\n'
+                f'    ent.define_link_type({name!r}, ..., symmetric=True)   # undirected\n'
+                f'    ent.define_link_type({name!r}, ..., symmetric=False)  # directed')
+
+        return self.define_link_type(name,
+                                     linker.link_type or linker.entity_type,
+                                     linked.link_type or linked.entity_type)
+
+    def link(self, linker: Entity, linked: Entity, link_type: str,
+             **attributes) -> LinkEntity:
+        """Connect two entities, and return the link that carries their data.
+
+        The kind is registered on first use from the endpoints it is given,
+        unless both ends are the same, where the direction has to be declared.
+
+            response = ent.link(phase, roi, 'mean_response')
+            response['mean_dff'] = 0.42
+
+        Getting the arguments the wrong way round is fine where the kind's
+        endpoint types differ, since there is then only one way it can be meant.
+
+        Calling this again for the same pair and kind returns the existing link
+        rather than failing, so re-running an analysis script is harmless.
+
+        Returns:
+            LinkEntity: the link, new or already present.
+        """
+        linker_endpoint = self._endpoint_of(linker)
+        linked_endpoint = self._endpoint_of(linked)
+
+        spec = self._link_spec_for_write(link_type, linker_endpoint, linked_endpoint)
+
+        if links.orientation(spec, linker_endpoint, linked_endpoint) == 'swapped':
+            linker, linked = linked, linker
+
+        linker_uuid, linked_uuid = links.canonical_pair(spec, linker.uuid, linked.uuid)
+
+        existing = self._existing_link_uuid(spec.name, linker_uuid, linked_uuid)
+        if existing is not None:
+            link_entity = self.get_entity('LinkEntity', existing, None)
+            if attributes:
+                link_entity.update(attributes)
+            return link_entity
+
+        if spec.cardinality == 'one_per_linker':
+            present = self.backend.count_links_per_linker(spec.name, [linker_uuid])
+            if present.get(linker_uuid, 0) > 0:
+                raise links.LinkCardinalityError(
+                    f'"{spec.name}" is declared one_per_linker and {linker_uuid} already '
+                    f'has one. Remove it first, or declare the kind sparse.')
+
+        link_entity = LinkEntity(self,
+                                 _id=f'{spec.name}@{linked_uuid}',
+                                 _parent=self.get_entity_by_uuid(linker_uuid))
+        self.add_new_entity(link_entity)
+
+        self._links_to_add.append({'link_uuid': link_entity.uuid,
+                                   'link_type': spec.name,
+                                   'linker_uuid': linker_uuid,
+                                   'linked_uuid': linked_uuid})
+        self._pending_link_index[(spec.name, linker_uuid, linked_uuid)] = link_entity.uuid
+
+        if attributes:
+            link_entity.update(attributes)
+
+        # Outside a context the entity was already committed by add_new_entity,
+        #  so the link row has to follow immediately
+        if not self.is_in_context:
+            self.commit()
+
+        return link_entity
+
+    def _existing_link_uuid(self, link_type: str, linker_uuid: str,
+                            linked_uuid: str) -> Union[str, None]:
+        """An existing link's uuid, whether committed or still queued.
+
+        Checking only the database would miss a link created earlier in the same
+        block, and creating a second carrier for the same pair violates the
+        uniqueness of (parent, entity type, id) on the entities table.
+        """
+        pending = self._pending_link_index.get((link_type, linker_uuid, linked_uuid))
+        if pending is not None:
+            return pending
+
+        return self.backend.find_link(link_type, linker_uuid, linked_uuid)
+
+    def get_link(self, linker: Entity, linked: Entity,
+                 link_type: str) -> Union[LinkEntity, None]:
+        """An existing link between two entities, or None."""
+        spec = self.backend.get_link_type(link_type)
+        if spec is None:
+            return None
+
+        linker_uuid, linked_uuid = links.canonical_pair(spec, linker.uuid, linked.uuid)
+        found = self._existing_link_uuid(link_type, linker_uuid, linked_uuid)
+
+        if found is None and not spec.symmetric and spec.endpoints_differ:
+            # Tolerate the arguments arriving the other way round, as link() does
+            found = self._existing_link_uuid(link_type, linked_uuid, linker_uuid)
+
+        if found is None:
+            return None
+
+        return self.get_entity('LinkEntity', found, None)
+
+    def get_links_for(self, entity: Entity, link_type: str = None,
+                      direction: str = 'both') -> list[LinkEntity]:
+        """Every link touching an entity."""
+        rows = self.backend.get_links_for_entity(entity.uuid, link_type=link_type,
+                                                 direction=direction)
+
+        return [self.get_entity('LinkEntity', row['link_uuid'], None) for row in rows]
+
+    def get_links(self, link_type: str) -> list[LinkEntity]:
+        """Every link of a kind.
+
+        A list for now; this becomes a queryable LinkCollection with the query
+        syntax, at which point filtering by endpoint attributes becomes possible.
+        """
+        return [self.get_entity('LinkEntity', row['link_uuid'], None)
+                for row in self.backend.get_links_of_type(link_type)]
+
     def get_link_type(self, name: str) -> Union[links.LinkTypeSpec, None]:
         """The registered kind, or None if it has never been defined."""
         return self.backend.get_link_type(name)
@@ -640,6 +795,204 @@ class Entarchy(object):
         Kinds are invented at runtime, so this is the only schema there is.
         """
         return self.backend.get_link_types()
+
+    def link_from_frame(self, df, link_type: str,
+                        confirm_count: int = None,
+                        dry_run: bool = False) -> links.LinkWriteResult:
+        """Create many links at once from a DataFrame.
+
+        The frame needs `linker_uuid` and `linked_uuid` columns; every other
+        column becomes an attribute of the link.
+
+            ent.link_from_frame(pd.DataFrame({
+                'linker_uuid': phase_uuids,
+                'linked_uuid': roi_uuids,
+                'mean_dff': values,
+            }), 'mean_response')
+
+        Pairs that already carry this kind are left alone, so re-running is
+        harmless. Refuses a write that is a large fraction of every possible pair
+        or simply enormous; see `check_write_size` for what clears each guard.
+
+        Returns:
+            links.LinkWriteResult: what was written, or would have been.
+        """
+        import pandas as pd
+
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError('link_from_frame needs a DataFrame.')
+
+        for column in ('linker_uuid', 'linked_uuid'):
+            if column not in df.columns:
+                raise ValueError(f'link_from_frame needs a "{column}" column; '
+                                 f'got {list(df.columns)}.')
+
+        result = links.LinkWriteResult(link_type=link_type, requested=len(df),
+                                       dry_run=dry_run)
+        if len(df) == 0:
+            return result
+
+        linker_uuids = [str(value) for value in df['linker_uuid']]
+        linked_uuids = [str(value) for value in df['linked_uuid']]
+
+        # What the endpoints actually are, so the kind can be registered or checked
+        kinds = self.backend.get_entity_kinds(linker_uuids + linked_uuids)
+        missing = [uuid for uuid in set(linker_uuids + linked_uuids) if uuid not in kinds]
+        if missing:
+            raise ValueError(f'{len(missing)} endpoint uuid(s) are not entities of this '
+                             f'entarchy, e.g. {missing[0]}.')
+
+        spec = self._link_spec_for_write(link_type, kinds[linker_uuids[0]],
+                                         kinds[linked_uuids[0]])
+
+        # Validate each distinct combination once rather than once per row
+        swap_by_pair = {}
+        for linker_kind, linked_kind in {(kinds[a], kinds[b])
+                                         for a, b in zip(linker_uuids, linked_uuids)}:
+            swap_by_pair[(linker_kind, linked_kind)] = links.orientation(
+                spec, linker_kind, linked_kind) == 'swapped'
+
+        pairs = []
+        for linker_uuid, linked_uuid in zip(linker_uuids, linked_uuids):
+            if swap_by_pair[(kinds[linker_uuid], kinds[linked_uuid])]:
+                linker_uuid, linked_uuid = linked_uuid, linker_uuid
+            pairs.append(links.canonical_pair(spec, linker_uuid, linked_uuid))
+
+        # Drop duplicates within the input, keeping the first occurrence
+        seen = {}
+        for index, pair in enumerate(pairs):
+            seen.setdefault(pair, index)
+        keep_indices = sorted(seen.values())
+        result.duplicates_dropped = len(pairs) - len(keep_indices)
+
+        unique_pairs = [pairs[index] for index in keep_indices]
+
+        already = self.backend.find_existing_pairs(spec.name, unique_pairs)
+        already |= {pair for pair in unique_pairs
+                    if (spec.name, pair[0], pair[1]) in self._pending_link_index}
+        fresh = [(index, pair) for index, pair in zip(keep_indices, unique_pairs)
+                 if pair not in already]
+        result.already_present = len(unique_pairs) - len(fresh)
+
+        links.check_write_size(spec, len(fresh),
+                               len({pair[0] for pair in unique_pairs}),
+                               len({pair[1] for pair in unique_pairs}),
+                               confirm_count=confirm_count)
+
+        if spec.cardinality == 'one_per_linker':
+            self._check_one_per_linker(spec, [pair for _, pair in fresh])
+
+        result.created = len(fresh)
+        if dry_run or len(fresh) == 0:
+            return result
+
+        self._write_links(spec, fresh, df, result)
+
+        return result
+
+    def _check_one_per_linker(self, spec, pairs) -> None:
+        wanted = [linker for linker, _ in pairs]
+        present = self.backend.count_links_per_linker(spec.name, wanted)
+
+        counts = {}
+        for linker in wanted:
+            counts[linker] = counts.get(linker, 0) + present.get(linker, 0) + 1
+
+        offenders = [linker for linker, count in counts.items() if count > 1]
+        if offenders:
+            raise links.LinkCardinalityError(
+                f'"{spec.name}" is declared one_per_linker, but this write would leave '
+                f'{len(offenders)} linker(s) with more than one, e.g. {offenders[0]}.')
+
+    def _write_links(self, spec, fresh, df, result) -> None:
+        """Insert carrier entities, link rows and attributes, in that order."""
+        import pandas as pd
+
+        link_uuids = [str(uuid.uuid4()) for _ in fresh]
+        result.link_uuids = link_uuids
+
+        entity_records = [
+            {'uuid': link_uuid, 'id': f'{spec.name}@{pair[1]}',
+             'parent_uuid': pair[0], 'entity_type_name': 'LinkEntity'}
+            for link_uuid, (_, pair) in zip(link_uuids, fresh)]
+
+        link_records = [
+            {'link_uuid': link_uuid, 'link_type': spec.name,
+             'linker_uuid': pair[0], 'linked_uuid': pair[1]}
+            for link_uuid, (_, pair) in zip(link_uuids, fresh)]
+
+        attribute_columns = [column for column in df.columns
+                             if column not in ('linker_uuid', 'linked_uuid')]
+
+        with self.backend.batch():
+            self.backend.add_entity_records(entity_records)
+            self.backend.add_links(link_records)
+
+            if attribute_columns:
+                source_rows = [index for index, _ in fresh]
+                attributes = pd.DataFrame(
+                    {column: df[column].iloc[source_rows].to_numpy()
+                     for column in attribute_columns},
+                    index=link_uuids)
+                self.backend.set_attributes_by_uuid(self, attributes)
+
+    def link_from_matrix(self, linkers, linkeds, matrix, link_type: str,
+                         where, value_name: str = 'value',
+                         confirm_count: int = None,
+                         dry_run: bool = False) -> links.LinkWriteResult:
+        """Create links from a pairwise matrix, keeping only what `where` selects.
+
+            r = np.corrcoef(traces)
+            ent.link_from_matrix(rois, rois, r, 'correlated',
+                                 where=lambda v: abs(v) > 0.6, value_name='r')
+
+        `where` is required rather than optional, which is the point of this
+        method: forgetting to threshold is how a pairwise result becomes millions
+        of rows, and a signature that cannot be called without one removes the
+        mistake instead of catching it afterwards.
+
+        For a symmetric kind over the same entities only the upper triangle is
+        considered, since each pair means one link.
+        """
+        import numpy as np
+        import pandas as pd
+
+        if where is None:
+            raise ValueError(
+                'link_from_matrix needs a "where" predicate or threshold. Storing every '
+                'pair is what makes a pairwise result unmanageable; if that really is '
+                'what you want, build the frame yourself and use link_from_frame.')
+
+        matrix = np.asarray(matrix)
+        linker_uuids = [item if isinstance(item, str) else item.uuid for item in linkers]
+        linked_uuids = [item if isinstance(item, str) else item.uuid for item in linkeds]
+
+        if matrix.shape != (len(linker_uuids), len(linked_uuids)):
+            raise ValueError(f'matrix is {matrix.shape} but there are '
+                             f'{len(linker_uuids)} linkers and {len(linked_uuids)} linked '
+                             f'entities.')
+
+        keep = where(matrix) if _accepts_array(where, matrix) else np.vectorize(where)(matrix)
+        keep = np.asarray(keep, dtype=bool)
+
+        spec = self.backend.get_link_type(link_type)
+        same_entities = linker_uuids == linked_uuids
+        if same_entities and (spec is None or spec.symmetric):
+            # Each unordered pair means one link, and the diagonal is not a pair
+            keep &= np.triu(np.ones_like(keep, dtype=bool), k=1)
+        elif same_entities:
+            np.fill_diagonal(keep, False)
+
+        rows, columns = np.nonzero(keep)
+
+        frame = pd.DataFrame({
+            'linker_uuid': [linker_uuids[row] for row in rows],
+            'linked_uuid': [linked_uuids[column] for column in columns],
+            value_name: matrix[rows, columns],
+        })
+
+        return self.link_from_frame(frame, link_type, confirm_count=confirm_count,
+                                    dry_run=dry_run)
 
     def redefine_link_type(self, name: str, *args, delete_existing: bool = False,
                            **kwargs) -> links.LinkTypeSpec:
@@ -762,3 +1115,13 @@ def digest_method(fun: Callable):
         return result
 
     return _digest_fun
+
+
+def _accepts_array(predicate, sample) -> bool:
+    """Whether a predicate handles a whole array rather than one value at a time."""
+    try:
+        result = predicate(sample)
+    except Exception:
+        return False
+
+    return getattr(result, 'shape', None) == sample.shape

@@ -1201,6 +1201,173 @@ class SQLBackend(Backend):
         with self.sql_session as session:
             return session.query(Link).filter(Link.link_type == name).count()
 
+    # Links
+
+    @_retry_on_operational_failure
+    def get_entity_kinds(self, uuids: list[str]) -> dict[str, Endpoint]:
+        """What each uuid is, as far as a link constraint is concerned.
+
+        An ordinary entity is its entity type; a link is its kind, because every
+        link carries the same entity type and so an entity type says nothing
+        useful about one.
+        """
+        kinds: dict[str, Endpoint] = {}
+        unique = list(dict.fromkeys(uuids))
+
+        with self.sql_session as session:
+            for start in range(0, len(unique), MAX_BOUND_PARAMETERS):
+                batch = unique[start:start + MAX_BOUND_PARAMETERS]
+
+                rows = (session.query(EntityTable.uuid, EntityTypeTable.name)
+                        .join(EntityTypeTable)
+                        .filter(EntityTable.uuid.in_(batch)).all())
+                for entity_uuid, type_name in rows:
+                    kinds[entity_uuid] = Endpoint(entity_type=type_name)
+
+                for link_uuid, link_type in (session.query(Link.link_uuid, Link.link_type)
+                                             .filter(Link.link_uuid.in_(batch)).all()):
+                    kinds[link_uuid] = Endpoint(link_type=link_type)
+
+        return kinds
+
+    @_retry_on_operational_failure
+    def add_entity_records(self, records: list[dict]) -> int:
+        """Insert entity rows straight from dicts, bypassing the ORM.
+
+        `add_entities` goes through the unit of work, which costs roughly 3 ms an
+        entity in ORM overhead once the per-entity commit is gone. Bulk link
+        creation writes far too many for that, and its rows are plain data rather
+        than Entity objects, so it inserts through the core instead.
+
+        Each record needs uuid, id, parent_uuid and entity_type_name.
+        """
+        if len(records) == 0:
+            return 0
+
+        with self._write_session() as session:
+            type_pks = self._entity_type_pks(session)
+
+            rows = []
+            for record in records:
+                type_name = record['entity_type_name']
+                if type_name not in type_pks:
+                    raise ValueError(f'Unknown entity type "{type_name}".')
+
+                rows.append({'uuid': record['uuid'], 'id': record['id'],
+                             'parent_uuid': record['parent_uuid'],
+                             'entity_type_pk': type_pks[type_name],
+                             'created': datetime.datetime.now(),
+                             'modified': datetime.datetime.now()})
+
+            for chunk in _chunk_by_bound_parameters(rows, len(EntityTable.__table__.columns)):
+                session.execute(sqlalchemy.insert(EntityTable), chunk)
+
+            self._commit(session)
+
+        return len(rows)
+
+    @_retry_on_operational_failure
+    def add_links(self, records: list[dict]) -> int:
+        """Insert link rows. The carrier entities must already exist."""
+        if len(records) == 0:
+            return 0
+
+        with self._write_session() as session:
+            for chunk in _chunk_by_bound_parameters(records, len(Link.__table__.columns)):
+                session.execute(sqlalchemy.insert(Link), chunk)
+            self._commit(session)
+
+        return len(records)
+
+    @_retry_on_operational_failure
+    def get_link_row(self, link_uuid: str) -> Union[dict, None]:
+        with self.sql_session as session:
+            row = session.get(Link, link_uuid)
+            if row is None:
+                return None
+
+            return {'link_uuid': row.link_uuid, 'link_type': row.link_type,
+                    'linker_uuid': row.linker_uuid, 'linked_uuid': row.linked_uuid}
+
+    @_retry_on_operational_failure
+    def find_link(self, link_type: str, linker_uuid: str, linked_uuid: str) -> Union[str, None]:
+        """The uuid of an existing link, or None."""
+        with self.sql_session as session:
+            row = (session.query(Link.link_uuid)
+                   .filter(Link.link_type == link_type,
+                           Link.linker_uuid == linker_uuid,
+                           Link.linked_uuid == linked_uuid).one_or_none())
+
+            return row[0] if row is not None else None
+
+    @_retry_on_operational_failure
+    def find_existing_pairs(self, link_type: str, pairs: list[tuple]) -> set:
+        """Which of these (linker, linked) pairs already carry this kind."""
+        if len(pairs) == 0:
+            return set()
+
+        linkers = list({linker for linker, _ in pairs})
+        found = set()
+
+        with self.sql_session as session:
+            wanted = set(pairs)
+            for start in range(0, len(linkers), MAX_BOUND_PARAMETERS):
+                batch = linkers[start:start + MAX_BOUND_PARAMETERS]
+                for linker, linked in (session.query(Link.linker_uuid, Link.linked_uuid)
+                                       .filter(Link.link_type == link_type,
+                                               Link.linker_uuid.in_(batch)).all()):
+                    if (linker, linked) in wanted:
+                        found.add((linker, linked))
+
+        return found
+
+    @_retry_on_operational_failure
+    def get_links_for_entity(self, entity_uuid: str, link_type: str = None,
+                             direction: str = 'both') -> list[dict]:
+        """Every link touching an entity, in either or one direction."""
+        with self.sql_session as session:
+            query = session.query(Link)
+
+            if direction == 'out':
+                query = query.filter(Link.linker_uuid == entity_uuid)
+            elif direction == 'in':
+                query = query.filter(Link.linked_uuid == entity_uuid)
+            else:
+                query = query.filter(sqlalchemy.or_(Link.linker_uuid == entity_uuid,
+                                                    Link.linked_uuid == entity_uuid))
+
+            if link_type is not None:
+                query = query.filter(Link.link_type == link_type)
+
+            return [{'link_uuid': row.link_uuid, 'link_type': row.link_type,
+                     'linker_uuid': row.linker_uuid, 'linked_uuid': row.linked_uuid}
+                    for row in query.order_by(Link.link_uuid).all()]
+
+    @_retry_on_operational_failure
+    def get_links_of_type(self, link_type: str) -> list[dict]:
+        with self.sql_session as session:
+            return [{'link_uuid': row.link_uuid, 'link_type': row.link_type,
+                     'linker_uuid': row.linker_uuid, 'linked_uuid': row.linked_uuid}
+                    for row in session.query(Link).filter(
+                        Link.link_type == link_type).order_by(Link.link_uuid).all()]
+
+    @_retry_on_operational_failure
+    def count_links_per_linker(self, link_type: str, linker_uuids: list[str]) -> dict[str, int]:
+        """How many links of a kind each linker already has."""
+        counts: dict[str, int] = {}
+        unique = list(dict.fromkeys(linker_uuids))
+
+        with self.sql_session as session:
+            for start in range(0, len(unique), MAX_BOUND_PARAMETERS):
+                batch = unique[start:start + MAX_BOUND_PARAMETERS]
+                rows = (session.query(Link.linker_uuid, sqlalchemy.func.count())
+                        .filter(Link.link_type == link_type, Link.linker_uuid.in_(batch))
+                        .group_by(Link.linker_uuid).all())
+                for linker_uuid, count in rows:
+                    counts[linker_uuid] = int(count)
+
+        return counts
+
     @_retry_on_operational_failure
     def remove_links_of_type(self, name: str) -> int:
         """Delete every link of a kind, and the entities carrying them."""
@@ -1446,13 +1613,20 @@ class SQLBackend(Backend):
 
         return df
 
-    @_retry_on_operational_failure
     def set_collection_attributes(self, _collection: Collection, df: pd.DataFrame) -> None:
+        self.set_attributes_by_uuid(_collection.entarchy, df)
+
+    @_retry_on_operational_failure
+    def set_attributes_by_uuid(self, ent: Entarchy, df: pd.DataFrame) -> None:
+        """Write attributes for entities addressed by uuid.
+
+        The rows are identified by the frame's index, so this needs no
+        collection - which is what lets links use the same bulk path, since a
+        freshly created set of links is not a query result.
+        """
 
         if df.empty or len(df.columns) == 0:
             return
-
-        ent = _collection.entarchy
 
         _dtypes = ['str', 'float', 'int', 'date', 'datetime', 'bool', 'blob']
 
@@ -1536,10 +1710,10 @@ class SQLBackend(Backend):
                 def _serialize_blob(series: pd.Series) -> Serializer:
                     ser = Serializer()
                     ser.serialize(series[attr_name],
-                                  _collection.entarchy.path,
+                                  ent.path,
                                   series['entity_uuid'],
                                   attr_name,
-                                  _collection.entarchy.max_blob_size)
+                                  ent.max_blob_size)
                     return ser
 
                 # Apply to each row
