@@ -160,3 +160,63 @@ class TestLargeCollectionWrites:
         times = [wide.backend.get_entity_modified_time(rois[i])
                  for i in range(0, LARGE, LARGE // 10)]
         assert all(time is not None for time in times)
+
+
+class TestCollectionReads:
+    """Reading attributes back out of a large collection.
+
+    `dataframe_of` used to hang here. `EntityTable.uuid.in_(query.subquery()
+    .primary_key)` looks like a membership test against the collection but is
+    not: primary_key is a collection of Column objects, so the subquery lands in
+    the FROM clause and the comparison runs per combined row - a cartesian
+    product. Small fixtures hid it; 27 000 entities against 713 000 attribute
+    rows did not finish in nine minutes.
+    """
+
+    def test_uuid_subquery_is_a_select(self, wide):
+        """Not a column collection, which is what caused the cross join."""
+        import sqlalchemy
+        from sqlalchemy.orm import Session as SASession
+
+        from entarchy.backend.sql import _build_query_from_collection, _uuids_of
+
+        with SASession(wide.backend.sql_engine) as session:
+            query = _build_query_from_collection(wide.get(Roi), session)
+            selected = _uuids_of(query)
+
+        assert isinstance(selected, sqlalchemy.Selectable)
+        assert 'SELECT' in str(selected).upper()
+
+    def test_generated_sql_uses_a_subquery_not_a_cross_join(self, wide):
+        import sqlalchemy
+        from sqlalchemy.orm import Session as SASession
+
+        from entarchy.backend.sql import (AttributeTable, EntityTable,
+                                          _build_query_from_collection, _uuids_of)
+
+        with SASession(wide.backend.sql_engine) as session:
+            query = _build_query_from_collection(wide.get(Roi), session)
+            statement = str(session.query(AttributeTable.name)
+                            .join(EntityTable)
+                            .filter(EntityTable.uuid.in_(_uuids_of(query))))
+
+        assert 'IN (SELECT' in statement
+        # The cross join rendered the subquery into FROM, next to a comma
+        from_clause = statement.split('WHERE')[0]
+        assert '), (SELECT' not in from_clause
+        assert ', (SELECT' not in from_clause
+
+    def test_dataframe_of_over_the_whole_collection(self, wide):
+        wide.get(Roi).update(pd.DataFrame(
+            {'read_index': range(LARGE), 'read_label': [f'r{i}' for i in range(LARGE)]},
+            index=_uuids(wide)))
+
+        frame = wide.get(Roi).dataframe_of(['read_index', 'read_label'])
+
+        assert frame.shape == (LARGE, 2)
+        assert sorted(frame['read_index'].tolist()) == list(range(LARGE))
+
+    def test_attribute_names_over_the_whole_collection(self, wide):
+        names = wide.backend.get_collection_attribute_names(wide.get(Roi))
+
+        assert 'id' in names and 'uuid' in names

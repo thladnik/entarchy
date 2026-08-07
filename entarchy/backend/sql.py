@@ -710,6 +710,25 @@ def _chunk_by_bound_parameters(records: list[dict], columns: int):
         yield records[start:start + rows_per_statement]
 
 
+def _uuids_of(entity_query: sqlalchemy.orm.Query):
+    """A subquery selecting a collection's entity uuids, for use with IN.
+
+    Passing `query.subquery().primary_key` to `in_()` looks right but is not: it
+    is a collection of Column objects, so SQLAlchemy renders the subquery into
+    the FROM clause and compares against its column - a cartesian product, with
+    a membership test per combined row:
+
+        FROM attributes JOIN entities ON ..., (SELECT ...) AS anon_1
+        WHERE entities.uuid IN (anon_1.uuid)
+
+    With 713 000 attribute rows and 27 000 entities that is 1.9e10 combinations,
+    which never finished. Small fixtures hid it completely.
+    """
+    subquery = entity_query.subquery()
+
+    return sqlalchemy.select(subquery.c.uuid)
+
+
 def _value_columns(value: Any) -> list:
     """The attribute columns a filter literal could match.
 
@@ -1664,7 +1683,7 @@ class SQLBackend(Backend):
             # Get attribute types for requested names
             attribute_query = (session.query(AttributeTable.name)
                                .join(EntityTable)
-                               .filter(EntityTable.uuid.in_(entity_query.subquery().primary_key))
+                               .filter(EntityTable.uuid.in_(_uuids_of(entity_query)))
                                .distinct())
 
             names = [row.name for row in attribute_query.all()]
@@ -1682,11 +1701,17 @@ class SQLBackend(Backend):
             # Get entity query for collection
             entity_query = _build_query_from_collection(_collection, session)
 
-            # Get attribute types for requested names
+            # Get attribute types for requested names.
+            #  Restricted to those names: the result is only ever read for them,
+            #  and without it this scans every attribute row of every entity in
+            #  the collection. On 27 000 entities with 21 attributes each that is
+            #  700 000 rows against a 27 000 row IN list, which SQLite does not
+            #  turn into anything usable - it ran for over nine minutes.
             attribute_types = {}
             distinct_attribute_query = (session.query(AttributeTable.name, AttributeTable.data_type)
+                                        .filter(AttributeTable.name.in_(names))
                                         .join(EntityTable)
-                                        .filter(EntityTable.uuid.in_(entity_query.subquery().primary_key))
+                                        .filter(EntityTable.uuid.in_(_uuids_of(entity_query)))
                                         .join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
                                         .distinct())
 
@@ -1742,7 +1767,7 @@ class SQLBackend(Backend):
                     *cases
                 )
                 .join(AttributeTable, EntityTable.uuid == AttributeTable.entity_uuid)
-                .filter(EntityTable.uuid.in_(entity_query.subquery().primary_key))
+                .filter(EntityTable.uuid.in_(_uuids_of(entity_query)))
                 .group_by(EntityTable.uuid, EntityTable.id)
             )
 

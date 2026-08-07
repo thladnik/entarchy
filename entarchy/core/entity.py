@@ -222,17 +222,6 @@ class Entity(object):
             return res
         return res[0]
 
-    def __matmul__(self, other) -> LinkEntity:
-        """Not supported: a link needs its kind naming.
-
-        Deliberately left out. Creating a database row from an operator is
-        surprising, and a link between two entities is ambiguous whenever more
-        than one kind connects those types.
-        """
-        raise TypeError(
-            'Use entarchy.link(linker, linked, kind) to create a link. There is no @ '
-            'operator: a link has a kind, and two entities may be connected by several.')
-
     def links(self, link_type: str = None, direction: str = 'both') -> list[LinkEntity]:
         """The links touching this entity.
 

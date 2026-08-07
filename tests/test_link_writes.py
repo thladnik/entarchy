@@ -294,10 +294,11 @@ class TestReading:
 
         assert ent.get_link(recording, rois[0], 'never_defined') is None
 
-    def test_matmul_points_at_the_method(self, wired):
+    def test_there_is_no_matmul_operator(self, wired):
+        """Links are created by name, not by an operator; @ is left unimplemented."""
         ent, recording, rois = wired
 
-        with pytest.raises(TypeError, match='entarchy.link'):
+        with pytest.raises(TypeError, match='unsupported operand'):
             recording @ rois[0]
 
 
