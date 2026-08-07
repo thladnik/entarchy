@@ -98,6 +98,33 @@ def deep(tmp_path):
     e.backend.close()
 
 
+def make_link_row(ent, link_type, linker_uuid, linked_uuid, link_uuid=None):
+    """Insert a link and its carrier entity directly, without the write API.
+
+    The creation API comes with the link write path; until then tests exercise
+    the schema through plain inserts.
+    """
+    import uuid as uuid_module
+
+    from sqlalchemy.orm import Session as SASession
+
+    from entarchy.backend.sql import EntityTable, EntityTypeTable, Link
+
+    link_uuid = link_uuid or str(uuid_module.uuid4())
+
+    with SASession(ent.backend.sql_engine) as session:
+        link_entity_pk = session.query(EntityTypeTable).filter(
+            EntityTypeTable.name == 'LinkEntity').one().pk
+
+        session.add(EntityTable(uuid=link_uuid, id=f'{link_type}@{linked_uuid}',
+                                parent_uuid=linker_uuid, entity_type_pk=link_entity_pk))
+        session.add(Link(link_uuid=link_uuid, link_type=link_type,
+                         linker_uuid=linker_uuid, linked_uuid=linked_uuid))
+        session.commit()
+
+    return link_uuid
+
+
 @pytest.fixture()
 def populated(ent):
     with ent:

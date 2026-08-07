@@ -451,6 +451,87 @@ class TestDatetimePrecisionMigration:
         assert 'full precision already' in capsys.readouterr().out
 
 
+class TestLinkSchema:
+    """The link tables against a real server.
+
+    Worth its own coverage because MySQL rejects things SQLite accepts: index
+    key lengths (utf8mb4 counts four bytes per character, against a 3072 byte
+    InnoDB limit), and self-referential foreign keys of the kind link_types
+    carries for link endpoints.
+    """
+
+    def test_tables_are_created(self, ent):
+        from sqlalchemy import inspect
+
+        tables = set(inspect(ent.backend.sql_engine).get_table_names())
+
+        assert 'links' in tables
+        assert 'link_types' in tables
+
+    def test_indexes_fit_the_key_length_limit(self, ent):
+        """The composite unique index is the one at risk."""
+        from sqlalchemy import inspect
+
+        indexes = inspect(ent.backend.sql_engine).get_indexes('links')
+        names = {index['name'] for index in indexes}
+
+        assert 'ix_unique_link_per_type_and_pair' in names
+        assert 'ix_link_reverse' in names
+
+    def test_define_and_read_back(self, ent):
+        ent.define_link_type('mean_response', Subject, Session,
+                             description='trial-averaged response')
+
+        spec = ent.get_link_type('mean_response')
+        assert spec.linker.entity_type == 'Subject'
+        assert spec.linked.entity_type == 'Session'
+        assert spec.description == 'trial-averaged response'
+
+    def test_self_referential_endpoint(self, ent):
+        """link_types.linker_link_type points back at link_types.name."""
+        ent.define_link_type('mean_response', Subject, Session)
+        ent.define_link_type('adaptation', 'mean_response', 'mean_response',
+                             symmetric=False)
+
+        spec = ent.get_link_type('adaptation')
+        assert spec.linker.link_type == 'mean_response'
+
+    def test_symmetric_and_cardinality_persist(self, ent):
+        ent.define_link_type('correlated', Session, Session, symmetric=True,
+                             cardinality='one_per_linker')
+
+        spec = ent.get_link_type('correlated')
+        assert spec.symmetric is True
+        assert spec.cardinality == 'one_per_linker'
+
+    def test_a_pair_may_carry_several_kinds(self, populated):
+        from conftest import make_link_row
+
+        populated.define_link_type('mean_response', Subject, Session)
+        populated.define_link_type('peak_latency', Subject, Session)
+
+        subject = populated.get(Subject)[0]
+        session_entity = populated.get(Session)[0]
+        make_link_row(populated, 'mean_response', subject.uuid, session_entity.uuid)
+        make_link_row(populated, 'peak_latency', subject.uuid, session_entity.uuid)
+
+        assert populated.backend.count_links_of_type('mean_response') == 1
+        assert populated.backend.count_links_of_type('peak_latency') == 1
+
+    def test_removing_links_removes_their_carriers(self, populated):
+        from conftest import make_link_row
+
+        populated.define_link_type('mean_response', Subject, Session)
+        subject = populated.get(Subject)[0]
+        for session_entity in populated.get(Session):
+            make_link_row(populated, 'mean_response', subject.uuid, session_entity.uuid)
+
+        removed = populated.backend.remove_links_of_type('mean_response')
+
+        assert removed == 6
+        assert populated.backend.count_links_of_type('mean_response') == 0
+
+
 @pytest.mark.slow
 class TestParallel:
 

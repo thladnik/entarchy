@@ -47,13 +47,19 @@ from sqlalchemy.orm import Session
 
 from ..backend import asdf_store
 from ..backend.archive import BLOCK_DIR, INDEX_NAME, META_NAME
-from ..backend.sql import AttributeTable, Base, EntityTable, EntityTypeTable, Link, Serializer
+from ..backend.sql import (AttributeTable, Base, EntityTable, EntityTypeTable, Link,
+                          LinkTypeTable, Serializer)
 
 ARCHIVE_FORMAT_VERSION = 1
 
 # Column groups copied verbatim between the index and meta.asdf
 _ENTITY_COLUMNS = ['uuid', 'parent_uuid', 'entity_type_pk', 'id', 'created', 'modified']
-_LINK_COLUMNS = ['linker_uuid', 'linked_uuid', 'entity_uuid', 'created', 'modified']
+_LINK_COLUMNS = ['link_uuid', 'link_type', 'linker_uuid', 'linked_uuid', 'created', 'modified']
+
+# Without these an archive would carry links whose meaning had been lost
+_LINK_TYPE_COLUMNS = ['name', 'linker_type_pk', 'linker_link_type', 'linked_type_pk',
+                      'linked_link_type', 'symmetric', 'cardinality', 'description',
+                      'created']
 _ATTRIBUTE_COLUMNS = ['entity_uuid', 'analysis_uuid', 'name', 'value_str', 'value_int',
                       'value_float', 'value_bool', 'value_date', 'value_datetime',
                       'data_type', 'data_size', 'float_is_nan', 'float_is_inf', 'mutable',
@@ -66,9 +72,13 @@ _COLUMN_KINDS = {
     'uuid': 'str', 'parent_uuid': 'str', 'entity_uuid': 'str', 'analysis_uuid': 'str',
     'linker_uuid': 'str', 'linked_uuid': 'str', 'id': 'str', 'name': 'str',
     'value_str': 'str', 'data_type': 'str',
+    'link_uuid': 'str', 'link_type': 'str', 'linker_link_type': 'str',
+    'linked_link_type': 'str', 'cardinality': 'str', 'description': 'str',
     'entity_type_pk': 'int', 'value_int': 'int', 'data_size': 'int',
+    'linker_type_pk': 'int', 'linked_type_pk': 'int',
     'value_float': 'float',
     'value_bool': 'bool', 'float_is_nan': 'bool', 'float_is_inf': 'bool', 'mutable': 'bool',
+    'symmetric': 'bool',
     'created': 'datetime', 'modified': 'datetime', 'value_datetime': 'datetime',
     'value_date': 'date',
 }
@@ -289,9 +299,15 @@ def _export(source_ent, destination, collection, compression, meta_compression, 
         uuids = {row['uuid'] for row in entity_rows}
         stats['entities'] = len(entity_rows)
 
+        # Link kinds are copied whole, so an archive explains its links even when
+        #  only a subtree of entities was exported
+        link_type_rows = [{column: getattr(row, column) for column in _LINK_TYPE_COLUMNS}
+                          for row in session.query(LinkTypeTable).all()]
+
         link_rows = [{column: getattr(row, column) for column in _LINK_COLUMNS}
                      for row in session.query(Link).all()
-                     if row.linker_uuid in uuids and row.linked_uuid in uuids]
+                     if row.linker_uuid in uuids and row.linked_uuid in uuids
+                     and row.link_uuid in uuids]
 
         # Group entities by parent. Block files follow the same grouping map_async
         #  uses for worker locality, so reading a recording touches one file.
@@ -338,6 +354,8 @@ def _export(source_ent, destination, collection, compression, meta_compression, 
     with index_engine.begin() as connection:
         if len(type_rows) > 0:
             connection.execute(sqlalchemy.insert(EntityTypeTable), type_rows)
+        if len(link_type_rows) > 0:
+            connection.execute(sqlalchemy.insert(LinkTypeTable), link_type_rows)
         if len(entity_rows) > 0:
             connection.execute(sqlalchemy.insert(EntityTable), entity_rows)
         if len(link_rows) > 0:
@@ -362,6 +380,7 @@ def _export(source_ent, destination, collection, compression, meta_compression, 
                                                 for row in type_rows], dtype=np.int64),
                          'name': np.array([row['name'] for row in type_rows], dtype=np.str_)},
         'entities': _table_to_tree(entity_rows, _ENTITY_COLUMNS),
+        'link_types': _table_to_tree(link_type_rows, _LINK_TYPE_COLUMNS),
         'links': _table_to_tree(link_rows, _LINK_COLUMNS),
         'attributes': _table_to_tree(attribute_rows, _ATTRIBUTE_COLUMNS),
         'attribute_blobs': _blob_pointer_tree(attribute_rows),
@@ -559,6 +578,9 @@ def rebuild_index(archive_path: str, verbose: bool = True) -> int:
                                                  type_tree['name'])]
 
         entity_rows = _tree_to_table(handle['entities'], _ENTITY_COLUMNS)
+        # Archives written before link types existed have no such entry
+        link_type_rows = (_tree_to_table(handle['link_types'], _LINK_TYPE_COLUMNS)
+                          if 'link_types' in handle else [])
         link_rows = _tree_to_table(handle['links'], _LINK_COLUMNS)
         attribute_rows = _tree_to_table(handle['attributes'], _ATTRIBUTE_COLUMNS)
 
@@ -587,6 +609,8 @@ def rebuild_index(archive_path: str, verbose: bool = True) -> int:
     with engine.begin() as connection:
         if len(type_rows) > 0:
             connection.execute(sqlalchemy.insert(EntityTypeTable), type_rows)
+        if len(link_type_rows) > 0:
+            connection.execute(sqlalchemy.insert(LinkTypeTable), link_type_rows)
         if len(entity_rows) > 0:
             connection.execute(sqlalchemy.insert(EntityTable), entity_rows)
         if len(link_rows) > 0:

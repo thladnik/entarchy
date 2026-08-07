@@ -625,6 +625,73 @@ class TestParallelReads:
                                    _worker_num=2, _calibrate=False)
 
 
+class TestLinksInArchives:
+    """An archive carrying links must carry what they mean, too."""
+
+    @pytest.fixture()
+    def with_links(self, source):
+        from conftest import make_link_row
+
+        source.define_link_type('mean_response', Layer, Roi,
+                                description='trial-averaged response')
+        source.define_link_type('correlated', Roi, Roi, symmetric=True,
+                                cardinality='sparse')
+
+        layer = sorted(source.get(Layer), key=lambda e: e.uuid)[0]
+        rois = sorted(source.get(Roi), key=lambda e: e.uuid)
+        make_link_row(source, 'mean_response', layer.uuid, rois[0].uuid)
+        make_link_row(source, 'correlated', rois[0].uuid, rois[1].uuid)
+
+        return source
+
+    def test_link_types_survive_export(self, with_links, tmp_path):
+        destination = (tmp_path / 'linked_archive').as_posix()
+        archive_tool.export(with_links, destination, verbose=False)
+
+        ent = DeepArchy(destination)
+        try:
+            names = [spec.name for spec in ent.link_types()]
+            assert names == ['correlated', 'mean_response']
+
+            spec = ent.get_link_type('mean_response')
+            assert spec.linker.entity_type == 'Layer'
+            assert spec.linked.entity_type == 'Roi'
+            assert spec.description == 'trial-averaged response'
+            assert ent.get_link_type('correlated').symmetric is True
+        finally:
+            ent.backend.close()
+            asdf_store.close_asdf_files()
+
+    def test_links_survive_export(self, with_links, tmp_path):
+        destination = (tmp_path / 'linked_archive_rows').as_posix()
+        archive_tool.export(with_links, destination, verbose=False)
+
+        ent = DeepArchy(destination)
+        try:
+            assert ent.backend.count_links_of_type('mean_response') == 1
+            assert ent.backend.count_links_of_type('correlated') == 1
+        finally:
+            ent.backend.close()
+            asdf_store.close_asdf_files()
+
+    def test_link_types_survive_an_index_rebuild(self, with_links, tmp_path):
+        """meta.asdf is the source of truth, so it must hold them too."""
+        destination = (tmp_path / 'linked_rebuild').as_posix()
+        archive_tool.export(with_links, destination, verbose=False)
+
+        os.remove(os.path.join(destination, INDEX_NAME))
+        archive_tool.rebuild_index(destination, verbose=False)
+
+        ent = DeepArchy(destination)
+        try:
+            assert ent.get_link_type('mean_response').linked.entity_type == 'Roi'
+            assert ent.get_link_type('correlated').symmetric is True
+            assert ent.backend.count_links_of_type('mean_response') == 1
+        finally:
+            ent.backend.close()
+            asdf_store.close_asdf_files()
+
+
 class TestSubsetExport:
 
     def test_collection_export_includes_ancestors(self, source, tmp_path):

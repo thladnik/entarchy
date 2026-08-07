@@ -11,6 +11,7 @@ import alive_progress
 import yaml
 
 from . import console
+from . import links
 from . import query
 from .entity import AnalysisEntity, Collection, EntarchyEntity, Entity, LinkEntity
 
@@ -580,6 +581,87 @@ class Entarchy(object):
                   f'kept {len(pending)} with uncommitted changes')
 
         return len(released)
+
+    def define_link_type(self,
+                         name: str,
+                         linker: Any = None,
+                         linked: Any = None,
+                         symmetric: bool = None,
+                         cardinality: str = links.DEFAULT_CARDINALITY,
+                         description: str = None) -> links.LinkTypeSpec:
+        """Register a kind of link and what it may connect.
+
+        Endpoints are given as entity classes, entity type names, the name of an
+        already registered link type (for a link between links), or None for a
+        deliberate wildcard.
+
+            ent.define_link_type('mean_response', Phase, Roi,
+                                 description='trial-averaged dF/F during the phase')
+            ent.define_link_type('correlated', Roi, Roi, symmetric=True)
+            ent.define_link_type('adaptation', 'mean_response', 'mean_response')
+
+        `symmetric` only has to be given when both endpoints are the same, since
+        otherwise the endpoint types already say which end is which.
+
+        Returns:
+            links.LinkTypeSpec: the registered kind.
+        """
+        entity_type_names = set(self._entity_map)
+        link_type_names = {spec.name for spec in self.backend.get_link_types()}
+
+        linker_endpoint = links.resolve_endpoint(linker, entity_type_names, link_type_names)
+        linked_endpoint = links.resolve_endpoint(linked, entity_type_names, link_type_names)
+
+        if symmetric is None:
+            if links.requires_direction_declaration(linker_endpoint, linked_endpoint):
+                raise links.LinkTypeError(
+                    f'Link type "{name}" connects {linker_endpoint} to {linked_endpoint}, '
+                    f'so the endpoint types cannot say which end is which. Pass '
+                    f'symmetric=True for an undirected relationship, or symmetric=False '
+                    f'to keep the two directions distinct.')
+            symmetric = False
+
+        spec = links.LinkTypeSpec(name=name,
+                                  linker=linker_endpoint,
+                                  linked=linked_endpoint,
+                                  symmetric=symmetric,
+                                  cardinality=cardinality,
+                                  description=description)
+
+        return self.backend.add_link_type(spec)
+
+    def get_link_type(self, name: str) -> Union[links.LinkTypeSpec, None]:
+        """The registered kind, or None if it has never been defined."""
+        return self.backend.get_link_type(name)
+
+    def link_types(self) -> list[links.LinkTypeSpec]:
+        """Every registered link kind.
+
+        Kinds are invented at runtime, so this is the only schema there is.
+        """
+        return self.backend.get_link_types()
+
+    def redefine_link_type(self, name: str, *args, delete_existing: bool = False,
+                           **kwargs) -> links.LinkTypeSpec:
+        """Replace a link kind's definition.
+
+        Refuses while links of that kind exist, since they were written against
+        the old constraints and may not satisfy the new ones. Pass
+        delete_existing=True to drop them first.
+        """
+        existing_count = self.backend.count_links_of_type(name)
+        if existing_count > 0 and not delete_existing:
+            raise links.LinkTypeError(
+                f'{existing_count} link(s) of type "{name}" exist and were written '
+                f'against its current definition. Pass delete_existing=True to remove '
+                f'them and redefine it.')
+
+        if existing_count > 0:
+            self.backend.remove_links_of_type(name)
+
+        self.backend.remove_link_type(name)
+
+        return self.define_link_type(name, *args, **kwargs)
 
     def to_asdf(self, destination: str, **kwargs) -> dict:
         """Write this entarchy to a self-describing ASDF archive.

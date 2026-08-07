@@ -29,6 +29,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from . import asdf_store
 from .backend import Backend
 from .. import AnalysisEntity, Collection, Entarchy, Entity
+from ..core.links import Endpoint, LinkTypeError, LinkTypeSpec
 
 
 # MySQL's generic BLOB tops out at 64 KB, which is far too small for the
@@ -89,19 +90,87 @@ class EntityTable(Base):
         return f"<{self.entity_type.name}Row(id={self.id}, parent={self.parent})>"
 
 
+class LinkTypeTable(Base):
+    """The registry of link kinds.
+
+    Kinds are data rather than Python classes, so that a link kind can be
+    invented at the prompt the way an attribute name can. That means the
+    database is the only registry there is, and the constraints on a kind have
+    to live here too.
+    """
+    __tablename__ = 'link_types'
+
+    name: Mapped[str] = mapped_column(String(255), primary_key=True)
+
+    # Endpoint constraints. Per endpoint at most one of the two columns is set:
+    #  an entity type for an ordinary entity, or a link type where the endpoint
+    #  is itself a link. Both null is a deliberate wildcard.
+    #  Links need the second form because every link carries the same entity type
+    #  (LinkEntity), so constraining a link endpoint by entity type would permit
+    #  connecting any two links at all.
+    linker_type_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), nullable=True)
+    linker_link_type: Mapped[str] = mapped_column(String(255), ForeignKey('link_types.name'),
+                                                  nullable=True)
+    linked_type_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), nullable=True)
+    linked_link_type: Mapped[str] = mapped_column(String(255), ForeignKey('link_types.name'),
+                                                  nullable=True)
+
+    # Direction only has to be declared when both endpoints are the same kind;
+    #  otherwise the endpoint types say which end is which
+    symmetric: Mapped[bool] = mapped_column(default=False)
+
+    # 'sparse' (the default), 'one_per_linker' or 'dense' - see core.links
+    cardinality: Mapped[str] = mapped_column(String(50), default='sparse')
+
+    description: Mapped[str] = mapped_column(String(2000), nullable=True)
+
+    created: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now)
+
+    def __repr__(self):
+        return f'<LinkType({self.name})>'
+
+
 class Link(Base):
+    """A relationship between two entities, carried by an entity of its own.
+
+    link_uuid is the carrier entity's uuid, so a link's attributes go through
+    exactly the same machinery as any other entity's. The carrier's parent is
+    its linker, which keeps the entity tree valid and gives archive block files
+    and map_async the same grouping they use everywhere else.
+    """
     __tablename__ = 'links'
 
-    linker_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), primary_key=True)
+    link_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'),
+                                           primary_key=True)
+    link_type: Mapped[str] = mapped_column(String(255), ForeignKey('link_types.name'))
+
+    linker_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'))
+    linked_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'))
+
+    entity = relationship('EntityTable', foreign_keys=[link_uuid])
     linker = relationship('EntityTable', foreign_keys=[linker_uuid])
-    linked_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), primary_key=True)
     linked = relationship('EntityTable', foreign_keys=[linked_uuid])
-    entity_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), nullable=True)
-    entity = relationship('EntityTable', foreign_keys=[entity_uuid])
+    type = relationship('LinkTypeTable', foreign_keys=[link_type])
 
     created: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now)
     modified: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now,
                                                        onupdate=datetime.datetime.now)
+
+    __table_args__ = (
+        # One link of a given kind per ordered pair. The kind is part of the key
+        #  so that the same pair can carry several kinds at once - a phase and a
+        #  ROI may have both a mean_response and a peak_latency between them.
+        Index('ix_unique_link_per_type_and_pair',
+              'link_type', 'linker_uuid', 'linked_uuid', unique=True),
+        # Finding a link from its linked end, which a plain (linker, linked)
+        #  index cannot serve
+        Index('ix_link_reverse', 'link_type', 'linked_uuid'),
+        Index('ix_link_linker', 'linker_uuid'),
+        Index('ix_link_linked', 'linked_uuid'),
+    )
+
+    def __repr__(self):
+        return f'<Link({self.link_type}: {self.linker_uuid} -> {self.linked_uuid})>'
 
 
 class AttributeTable(Base):
@@ -1046,6 +1115,120 @@ class SQLBackend(Backend):
             self._commit(session)
 
             return True, ''
+
+    # Link type registry
+
+    def _entity_type_pks(self, session) -> dict[str, int]:
+        return {row.name: row.pk for row in session.query(EntityTypeTable).all()}
+
+    def _link_type_from_row(self, row: LinkTypeTable, type_names: dict[int, str]) -> LinkTypeSpec:
+        return LinkTypeSpec(
+            name=row.name,
+            linker=Endpoint(entity_type=type_names.get(row.linker_type_pk),
+                            link_type=row.linker_link_type),
+            linked=Endpoint(entity_type=type_names.get(row.linked_type_pk),
+                            link_type=row.linked_link_type),
+            symmetric=bool(row.symmetric),
+            cardinality=row.cardinality,
+            description=row.description,
+        )
+
+    @_retry_on_operational_failure
+    def get_link_types(self) -> list[LinkTypeSpec]:
+        """Every registered link kind."""
+        with self.sql_session as session:
+            type_names = {pk: name for name, pk in self._entity_type_pks(session).items()}
+            return [self._link_type_from_row(row, type_names)
+                    for row in session.query(LinkTypeTable).order_by(LinkTypeTable.name).all()]
+
+    @_retry_on_operational_failure
+    def get_link_type(self, name: str) -> Union[LinkTypeSpec, None]:
+        with self.sql_session as session:
+            row = session.get(LinkTypeTable, name)
+            if row is None:
+                return None
+
+            type_names = {pk: name for name, pk in self._entity_type_pks(session).items()}
+            return self._link_type_from_row(row, type_names)
+
+    @_retry_on_operational_failure
+    def add_link_type(self, spec: LinkTypeSpec) -> LinkTypeSpec:
+        """Record a new link kind. Fails if the name is already taken."""
+        with self._write_session() as session:
+
+            if session.get(LinkTypeTable, spec.name) is not None:
+                raise LinkTypeError(f'Link type "{spec.name}" is already defined. '
+                                    f'Use redefine_link_type to change it.')
+
+            entity_type_pks = self._entity_type_pks(session)
+
+            def _endpoint_columns(endpoint: Endpoint, label: str) -> tuple:
+                if endpoint.link_type is not None:
+                    if session.get(LinkTypeTable, endpoint.link_type) is None:
+                        raise LinkTypeError(
+                            f'The {label} endpoint of "{spec.name}" is declared as a '
+                            f'"{endpoint.link_type}" link, but no such link type is '
+                            f'defined.')
+                    return None, endpoint.link_type
+
+                if endpoint.entity_type is not None:
+                    if endpoint.entity_type not in entity_type_pks:
+                        raise LinkTypeError(
+                            f'The {label} endpoint of "{spec.name}" is declared as '
+                            f'"{endpoint.entity_type}", which is not an entity type of '
+                            f'this entarchy.')
+                    return entity_type_pks[endpoint.entity_type], None
+
+                return None, None
+
+            linker_pk, linker_link = _endpoint_columns(spec.linker, 'linker')
+            linked_pk, linked_link = _endpoint_columns(spec.linked, 'linked')
+
+            session.add(LinkTypeTable(
+                name=spec.name,
+                linker_type_pk=linker_pk, linker_link_type=linker_link,
+                linked_type_pk=linked_pk, linked_link_type=linked_link,
+                symmetric=spec.symmetric,
+                cardinality=spec.cardinality,
+                description=spec.description,
+            ))
+            self._commit(session)
+
+        return spec
+
+    @_retry_on_operational_failure
+    def count_links_of_type(self, name: str) -> int:
+        with self.sql_session as session:
+            return session.query(Link).filter(Link.link_type == name).count()
+
+    @_retry_on_operational_failure
+    def remove_links_of_type(self, name: str) -> int:
+        """Delete every link of a kind, and the entities carrying them."""
+        with self._write_session() as session:
+            uuids = [row.link_uuid for row in
+                     session.query(Link.link_uuid).filter(Link.link_type == name).all()]
+
+            for start in range(0, len(uuids), MAX_BOUND_PARAMETERS):
+                batch = uuids[start:start + MAX_BOUND_PARAMETERS]
+                session.query(AttributeTable).filter(
+                    AttributeTable.entity_uuid.in_(batch)).delete(synchronize_session=False)
+                session.query(Link).filter(
+                    Link.link_uuid.in_(batch)).delete(synchronize_session=False)
+                session.query(EntityTable).filter(
+                    EntityTable.uuid.in_(batch)).delete(synchronize_session=False)
+
+            self._commit(session)
+
+        return len(uuids)
+
+    @_retry_on_operational_failure
+    def remove_link_type(self, name: str) -> None:
+        """Drop a link kind. The caller is responsible for its links being gone."""
+        with self._write_session() as session:
+            row = session.get(LinkTypeTable, name)
+            if row is not None:
+                session.delete(row)
+            self._commit(session)
 
     # Collection related methods
 

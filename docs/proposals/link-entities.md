@@ -1,6 +1,7 @@
 # Proposal: dynamic link entities
 
-Status: draft for discussion
+Status: **schema and registry implemented**; the write API, `LinkCollection` and
+the query syntax are still proposals. Both prerequisites listed below are done.
 Measured against: entarchy at `559998a`, SQLite 3.40.1, MySQL 8.0.46, Windows 11 / Python 3.10
 
 ## Summary
@@ -606,8 +607,10 @@ To be built:
 
 ## Prerequisites
 
-Two existing defects block bulk link creation. Both were found while measuring
-for this proposal and are worth fixing regardless.
+Two existing defects blocked bulk link creation. Both were found while measuring
+for this proposal and were worth fixing regardless. **Both are now fixed**; the
+diagnosis of the second turned out to be wrong, and the measurements below record
+what it actually was.
 
 **`collection.update()` fails above ~2,340 entities on SQLite.**
 `set_collection_attributes` builds a single INSERT with every row inline; SQLite
@@ -625,14 +628,23 @@ lines plus a test at 5,000 rows.
 | 20,000 | 185.4 s | 23.8 s | 10.46 ms |
 
 Flat at ~10 ms per entity however large the batch, while the collection attribute
-path achieves ~0.4 ms per value. At that rate 120,000 links take ~21 minutes and
-2.4 million take ~7 hours, which makes example 1 impractical at full scale. A core
-`insert().values([...])` in chunks should bring entity creation into the same
-range as the attribute path; a rough target is 3–4 minutes for 120,000 links,
-though that is an estimate rather than a measurement.
+path achieves ~0.4 ms per value.
 
-This second one is not link-specific — it is the same cost paid ingesting 100,000
-ROIs today.
+Profiling showed the diagnosis was wrong. `add_entities` was already 0.14 ms per
+entity; the cost was in the per-entity attribute commit that follows it, since
+`add_new_entity` writes `id` and `uuid`. Of that, `sqlite3.Connection.commit`
+alone was 2.98 s of 5.35 s — a commit is an fsync, measured at 5.91 ms against
+0.028 ms for the same insert inside a transaction. `Entarchy.commit()` now runs
+as one batch, which brings entity creation to about 3 ms and makes a block
+all-or-nothing rather than half-persisted on failure.
+
+What remains at ~3 ms is SQLAlchemy ORM overhead, not the database: `sqlite3`
+execute and executemany together account for 0.24 s of 7.7 s. Going below that
+means bypassing the ORM, which the bulk link writer should do rather than the
+general entity path — keeping the risky surgery in new code.
+
+This second one was never link-specific: it is the same cost paid ingesting
+100,000 ROIs today.
 
 ## Decisions
 
