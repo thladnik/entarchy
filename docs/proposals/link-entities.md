@@ -1,7 +1,8 @@
 # Proposal: dynamic link entities
 
-Status: **schema, registry and write API implemented**; `LinkCollection` and the
-query syntax are still proposals. Both prerequisites listed below are done.
+Status: **implemented**. Schema, registry, write API, `LinkCollection` and the
+endpoint query syntax are all in place, as are both prerequisites listed below.
+What remains unbuilt is noted under "Remaining questions".
 
 Bulk link creation measures **0.758 ms per link** (12,000 links with two
 attributes each, SQLite), so example 1's 120,000 links take about 1.5 minutes and
@@ -721,4 +722,13 @@ guarantee that does not exist.
   need relating. If new work goes into one entarchy per project, this is moot.
 - **Does refusing deletion need an escape hatch** — a `delete_links=True` that
   clears the chain — or is manual cleanup acceptable given how rarely entities
-  are deleted?
+  are deleted? Entity deletion is not implemented at all today, so nothing
+  enforces the refusal yet.
+- **Addressing a link endpoint's attributes when the endpoint is itself a link**
+  (`@mean_response.mean_dff`). Storage and constraints support links between
+  links; the filter syntax resolves `@<kind>` to an end but then reads the
+  attribute from that end directly, which is right for an entity endpoint and
+  untested for a link one.
+- **`@both` on a symmetric kind** means "each end satisfies this", which is what
+  you want; there is no way to say "these two specific conditions, one per end"
+  for a symmetric kind, and it is not clear that there should be.

@@ -608,6 +608,75 @@ class TestLinkWrites:
         assert len(restored) == 1000
 
 
+class TestLinkQueries:
+    """Endpoint filters build aliased joins and OR-ed subqueries, so they are
+    worth running against a real server rather than only compiling."""
+
+    @pytest.fixture()
+    def responses(self, populated):
+        subject = populated.get(Subject)[0]
+        sessions = sorted(populated.get(Session), key=lambda e: e['index'])
+
+        populated.define_link_type('mean_response', Subject, Session,
+                                   cardinality='dense')
+        populated.link_from_frame(pd.DataFrame({
+            'linker_uuid': [subject.uuid] * len(sessions),
+            'linked_uuid': [s.uuid for s in sessions],
+            'mean_dff': [0.1 * (index + 1) for index in range(len(sessions))],
+        }), 'mean_response')
+
+        return populated, subject, sessions
+
+    def test_own_attribute_filter(self, responses):
+        ent, subject, sessions = responses
+
+        assert len(ent.links('mean_response', 'mean_dff > 0.35')) == 3
+
+    def test_endpoint_by_type(self, responses):
+        ent, subject, sessions = responses
+
+        assert len(ent.links('mean_response', '@Session.flag == True')) == 3
+        assert len(ent.links('mean_response', '@Subject.strain == "wildtype"')) == 6
+
+    def test_endpoint_by_role(self, responses):
+        ent, subject, sessions = responses
+
+        assert len(ent.links('mean_response', '@linked.index IN (0, 1)')) == 2
+        assert len(ent.links('mean_response', '@linker.strain == "wildtype"')) == 6
+
+    def test_either_and_both(self, responses):
+        ent, subject, sessions = responses
+
+        assert len(ent.links('mean_response', '@either.index == 0')) == 1
+        assert len(ent.links('mean_response', '@both.index == 0')) == 0
+
+    def test_ancestor_traversal(self, responses):
+        ent, subject, sessions = responses
+
+        assert len(ent.links('mean_response', '@Session.[Subject]strain == "wildtype"')) == 6
+
+    def test_combined_filters(self, responses):
+        ent, subject, sessions = responses
+
+        selected = ent.links('mean_response',
+                             '@Session.flag == True AND mean_dff > 0.35')
+
+        # flag is True at indices 0, 2 and 4, whose mean_dff are 0.1, 0.3 and 0.5
+        assert len(selected) == 1
+        assert selected[0]['mean_dff'] == pytest.approx(0.5)
+
+    def test_symmetric_kind(self, populated):
+        sessions = sorted(populated.get(Session), key=lambda e: e['index'])
+        populated.define_link_type('correlated', Session, Session, symmetric=True)
+
+        with populated:
+            populated.link(sessions[1], sessions[0], 'correlated', r=0.9)
+
+        assert len(populated.links('correlated', '@Session.index == 0')) == 1
+        with pytest.raises(ValueError, match='symmetric'):
+            len(populated.links('correlated', '@linker.index == 0'))
+
+
 @pytest.mark.slow
 class TestParallel:
 

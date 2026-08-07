@@ -345,6 +345,19 @@ def _retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable
     return _wrapper
 
 
+class _QueryContext:
+    """What a filter expression is being resolved against.
+
+    For an ordinary collection that is just the entity type. For a collection of
+    links it is also the link kind, which is what lets `@Roi.attr` work out which
+    endpoint is meant.
+    """
+
+    def __init__(self, entity_type_name: str, link_spec: LinkTypeSpec = None):
+        self.entity_type_name = entity_type_name
+        self.link_spec = link_spec
+
+
 def _build_query_from_collection(_collection: Collection,
                                  _session: sqlalchemy.orm.Session
                                  ) -> sqlalchemy.orm.Query:
@@ -357,25 +370,167 @@ def _build_query_from_collection(_collection: Collection,
     _query = _session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
     _query = _query.filter(EntityTable.created <= creation_time)
 
+    link_spec = None
+    if getattr(_collection, 'link_type', None) is not None:
+        # A link collection is a collection of carrier entities narrowed to one kind
+        link_spec = _collection.link_type_spec
+        _query = (_query.join(Link, Link.link_uuid == EntityTable.uuid)
+                  .filter(Link.link_type == _collection.link_type))
+
     # Apply filters generated from the abstract syntax tree
     if len(as_tree) == 0:
         return _query
 
-    filters = _generate_attribute_filters(entity_type_name, _session, as_tree)
+    filters = _generate_attribute_filters(
+        _QueryContext(entity_type_name, link_spec), _session, as_tree)
 
     return _query.filter(filters)
 
 
-def _generate_attribute_filters(entity_type_name: str,
+# Endpoint roles that address a link's ends rather than an entity type
+_ENDPOINT_ROLES = ('linker', 'linked', 'either', 'both')
+
+
+def _split_endpoint_name(name: str) -> tuple[str, str]:
+    """Split "@role.rest" into its role and the attribute path after it."""
+    role, _, rest = name[1:].partition('.')
+
+    if not role or not rest:
+        raise ValueError(f'Malformed endpoint reference "{name}". Expected something '
+                         f'like "@Roi.attribute" or "@linker.attribute".')
+
+    return role, rest
+
+
+def _resolve_endpoint_roles(context: _QueryContext, role: str, name: str) -> list[str]:
+    """Which end(s) of the link "@role" addresses."""
+    spec = context.link_spec
+
+    if spec is None:
+        raise ValueError(
+            f'"{name}" addresses a link endpoint, but this is a collection of '
+            f'{context.entity_type_name} rather than of links. Endpoint filters are '
+            f'only available on a link collection (entarchy.links(kind, ...)).')
+
+    if role in ('linker', 'linked'):
+        if spec.symmetric:
+            raise ValueError(
+                f'"{name}" addresses the {role} of "{spec.name}", which is symmetric: '
+                f'its two ends are stored in uuid order, so which is which carries no '
+                f'meaning. Use @either or @both, or address the endpoint by type.')
+        return [role]
+
+    if role == 'either':
+        return ['linker', 'linked']
+    if role == 'both':
+        return ['linker', 'linked']
+
+    # Otherwise the role names an entity type or link kind; find which end it is
+    matches = [end for end, endpoint in (('linker', spec.linker), ('linked', spec.linked))
+               if endpoint.entity_type == role or endpoint.link_type == role]
+
+    if len(matches) == 0:
+        raise ValueError(
+            f'"{name}" addresses a "{role}" endpoint, but "{spec.name}" connects '
+            f'{spec.linker} to {spec.linked}. Use one of those, or @linker/@linked/'
+            f'@either/@both.')
+
+    if len(matches) == 2 and not spec.symmetric:
+        raise ValueError(
+            f'"{name}" is ambiguous: both ends of "{spec.name}" are {role}. Use '
+            f'@linker or @linked to say which, or @either/@both for either or both.')
+
+    return matches
+
+
+def _endpoint_attribute_filter(context: _QueryContext, _session, name: str, comparison):
+    """Build the filter for an "@endpoint.attribute" reference.
+
+    Returns a filter over EntityTable.uuid rather than a subquery, so that
+    "either" and "both" become OR and AND of two membership tests. Expressing
+    them as UNION and INTERSECT instead would work on SQLite but INTERSECT is
+    only available on recent MySQL.
+    """
+    role, rest = _split_endpoint_name(name)
+    ends = _resolve_endpoint_roles(context, role, name)
+    spec = context.link_spec
+
+    filters = []
+    for end in ends:
+        endpoint_column = Link.linker_uuid if end == 'linker' else Link.linked_uuid
+        endpoint = spec.linker if end == 'linker' else spec.linked
+
+        parent_level, attr_name = _split_endpoint_traversal(_session, rest, endpoint, name)
+
+        # Walk from the endpoint entity up to whichever ancestor holds the attribute
+        aliases = [sqlalchemy.orm.aliased(EntityTable) for _ in range(parent_level + 1)]
+        subq = (_session.query(Link.link_uuid.label('entity_uuid'))
+                .filter(Link.link_type == spec.name)
+                .join(aliases[0], aliases[0].uuid == endpoint_column))
+
+        for level in range(parent_level):
+            subq = subq.join(aliases[level + 1],
+                             aliases[level].parent_uuid == aliases[level + 1].uuid)
+
+        anchor = aliases[-1]
+        subq = subq.join(AttributeTable, AttributeTable.entity_uuid == anchor.uuid)
+        subq = subq.filter(AttributeTable.name == attr_name)
+        if comparison is not None:
+            subq = subq.filter(comparison)
+
+        filters.append(EntityTable.uuid.in_(_session.query(subq.subquery().c.entity_uuid)))
+
+    if len(filters) == 1:
+        return filters[0]
+
+    return sqlalchemy.and_(*filters) if role == 'both' else sqlalchemy.or_(*filters)
+
+
+def _split_endpoint_traversal(_session, rest: str, endpoint: Endpoint,
+                              name: str) -> tuple[int, str]:
+    """How far above the endpoint the attribute sits, and its name."""
+    if rest.startswith('../'):
+        parent_level = rest.count('../')
+        return parent_level, rest[parent_level * 3:]
+
+    if rest.startswith('['):
+        if ']' not in rest:
+            raise ValueError(f'Malformed ancestor reference in "{name}".')
+
+        ancestor_type, attr_name = rest.replace('[', '').split(']')
+
+        if endpoint.entity_type is None:
+            raise ValueError(
+                f'"{name}" walks up from an endpoint declared as {endpoint}, whose '
+                f'entity type is not fixed, so "{ancestor_type}" cannot be resolved.')
+
+        parent_level = _get_entity_type_ancestor_distance(_session, endpoint.entity_type,
+                                                          ancestor_type)
+        if parent_level is None:
+            raise ValueError(f'Entity type "{ancestor_type}" is not an ancestor of '
+                             f'"{endpoint.entity_type}" in "{name}".')
+
+        return parent_level, attr_name
+
+    return 0, rest
+
+
+def _generate_attribute_filters(context: Union[_QueryContext, str],
                                 _session: sqlalchemy.orm.Session,
                                 as_tree: dict[str, ...]) -> Any:
+
+    # A bare entity type name is still accepted, so that anything calling this
+    #  directly keeps working
+    if isinstance(context, str):
+        context = _QueryContext(context)
+    entity_type_name = context.entity_type_name
 
     _operator = as_tree['operator'].upper()
 
     # Handle connectives
     if _operator in ('AND', 'OR', 'XOR'):
-        left = _generate_attribute_filters(entity_type_name, _session, as_tree['left_operand'])
-        right = _generate_attribute_filters(entity_type_name, _session, as_tree['right_operand'])
+        left = _generate_attribute_filters(context, _session, as_tree['left_operand'])
+        right = _generate_attribute_filters(context, _session, as_tree['right_operand'])
 
         if _operator == 'AND':
             return sqlalchemy.and_(left, right)
@@ -413,6 +568,10 @@ def _generate_attribute_filters(entity_type_name: str,
             }[_operator]
 
             comparison = _op_fun(attribute_value_col, value)
+
+        # An @ prefix addresses one of a link's endpoints
+        if name.startswith('@'):
+            return _endpoint_attribute_filter(context, _session, name, comparison)
 
         # If name does not start with dots, it's a direct attribute
         if not name.startswith('../') and not name.startswith('['):
@@ -469,12 +628,18 @@ def _generate_attribute_filters(entity_type_name: str,
 
     # Handle unary operators
     elif _operator == 'EXIST':
+        name = as_tree['right_operand']
+
+        if name.startswith('@'):
+            return _endpoint_attribute_filter(context, _session, name, None)
+
         subquery = (_session.query(AttributeTable.entity_uuid)
-                    .filter(AttributeTable.name == as_tree['right_operand'])
+                    .filter(AttributeTable.name == name)
                     .subquery())
 
     elif _operator == 'NOT':
-        return sqlalchemy.not_(_generate_attribute_filters(entity_type_name, _session, as_tree['right_operand']))
+        return sqlalchemy.not_(_generate_attribute_filters(context, _session,
+                                                           as_tree['right_operand']))
 
     # Fallback
     else:

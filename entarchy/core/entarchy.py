@@ -15,7 +15,8 @@ import yaml
 from . import console
 from . import links
 from . import query
-from .entity import AnalysisEntity, Collection, EntarchyEntity, Entity, LinkEntity
+from .entity import (AnalysisEntity, Collection, EntarchyEntity, Entity, LinkCollection,
+                     LinkEntity)
 
 if TYPE_CHECKING:
     from ..backend.backend import Backend
@@ -487,23 +488,7 @@ class Entarchy(object):
         if isinstance(entity_type, str):
             entity_type = self.get_entity_type(entity_type)
 
-        # Add equality filters to filter expressions
-        for k, v in _equalities.items():
-
-            # Add quotes to string
-            if isinstance(v, str):
-                v = f'"{v}"'
-
-            _string_expressions = _string_expressions + (f'{k} == {v}',)
-
-        # Concat expressions. Each one is parenthesized so a top-level OR inside
-        #  one expression cannot regroup with the neighboring expressions.
-        _expression = ' AND '.join(f'({e})' for e in _string_expressions if e is not None and str(e).strip() != '')
-
-        # Parse to get dictionary representation
-        as_tree = query.parse_boolean_expression(_expression)
-        if as_tree is None:
-            as_tree = {}
+        as_tree = self._build_filter_tree(_string_expressions, _equalities)
 
         # Return collection of custom type if available
         if entity_type.collection_type is not None:
@@ -511,6 +496,27 @@ class Entarchy(object):
 
         # Fallback to generic collection
         return Collection(self, entity_type, as_tree)
+
+    def _build_filter_tree(self, _string_expressions, _equalities) -> dict[str, Any]:
+        """Turn filter expressions and keyword equalities into one AST."""
+
+        # Add equality filters to filter expressions
+        for k, v in _equalities.items():
+
+            # Add quotes to string
+            if isinstance(v, str):
+                v = f'"{v}"'
+
+            _string_expressions = tuple(_string_expressions) + (f'{k} == {v}',)
+
+        # Concat expressions. Each one is parenthesized so a top-level OR inside
+        #  one expression cannot regroup with the neighboring expressions.
+        _expression = ' AND '.join(f'({e})' for e in _string_expressions
+                                   if e is not None and str(e).strip() != '')
+
+        as_tree = query.parse_boolean_expression(_expression)
+
+        return {} if as_tree is None else as_tree
 
     def get_config(self) -> dict[str, Any]:
         return self._config.copy()
@@ -776,14 +782,36 @@ class Entarchy(object):
 
         return [self.get_entity('LinkEntity', row['link_uuid'], None) for row in rows]
 
-    def get_links(self, link_type: str) -> list[LinkEntity]:
-        """Every link of a kind.
+    def links(self, link_type: str, *_string_expressions: str,
+              **_equalities) -> LinkCollection:
+        """A queryable collection of links of one kind.
 
-        A list for now; this becomes a queryable LinkCollection with the query
-        syntax, at which point filtering by endpoint attributes becomes possible.
+            ent.links('mean_response')
+            ent.links('mean_response', 'mean_dff > 0.3')
+            ent.links('mean_response',
+                      '@Phase.index == 3 AND @Roi.has_receptive_field == True')
+            ent.links('mean_response', '@linker.[Recording]imaging_rate > 8.0')
+
+        A bare name is an attribute of the link itself; `@` addresses one of its
+        endpoints, either by entity type or by role (`@linker`, `@linked`,
+        `@either`, `@both`). `@linker` and `@linked` are refused for a symmetric
+        kind, where which end is which is an artifact of uuid ordering.
+
+        Everything Collection offers works here, including map_async and
+        to_asdf, since a link is an entity.
         """
-        return [self.get_entity('LinkEntity', row['link_uuid'], None)
-                for row in self.backend.get_links_of_type(link_type)]
+        if self.backend.get_link_type(link_type) is None:
+            defined = ', '.join(spec.name for spec in self.link_types()) or 'none'
+            raise links.LinkTypeError(
+                f'Link type "{link_type}" is not defined. Defined kinds: {defined}.')
+
+        as_tree = self._build_filter_tree(_string_expressions, _equalities)
+
+        return LinkCollection(self, link_type, as_tree)
+
+    def get_links(self, link_type: str) -> LinkCollection:
+        """Deprecated alias for links()."""
+        return self.links(link_type)
 
     def get_link_type(self, name: str) -> Union[links.LinkTypeSpec, None]:
         """The registered kind, or None if it has never been defined."""

@@ -20,6 +20,61 @@ Supported comparisons: `==`, `!=`, `<`, `<=`, `>`, `>=`, `IN (...)`, `EXIST(attr
 Parent attributes are addressed with `../attr` (one level per `../`) or
 `[ParentEntityTypeName]attr`.
 
+### Links
+
+A link is a relationship between two entities, carried by an entity of its own,
+so it holds attributes exactly as any other entity does. It expresses what the
+parent hierarchy cannot: a ROI's response to a stimulation phase, the same cell
+across two sessions, correlated pairs.
+
+The *kind* of link is data rather than a class, so one can be invented at the
+prompt the way an attribute name can. What it may connect is recorded in the
+database and checked on every write:
+
+```python
+ent.define_link_type('mean_response', Phase, Roi,
+                     description='trial-averaged dF/F during the phase')
+ent.define_link_type('correlated', Roi, Roi, symmetric=True)
+
+response = ent.link(phase, roi, 'mean_response', mean_dff=0.42)
+ent.link_from_frame(df, 'mean_response')                     # df has linker_uuid/linked_uuid
+ent.link_from_matrix(rois, rois, r, 'correlated',            # the predicate is required
+                     where=lambda v: abs(v) > 0.6, value_name='r')
+```
+
+`symmetric` only has to be given when both endpoints are the same type;
+otherwise the endpoint types already say which end is which, and arguments in
+the wrong order are oriented rather than rejected.
+
+Querying uses the ordinary filter language, with `@` addressing an endpoint:
+
+```python
+ent.links('mean_response', '@Phase.index == 3 AND @Roi.has_receptive_field == True')
+ent.links('mean_response', '@linker.[Recording]imaging_rate > 8.0 AND mean_dff > 0.3')
+ent.links('correlated', '@Roi.quality == "good" AND r > 0.8')
+```
+
+A bare name is an attribute of the link itself. Endpoints are addressed by
+entity type, or by role: `@linker`, `@linked`, `@either` (at least one end) and
+`@both`. `@linker`/`@linked` are refused for a symmetric kind, where which end
+is which is an artifact of uuid ordering.
+
+`ent.links(...)` returns a `LinkCollection`, so `map_async`, `dataframe_of`,
+`update`, set operations and `to_asdf` all work on links.
+
+**Links are for sparse relationships.** A link costs roughly 1.5 kB against 4
+bytes for a `float32`, so an all-to-all matrix belongs on the nearest common
+ancestor as an array, not as links. Bulk writes refuse to be enormous or to be
+most of every possible pair unless told otherwise — see
+[the proposal](docs/proposals/link-entities.md) for the reasoning and the
+measurements.
+
+Entarchies created before links existed need their tables migrated:
+
+```sh
+python -m entarchy.tools.migrate_links /path/to/entarchy --apply
+```
+
 ### Database credentials (MySQL backend)
 
 The database password is **not** written to `entarchy.yaml`. At runtime it is

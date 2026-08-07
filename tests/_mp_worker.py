@@ -73,6 +73,12 @@ def write_to_archive_roi(roi):
     roi['should_not_persist'] = 1
 
 
+def scale_link_value(link, factor: float = 2.0):
+    """Analysis over a link collection, reaching through to an endpoint."""
+    link['scaled'] = float(link['mean_dff']) * factor
+    link['linked_index'] = int(link.linked['index'])
+
+
 def fail_on_odd_index(session):
     """Fail for half the entities, to exercise per-entity error collection."""
     if session['index'] % 2 == 1:

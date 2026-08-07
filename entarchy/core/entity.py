@@ -575,6 +575,16 @@ class Collection(object):
         self._pending_changes: dict[str, list[int]] = {}
         self._init_time = datetime.datetime.now()
 
+    def _derive(self, _as_tree) -> 'Collection':
+        """A collection like this one, with a different filter tree.
+
+        Set operations and where() build new collections, and a subclass that
+        carries extra state - LinkCollection and its kind - has to keep it.
+        """
+        collection_type = self.entity_type.collection_type or Collection
+
+        return collection_type(self.entarchy, self.entity_type, _as_tree)
+
     def __len__(self):
         if self._length is None:
             self._length = self.entarchy.backend.get_collection_count(self)
@@ -742,7 +752,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('UNION', self.as_tree, other.as_tree)
-        return Collection(self.entarchy, self.entity_type, new_tree)
+        return self._derive(new_tree)
 
     def __and__(self, other: Collection | str):
         """Create a new collection that is the intersection between this collection and another.
@@ -772,7 +782,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('INTERSECTION', self.as_tree, other.as_tree)
-        return Collection(self.entarchy, self.entity_type, new_tree)
+        return self._derive(new_tree)
 
     def __invert__(self):
         """Create a new collection that is the complement of this collection.
@@ -788,7 +798,7 @@ class Collection(object):
 
         # Invert and return new collection
         new_tree = query.combine_trees('COMPLEMENT', self.as_tree)
-        return Collection(self.entarchy, self.entity_type, new_tree)
+        return self._derive(new_tree)
 
     def __sub__(self, other: Collection | str):
         """Create a new collection that is the difference between this collection and another.
@@ -817,7 +827,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('DIFFERENCE', self.as_tree, other.as_tree)
-        return Collection(self.entarchy, self.entity_type, new_tree)
+        return self._derive(new_tree)
 
     def __xor__(self, other: Collection | str):
         """Create a new collection that is the symmetric difference between this collection and another.
@@ -846,7 +856,7 @@ class Collection(object):
 
         # Combine and return new collection
         new_tree = query.combine_trees('SYMMETRIC_DIFFERENCE', self.as_tree, other.as_tree)
-        return Collection(self.entarchy, self.entity_type, new_tree)
+        return self._derive(new_tree)
 
     # Properties
 
@@ -1345,12 +1355,48 @@ class Collection(object):
         else:
             new_tree = query.combine_trees('INTERSECTION', self.as_tree, _collection.as_tree)
 
-        if self.entity_type.collection_type is None:
-            collection_type = Collection
-        else:
-            collection_type = self.entity_type.collection_type
+        return self._derive(new_tree)
 
-        return collection_type(self.entarchy, self.entity_type, new_tree)
+
+class LinkCollection(Collection):
+    """A queryable set of links of one kind.
+
+    Everything Collection does works here - slicing, dataframe_of, update,
+    map_async, to_asdf - because a link is an entity. What it adds is the kind
+    filter and the endpoint syntax in filter expressions:
+
+        ent.links('mean_response',
+                  '@Phase.index == 3 AND @Roi.has_receptive_field == True '
+                  'AND mean_dff > 0.3')
+
+    A bare name is an attribute of the link itself; `@` addresses an endpoint.
+    """
+
+    def __init__(self, _entarchy, _link_type: str, _as_tree):
+        Collection.__init__(self, _entarchy, LinkEntity, _as_tree)
+        self._link_type = _link_type
+
+    @property
+    def link_type(self) -> str:
+        return self._link_type
+
+    @property
+    def link_type_spec(self):
+        spec = self.entarchy.get_link_type(self._link_type)
+        if spec is None:
+            from .links import LinkTypeError
+
+            raise LinkTypeError(f'Link type "{self._link_type}" is not defined.')
+
+        return spec
+
+    def _derive(self, _as_tree) -> 'LinkCollection':
+        return LinkCollection(self.entarchy, self._link_type, _as_tree)
+
+    def __repr__(self):
+        if self.name is not None:
+            return self.name
+        return f'LinkCollection(\'{self._link_type}\', count={len(self)})'
 
 
 # Per-worker state for Collection.map_async.

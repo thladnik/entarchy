@@ -24,6 +24,19 @@ Identifiers may contain `/` for grouped attribute names (e.g. s2p/attrs/x),
 a leading `../` per parent level, or a `[ParentEntityTypeName]` prefix for
 explicit parent traversal.
 
+When the collection is a collection of links, an identifier may also address one
+of the link's endpoints with an `@` prefix:
+
+    @Roi.has_receptive_field == True      the endpoint that is a Roi
+    @linker.index == 3                    the linker end, by role
+    @linked.quality == "good"              the linked end
+    @either.strain == "wt"                 at least one endpoint
+    @both.has_receptive_field == True      both endpoints
+    @linker.[Recording]imaging_rate > 8    an ancestor of the linker
+
+`@linker` and `@linked` are refused for a symmetric kind, where which end is
+which is an artifact of uuid ordering rather than meaning.
+
 The resulting AST uses plain dictionaries:
     binary ops: {'left_operand': ..., 'operator': 'AND'|'OR'|'XOR'|cmp|'IN', 'right_operand': ...}
     unary ops:  {'operator': 'NOT'|'EXIST', 'right_operand': ...}
@@ -49,7 +62,10 @@ _TOKEN_PATTERN = re.compile(r"""
     | (?P<DATE>\d{4}-\d{2}-\d{2})                                       # Date (YYYY-MM-DD)
     | (?P<FLOAT>-?(?:\d+\.\d+(?:[eE][-+]?\d+)?|\d+[eE][-+]?\d+))        # Float numbers (incl. scientific)
     | (?P<INTEGER>-?\d+)                                                # Integer numbers
-    | (?P<IDENTIFIER>(?:\.\./|\./)*[\w/\[\]]+)                          # Identifiers (incl. ../ and [Type] prefixes)
+    | (?P<IDENTIFIER>
+          @\w+(?:\.(?:\.\./)*[\w/\[\]]+)?                               # Link endpoint: @Roi.attr, @linker.[Type]attr
+        | (?:\.\./|\./)*[\w/\[\]]+                                      # Identifiers (incl. ../ and [Type] prefixes)
+      )
     | (?P<OPERATOR>>=|<=|==|!=|<|>)                                     # Comparison operators
     | (?P<AMP>&)
     | (?P<PIPE>\|)
