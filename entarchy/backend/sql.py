@@ -550,13 +550,10 @@ def _generate_attribute_filters(context: Union[_QueryContext, str],
             if not isinstance(value, list) or len(value) == 0:
                 raise ValueError('Operand after IN statement should be a non-empty list of values')
 
-            # Determine the correct column based on the type of the first value
-            attribute_value_col = getattr(AttributeTable, f'value_{value[0].__class__.__name__}')
-
-            comparison = attribute_value_col.in_(value)
+            columns = _value_columns(value[0])
+            comparisons = [column.in_(value) for column in columns]
         else:
-            # Determine the correct column based on value type
-            attribute_value_col = getattr(AttributeTable, f'value_{value.__class__.__name__}')
+            columns = _value_columns(value)
 
             _op_fun = {
                 '<': operator.lt,
@@ -567,7 +564,10 @@ def _generate_attribute_filters(context: Union[_QueryContext, str],
                 '>': operator.gt
             }[_operator]
 
-            comparison = _op_fun(attribute_value_col, value)
+            comparisons = [_op_fun(column, value) for column in columns]
+
+        comparison = (comparisons[0] if len(comparisons) == 1
+                      else sqlalchemy.or_(*comparisons))
 
         # An @ prefix addresses one of a link's endpoints
         if name.startswith('@'):
@@ -708,6 +708,27 @@ def _chunk_by_bound_parameters(records: list[dict], columns: int):
     rows_per_statement = max(1, MAX_BOUND_PARAMETERS // max(1, columns))
     for start in range(0, len(records), rows_per_statement):
         yield records[start:start + rows_per_statement]
+
+
+def _value_columns(value: Any) -> list:
+    """The attribute columns a filter literal could match.
+
+    A numeric literal has to consider both the integer and the float column.
+    Which column an attribute lands in is decided by how the value was written,
+    not by how a filter spells its threshold, so "depth > 0" must still find a
+    depth of 15.0 and "npix > 100.0" an npix of 153. Matching on the literal's
+    type alone silently returned nothing in those cases, which is worse than an
+    error because an empty collection looks like an answer.
+
+    bool is checked by class name rather than isinstance, since in Python it is
+    a subclass of int and must keep going to value_bool.
+    """
+    type_name = value.__class__.__name__
+
+    if type_name in ('int', 'float'):
+        return [AttributeTable.value_int, AttributeTable.value_float]
+
+    return [getattr(AttributeTable, f'value_{type_name}')]
 
 
 def _get_namehash(name: str) -> str:

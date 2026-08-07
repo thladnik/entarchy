@@ -158,3 +158,62 @@ class TestCollectionSetitem:
             sessions['id'] = 'clobbered'
         with pytest.raises(RuntimeError):
             sessions['uuid'] = 'clobbered'
+
+
+class TestNumericLiteralTypes:
+    """A filter's threshold must not decide which column is searched.
+
+    Which value column an attribute lands in is decided by how it was written -
+    an int goes to value_int, a float to value_float. Matching a filter literal
+    against only the column its own Python type implies meant `depth > 0` found
+    nothing when depth was 15.0, and `npix > 100.0` nothing when npix was 153.
+    An empty collection looks like an answer, so this failed silently.
+    """
+
+    @pytest.fixture()
+    def typed(self, ent):
+        with ent:
+            subject = Subject(ent, _id='subject_a', _parent=ent.root)
+            ent.add_new_entity(subject)
+
+            for index in range(4):
+                session = Session(ent, _id=f'sess_{index}', _parent=subject)
+                ent.add_new_entity(session)
+                session['count'] = index * 10          # int -> value_int
+                session['depth'] = float(index) * 15.0  # float -> value_float
+                session['label'] = f'row_{index}'
+                session['flag'] = (index % 2 == 0)
+
+        return ent
+
+    def test_int_literal_finds_float_attribute(self, typed):
+        assert len(typed.get(Session, 'depth > 0')) == 3
+        assert len(typed.get(Session, 'depth == 15')) == 1
+
+    def test_float_literal_finds_int_attribute(self, typed):
+        assert len(typed.get(Session, 'count > 10.0')) == 2
+        assert len(typed.get(Session, 'count == 20.0')) == 1
+
+    def test_both_spellings_agree(self, typed):
+        for integer, decimal in (('depth > 0', 'depth > 0.0'),
+                                 ('count > 10', 'count > 10.0'),
+                                 ('depth == 30', 'depth == 30.0'),
+                                 ('count != 0', 'count != 0.0')):
+            assert len(typed.get(Session, integer)) == len(typed.get(Session, decimal))
+
+    def test_in_list_spans_both_columns(self, typed):
+        assert len(typed.get(Session, 'depth IN (0, 15)')) == 2
+        assert len(typed.get(Session, 'count IN (0.0, 10.0)')) == 2
+
+    def test_booleans_are_not_treated_as_integers(self, typed):
+        """bool subclasses int in Python, but must still go to value_bool."""
+        assert len(typed.get(Session, 'flag == True')) == 2
+        assert len(typed.get(Session, 'flag == False')) == 2
+
+    def test_strings_are_unaffected(self, typed):
+        assert len(typed.get(Session, 'label == "row_1"')) == 1
+        assert len(typed.get(Session, 'label == "missing"')) == 0
+
+    def test_numeric_filter_ignores_a_string_attribute(self, typed):
+        """label holds strings, so a numeric threshold must match none of them."""
+        assert len(typed.get(Session, 'label > 0')) == 0
