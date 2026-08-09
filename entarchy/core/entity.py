@@ -16,6 +16,7 @@ import pandas as pd
 
 from . import console
 from . import query
+from .links import LinkTypeError
 
 if TYPE_CHECKING:
     from .entarchy import Entarchy
@@ -573,6 +574,92 @@ class Collection(object):
         collection_type = self.entity_type.collection_type or Collection
 
         return collection_type(self.entarchy, self.entity_type, _as_tree)
+
+    def _as_endpoint(self):
+        """What this collection is, as a link endpoint constraint would see it."""
+        from .links import Endpoint
+
+        if getattr(self, 'link_type', None) is not None:
+            return Endpoint(link_type=self.link_type)
+
+        return Endpoint(entity_type=self.entity_type.__name__)
+
+    def links(self, link_type: str, *_string_expressions: str, within: bool = False,
+              **_equalities) -> 'LinkCollection':
+        """Links of a kind that touch this collection.
+
+            rois.links('correlated')                # at least one end is a member
+            rois.links('correlated', within=True)   # both ends are members
+            rois.links('correlated', within=True, r=0.9)
+
+        `within=True` is the collection against itself: the correlations *among*
+        these ROIs rather than every correlation any of them takes part in.
+
+        Membership becomes a subquery, so this composes with whatever filter the
+        collection already carries and has no size limit - unlike spelling the
+        members out as `@both.uuid IN (...)`, which binds one parameter per uuid
+        per endpoint and gives up around sixteen thousand of them.
+
+        Returns:
+            LinkCollection: chainable, so `.where(...)`, `dataframe_of` and
+            `map_async` all work on the result.
+        """
+        spec = self.entarchy.require_link_type(link_type)
+        endpoint = self._as_endpoint()
+
+        accepted = [spec.linker.accepts(endpoint), spec.linked.accepts(endpoint)]
+        if not any(accepted):
+            raise LinkTypeError(
+                f'"{spec.name}" connects {spec.linker} to {spec.linked}, so a '
+                f'collection of {endpoint} is at neither end of it.')
+
+        if within:
+            # Both ends must be members, which only means anything if both ends
+            #  of the kind could be one. Otherwise the answer is always empty,
+            #  and an empty answer looks like a fact rather than a mistake.
+            if not all(accepted):
+                raise LinkTypeError(
+                    f'within=True asks for links whose two ends are both in this '
+                    f'collection, but "{spec.name}" connects {spec.linker} to '
+                    f'{spec.linked} and this is a collection of {endpoint}. Drop '
+                    f'within, or use links_to() for links reaching the other end.')
+            constraints = [(self, self)]
+        else:
+            constraints = [(self, None), (None, self)]
+
+        as_tree = self.entarchy._build_filter_tree(_string_expressions, _equalities)
+
+        return LinkCollection(self.entarchy, spec.name, as_tree, constraints)
+
+    def links_to(self, other: 'Collection', link_type: str, *_string_expressions: str,
+                 **_equalities) -> 'LinkCollection':
+        """Links of a kind running between this collection and another.
+
+            day2_rois.links_to(day1_rois, 'same_cell')
+            rois.links_to(phases, 'mean_response', mean_dff=0.5)
+
+        Which collection is the linker is worked out from the kind's endpoint
+        types, so the arguments may be given in either order when those types
+        differ. For a symmetric kind both storage orders are searched, since
+        which end is which is an artifact of uuid ordering there.
+        """
+        from .links import orientation
+
+        spec = self.entarchy.require_link_type(link_type)
+        own, others = self._as_endpoint(), other._as_endpoint()
+
+        if orientation(spec, own, others) == 'swapped':
+            constraints = [(other, self)]
+        else:
+            constraints = [(self, other)]
+
+        if spec.symmetric:
+            linker_side, linked_side = constraints[0]
+            constraints.append((linked_side, linker_side))
+
+        as_tree = self.entarchy._build_filter_tree(_string_expressions, _equalities)
+
+        return LinkCollection(self.entarchy, spec.name, as_tree, constraints)
 
     def __len__(self):
         if self._length is None:
@@ -1348,7 +1435,7 @@ class Collection(object):
 
 
 class LinkCollection(Collection):
-    """A queryable set of links of one kind.
+    """A queryable set of links of one kind, optionally with its ends pinned.
 
     Everything Collection does works here - slicing, dataframe_of, update,
     map_async, to_asdf - because a link is an entity. What it adds is the kind
@@ -1361,13 +1448,25 @@ class LinkCollection(Collection):
     A bare name is an attribute of the link itself; `@` addresses an endpoint.
     """
 
-    def __init__(self, _entarchy, _link_type: str, _as_tree):
+    def __init__(self, _entarchy, _link_type: str, _as_tree,
+                 _endpoint_constraints: list = None):
         Collection.__init__(self, _entarchy, LinkEntity, _as_tree)
         self._link_type = _link_type
+
+        # Pairs of (linker collection, linked collection), either side possibly
+        #  None for "anything", OR-ed together. Membership is applied as a
+        #  subquery rather than a list of uuids, so it composes with the member
+        #  collection's own filter and is not bounded by how many parameters a
+        #  statement may bind.
+        self._endpoint_constraints = list(_endpoint_constraints or [])
 
     @property
     def link_type(self) -> str:
         return self._link_type
+
+    @property
+    def endpoint_constraints(self) -> list:
+        return self._endpoint_constraints
 
     @property
     def link_type_spec(self):
@@ -1380,12 +1479,14 @@ class LinkCollection(Collection):
         return spec
 
     def _derive(self, _as_tree) -> 'LinkCollection':
-        return LinkCollection(self.entarchy, self._link_type, _as_tree)
+        return LinkCollection(self.entarchy, self._link_type, _as_tree,
+                              self._endpoint_constraints)
 
     def __repr__(self):
         if self.name is not None:
             return self.name
-        return f'LinkCollection(\'{self._link_type}\', count={len(self)})'
+        pinned = ' (endpoints restricted)' if self._endpoint_constraints else ''
+        return f'LinkCollection(\'{self._link_type}\'{pinned}, count={len(self)})'
 
 
 # Per-worker state for Collection.map_async.

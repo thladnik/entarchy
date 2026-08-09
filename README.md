@@ -59,6 +59,24 @@ entity type, or by role: `@linker`, `@linked`, `@either` (at least one end) and
 `@both`. `@linker`/`@linked` are refused for a symmetric kind, where which end
 is which is an artifact of uuid ordering.
 
+A collection can ask for the links reaching it, or the links *among* its own
+members — the collection against itself:
+
+```python
+rois = ent.get(Roi, 'has_receptive_field == True')
+
+rois.links('correlated')                 # at least one end is one of these ROIs
+rois.links('correlated', within=True)    # both ends are, i.e. among them
+rois.links('correlated', 'r > 0.8', within=True)
+
+day2.links_to(day1, 'same_cell')         # between two collections
+```
+
+Membership is applied as a subquery, so it composes with whatever filter the
+collection already carries and has no size limit. Spelling the members out as
+`@both.uuid IN (...)` also works, but binds one parameter per uuid per endpoint
+and gives up at roughly sixteen thousand.
+
 `ent.links(...)` returns a `LinkCollection`, so `map_async`, `dataframe_of`,
 `update`, set operations and `to_asdf` all work on links.
 

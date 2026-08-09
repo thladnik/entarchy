@@ -377,6 +377,10 @@ def _build_query_from_collection(_collection: Collection,
         _query = (_query.join(Link, Link.link_uuid == EntityTable.uuid)
                   .filter(Link.link_type == _collection.link_type))
 
+        endpoint_filter = _endpoint_membership_filter(_collection, _session)
+        if endpoint_filter is not None:
+            _query = _query.filter(endpoint_filter)
+
     # Apply filters generated from the abstract syntax tree
     if len(as_tree) == 0:
         return _query
@@ -385,6 +389,40 @@ def _build_query_from_collection(_collection: Collection,
         _QueryContext(entity_type_name, link_spec), _session, as_tree)
 
     return _query.filter(filters)
+
+
+def _endpoint_membership_filter(_collection: Collection, _session: sqlalchemy.orm.Session):
+    """Restrict a link collection to links whose ends lie in given collections.
+
+    Each constraint is a (linker collection, linked collection) pair, either side
+    None for "anything"; the pairs are OR-ed. Membership becomes a subquery over
+    the member collection's own query, so it carries that collection's filters
+    and is not limited by how many parameters a statement may bind - spelling the
+    members out as uuids gives up around sixteen thousand of them.
+    """
+    constraints = getattr(_collection, 'endpoint_constraints', None)
+    if not constraints:
+        return None
+
+    clauses = []
+    for linker_collection, linked_collection in constraints:
+        parts = []
+        if linker_collection is not None:
+            parts.append(Link.linker_uuid.in_(
+                _uuids_of(_build_query_from_collection(linker_collection, _session))))
+        if linked_collection is not None:
+            parts.append(Link.linked_uuid.in_(
+                _uuids_of(_build_query_from_collection(linked_collection, _session))))
+
+        if len(parts) == 1:
+            clauses.append(parts[0])
+        elif len(parts) > 1:
+            clauses.append(sqlalchemy.and_(*parts))
+
+    if len(clauses) == 0:
+        return None
+
+    return clauses[0] if len(clauses) == 1 else sqlalchemy.or_(*clauses)
 
 
 # Endpoint roles that address a link's ends rather than an entity type

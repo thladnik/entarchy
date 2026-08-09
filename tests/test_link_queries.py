@@ -390,3 +390,162 @@ class TestParallel:
                                                          'linked_index'])
         assert len(frame) == len(rois)
         np.testing.assert_allclose(frame['scaled'], frame['mean_dff'] * 3.0)
+
+
+class TestCollectionEndpoints:
+    """Links reaching a collection, and the collection against itself."""
+
+    def test_links_touching_the_collection(self, responses):
+        ent, recording, rois = responses
+        good = ent.get(Roi, 'good == True')
+
+        touching = good.links('mean_response')
+
+        assert isinstance(touching, LinkCollection)
+        assert len(touching) == len(ent.links('mean_response', '@either.good == True'))
+
+    def test_within_is_the_collection_against_itself(self, correlations):
+        ent, rois = correlations
+        good = ent.get(Roi, 'good == True')
+
+        within = good.links('correlated', within=True)
+
+        assert len(within) == len(ent.links('correlated', '@both.good == True'))
+
+    def test_within_differs_from_touching(self, correlations):
+        ent, rois = correlations
+        good = ent.get(Roi, 'good == True')
+
+        assert len(good.links('correlated')) > len(good.links('correlated', within=True))
+
+    def test_extra_filter_expressions(self, correlations):
+        ent, rois = correlations
+        good = ent.get(Roi, 'good == True')
+
+        assert len(good.links('correlated', 'r > 0.8')) == 1
+        assert len(good.links('correlated', 'r > 0.95')) == 0
+
+    def test_keyword_equalities(self, correlations):
+        ent, rois = correlations
+
+        assert len(ent.get(Roi).links('correlated', r=0.9)) == 1
+
+    def test_member_collection_filter_is_carried(self, responses):
+        """The constraint follows the member collection, filters and all."""
+        ent, recording, rois = responses
+
+        one = ent.get(Roi, 'index == 0')
+        assert len(one.links('mean_response')) == 1
+
+        two = ent.get(Roi, 'index IN (0, 1)')
+        assert len(two.links('mean_response')) == 2
+
+    def test_membership_is_a_subquery_not_a_uuid_list(self, correlations):
+        """Which is what removes the bound-parameter ceiling."""
+        from sqlalchemy.orm import Session as SASession
+
+        from entarchy.backend.sql import _build_query_from_collection
+
+        ent, rois = correlations
+        with SASession(ent.backend.sql_engine) as session:
+            statement = str(_build_query_from_collection(
+                ent.get(Roi).links('correlated', within=True), session))
+
+        assert 'IN (SELECT' in statement
+        # Spelling the members out would bind one parameter per uuid per endpoint
+        assert 'IN (?' not in statement
+
+
+class TestCollectionEndpointGuards:
+
+    def test_unknown_kind(self, responses):
+        ent, recording, rois = responses
+
+        with pytest.raises(links.LinkTypeError, match='not defined'):
+            ent.get(Roi).links('never_defined')
+
+    def test_collection_at_neither_end(self, responses):
+        ent, recording, rois = responses
+
+        with pytest.raises(links.LinkTypeError, match='neither end'):
+            ent.get(Animal).links('mean_response')
+
+    def test_within_needs_both_ends_to_match(self, responses):
+        """Otherwise the answer is always empty, which reads as a fact."""
+        ent, recording, rois = responses
+
+        with pytest.raises(links.LinkTypeError, match='within=True'):
+            ent.get(Roi).links('mean_response', within=True)
+
+    def test_within_is_allowed_for_a_same_type_kind(self, correlations):
+        ent, rois = correlations
+
+        assert len(ent.get(Roi).links('correlated', within=True)) == 2
+
+
+class TestLinksTo:
+
+    def test_between_two_collections(self, responses):
+        ent, recording, rois = responses
+        recordings = ent.get(Recording, f'uuid == "{recording.uuid}"')
+        first = ent.get(Roi, 'index IN (0, 1)')
+
+        assert len(recordings.links_to(first, 'mean_response')) == 2
+
+    def test_argument_order_does_not_matter(self, responses):
+        ent, recording, rois = responses
+        recordings = ent.get(Recording, f'uuid == "{recording.uuid}"')
+        first = ent.get(Roi, 'index IN (0, 1)')
+
+        assert (len(first.links_to(recordings, 'mean_response'))
+                == len(recordings.links_to(first, 'mean_response')))
+
+    def test_disjoint_collections_have_no_links(self, responses):
+        ent, recording, rois = responses
+        first = ent.get(Roi, 'index == 0')
+        others = ent.get(Recording, 'id == "does_not_exist"')
+
+        assert len(others.links_to(first, 'mean_response')) == 0
+
+    def test_symmetric_searches_both_orders(self, correlations):
+        """Storage order is uuid order, so a one-sided test would miss half."""
+        ent, rois = correlations
+        first = ent.get(Roi, f'uuid == "{rois[0].uuid}"')
+        second = ent.get(Roi, f'uuid == "{rois[1].uuid}"')
+
+        assert len(first.links_to(second, 'correlated')) == 1
+        assert len(second.links_to(first, 'correlated')) == 1
+
+    def test_mismatched_types_are_reported(self, responses):
+        ent, recording, rois = responses
+
+        with pytest.raises(links.LinkTypeError, match='connects'):
+            ent.get(Animal).links_to(ent.get(Animal), 'mean_response')
+
+
+class TestConstraintsSurviveDerivation:
+
+    def test_where_keeps_the_endpoints(self, correlations):
+        ent, rois = correlations
+        good = ent.get(Roi, 'good == True')
+        within = good.links('correlated', within=True)
+
+        assert len(within.where('r > 0.5')) == len(within)
+        assert isinstance(within.where('r > 0.5'), LinkCollection)
+
+    def test_intersection_keeps_the_endpoints(self, correlations):
+        ent, rois = correlations
+        good = ent.get(Roi, 'good == True')
+        within = good.links('correlated', within=True)
+
+        assert len(within & 'r > 0.95') == 0
+        assert len(within & 'r > 0.5') == len(within)
+
+    def test_inversion_keeps_the_endpoints(self, correlations):
+        ent, rois = correlations
+        good = ent.get(Roi, 'good == True')
+        within = good.links('correlated', within=True, r=0.9)
+
+        # Inverting the filter must not lift the endpoint restriction
+        inverted = ~within
+        assert len(inverted) < len(ent.links('correlated'))

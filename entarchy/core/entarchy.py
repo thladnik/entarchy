@@ -800,14 +800,20 @@ class Entarchy(object):
         Everything Collection offers works here, including map_async and
         to_asdf, since a link is an entity.
         """
-        if self.backend.get_link_type(link_type) is None:
-            defined = ', '.join(spec.name for spec in self.link_types()) or 'none'
+        spec = self.require_link_type(link_type)
+        as_tree = self._build_filter_tree(_string_expressions, _equalities)
+
+        return LinkCollection(self, spec.name, as_tree)
+
+    def require_link_type(self, link_type: str) -> links.LinkTypeSpec:
+        """The registered kind, or a message naming the ones that do exist."""
+        spec = self.backend.get_link_type(link_type)
+        if spec is None:
+            defined = ', '.join(other.name for other in self.link_types()) or 'none'
             raise links.LinkTypeError(
                 f'Link type "{link_type}" is not defined. Defined kinds: {defined}.')
 
-        as_tree = self._build_filter_tree(_string_expressions, _equalities)
-
-        return LinkCollection(self, link_type, as_tree)
+        return spec
 
     def get_links(self, link_type: str) -> LinkCollection:
         """Deprecated alias for links()."""
