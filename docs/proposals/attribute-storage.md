@@ -4,13 +4,17 @@ entarchy stores every attribute as a row in `attributes`, with seven typed value
 columns and a `data_type` saying which one holds the value. That is an EAV
 (entity–attribute–value) model, and EAV has a reputation for being slow. This
 document asks whether JSON columns would be better, answers it with
-measurements, and records the three fixes that came out of the exercise.
+measurements, and records the four fixes that came out of the exercise.
 
 **Conclusion: keep EAV.** The document form wins on bulk load, storage and the
 DataFrame pivot, but its filter advantage disappears once entities get wide or
 the per-attribute metadata comes along, and it structurally cannot answer the
-ancestor traversals entarchy's query language is built on. The three fixes below
-take the available wins without changing the model.
+ancestor traversals entarchy's query language is built on. The fixes below take
+the available wins without changing the model.
+
+The largest of them, as it turned out, had nothing to do with the storage model
+at all: the DataFrame path was spending more time working out which value column
+each attribute lived in than reading the values.
 
 ## What was compared
 
@@ -116,7 +120,7 @@ JSON document per entity   -> {'result_1': 1.0}                    one write los
 `json_set()` in SQL avoids the lost update where the new value can be expressed
 in SQL, but it still rewrites the whole document.
 
-## The three fixes
+## The four fixes
 
 None of them changes what a query returns.
 
@@ -185,6 +189,43 @@ maintains its own statistics.
 
 Existing databases have none at all, and get them from the tool below.
 
+### 4. Ask the type question of the table, not of the collection
+
+Before the pivot, `get_collection_attributes` has to know which value column
+each requested attribute lives in. It asked
+
+```sql
+SELECT DISTINCT a.name, a.data_type FROM attributes a
+  JOIN entities e ... JOIN entity_types t ...
+ WHERE a.name IN (...) AND t.name = 'Roi' AND e.uuid IN (<the collection>)
+```
+
+which tests collection membership for every attribute row in the collection to
+learn three facts. On the test entarchy that was **1024 ms**, more than the
+pivot it preceded, and the largest single cost of a DataFrame read.
+
+Dropping the restriction answers the same question in **31 ms** off the `name`
+index — but not always the same way, so it cannot simply be dropped:
+
+| what the narrow query gave | how it is kept |
+|---|---|
+| the data type of each name | the collection's rows are a subset of the table's, so a name stored with one type everywhere has that type here too |
+| a warning when a name has several types *in this collection* | only a name with several types **anywhere** can have several here, so the narrow query is still run — for those names alone |
+| an error when a name is on no entity in this collection | read off the pivot afterwards, which has just answered it |
+
+That last one is the subtle part. `dataframe_of(['depth'])` on a collection of
+ROIs must say so rather than return a column of NaN, and `depth` does exist —
+on `Layer`. Every value column is written non-NULL, so an all-NULL column after
+the pivot means nothing matched; floats are the exception, since NaN and Inf are
+stored as NULL plus a marker, and the marker columns tell the two apart. An
+empty collection still raises, as it did before.
+
+```
+dataframe_of, 1 of 23 attributes:  1343 -> 712 ms   1.89x
+dataframe_of, 3 of 23 attributes:  2443 -> 1370 ms  1.78x
+dataframe_of, 8 of 23 attributes:  5644 -> 3363 ms  1.68x
+```
+
 ### Applying them to an existing entarchy
 
 ```
@@ -199,30 +240,26 @@ Safe to repeat. On SQLite the space the index held goes on the free list; run
 
 On the 27 000-ROI test entarchy, through the API rather than in the benchmark:
 
-| | as shipped | optimised | |
+| | before | after | |
 |---|---|---|---|
+| `dataframe_of`, 1 of 23 attributes | 1343.5 ms | 712.3 ms | 1.89x |
+| `dataframe_of`, 3 of 23 attributes | 2443.1 ms | 1369.6 ms | 1.78x |
+| `dataframe_of`, 8 of 23 attributes | 5644.0 ms | 3362.5 ms | 1.68x |
 | filter `iscell == True` | 165.2 ms | 143.1 ms | 1.15x |
 | filter `s2p/npix > 200` | 8.5 ms | 8.5 ms | 1.00x |
 | filter `../depth > 0` | 20.6 ms | 21.0 ms | 1.00x |
-| pivot query, 3 of 23 attributes | 1329.7 ms | 1035.3 ms | 1.28x |
-| `dataframe_of`, 3 of 23, end to end | 2325.0 ms | 2139.3 ms | 1.09x |
 | file size | 1146 MB | 1102 MB after VACUUM | 44.1 MB |
 
-This is honest but underwhelming, and the reason is worth recording: the large
-ratios in the benchmark need either wide entities or an index the planner can
-choose between, and this entarchy has neither. The fixes are cheap and the
-upside is real, but they are not a transformation.
+Almost all of the DataFrame gain is fix 4, which is a plain application mistake
+and has nothing to do with EAV. Fixes 1 to 3 are worth 1.28x on the pivot query
+itself and 44 MB, and nothing measurable on filters — the large ratios in the
+benchmark need either wide entities or an index the planner can choose between,
+and this entarchy has neither. They are cheap and the upside is real, but on
+this dataset the storage-level work was not where the time was.
+
+That is the honest summary of the whole exercise: the model was not the problem.
 
 ## What is left
-
-**`get_collection_attributes` runs two queries, and the other one dominates.**
-Before the pivot it runs a `SELECT DISTINCT name, data_type` restricted to the
-collection, purely to learn which value column each attribute lives in. On the
-test entarchy that is **944 ms of the 2325 ms** a `dataframe_of` takes — more
-than the pivot it precedes. Without the collection join it answers the same
-thing in 49 ms, a 19x difference, but that changes semantics: the collection
-restriction is what makes the "attribute has multiple data types" warning
-meaningful. Worth doing, needs a decision about that warning first.
 
 **Blob attributes are 27% of the rows** on the test entarchy and each holds a
 pickled `Serializer` in `value_blob`, inline in the database unless the payload

@@ -1765,35 +1765,52 @@ class SQLBackend(Backend):
             # Get entity query for collection
             entity_query = _build_query_from_collection(_collection, session)
 
-            # Get attribute types for requested names.
-            #  Restricted to those names: the result is only ever read for them,
-            #  and without it this scans every attribute row of every entity in
-            #  the collection. On 27 000 entities with 21 attributes each that is
-            #  700 000 rows against a 27 000 row IN list, which SQLite does not
-            #  turn into anything usable - it ran for over nine minutes.
-            attribute_types = {}
-            distinct_attribute_query = (session.query(AttributeTable.name, AttributeTable.data_type)
-                                        .filter(AttributeTable.name.in_(names))
-                                        .join(EntityTable)
-                                        .filter(EntityTable.uuid.in_(_uuids_of(entity_query)))
-                                        .join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
-                                        .distinct())
+            # Which value column holds each requested attribute.
+            #
+            #  Asked of the whole table rather than of the collection, which is
+            #  the difference between reading an index and walking every
+            #  attribute row of every entity in the collection to test its
+            #  membership: 31 ms against 1024 ms on 27 000 ROIs, and it used to
+            #  be the largest single cost of a DataFrame read.
+            #
+            #  It gives the same answer. The collection's rows are a subset of
+            #  the table's, so a name stored with one type everywhere has that
+            #  type here too. Only a name stored with several types anywhere
+            #  needs the narrower question asked, and that is the rare case the
+            #  warning below exists for.
+            global_types: dict[str, set] = {}
+            for row in (session.query(AttributeTable.name, AttributeTable.data_type)
+                        .filter(AttributeTable.name.in_(names)).distinct().all()):
+                global_types.setdefault(row.name, set()).add(row.data_type)
 
-            for row in distinct_attribute_query.all():
-                if row.name in attribute_types:
-                    if attribute_types[row.name] != row.data_type:
+            unknown_names = [n for n in names if n not in global_types]
+            if len(unknown_names) > 0:
+                raise AttributeError(f'Attribute(s) {unknown_names} not found '
+                                     f'on any entity in {_collection}.')
+
+            attribute_types = {n: next(iter(global_types[n])) for n in names}
+
+            ambiguous_names = [n for n in names if len(global_types[n]) > 1]
+            if len(ambiguous_names) > 0:
+                # Only now is it worth asking what this collection actually holds
+                resolved: dict[str, str] = {}
+                for row in (session.query(AttributeTable.name, AttributeTable.data_type)
+                            .filter(AttributeTable.name.in_(ambiguous_names))
+                            .join(EntityTable)
+                            .filter(EntityTable.uuid.in_(_uuids_of(entity_query)))
+                            .join(EntityTypeTable)
+                            .filter(EntityTypeTable.name == entity_type_name)
+                            .distinct().all()):
+                    if row.name in resolved and resolved[row.name] != row.data_type:
                         # TODO: add runtime resolution of problem
                         #        option: always use scalars where available
                         warnings.warn(f'Attribute "{row.name}" has multiple data types in the selected collection. '
-                                      f'Using {row.data_type} (not {attribute_types[row.name]}).',
+                                      f'Using {row.data_type} (not {resolved[row.name]}).',
                                       RuntimeWarning)
 
-                attribute_types[row.name] = row.data_type
+                    resolved[row.name] = row.data_type
 
-            missing_names = [n for n in names if n not in attribute_types]
-            if len(missing_names) > 0:
-                raise AttributeError(f'Attribute(s) {missing_names} not found '
-                                     f'on any entity in {_collection}.')
+                attribute_types.update(resolved)
 
             # Construct query to fetch attributes
             #  Build cases which return correct value field based on attr_name's data_type
@@ -1855,6 +1872,28 @@ class SQLBackend(Backend):
 
         # Create DataFrame from query result
         df = pd.DataFrame(columns=column_labels, data=attribute_query.all())
+
+        # A requested name that no entity in this collection has.
+        #
+        #  Read off the pivot, which has just answered it, rather than asked
+        #  beforehand - asking meant testing collection membership for every
+        #  attribute row in the collection, and that was the single largest cost
+        #  of this function. Every value column is written non-NULL, so an
+        #  all-NULL column means nothing matched; floats are the exception,
+        #  since NaN and Inf are stored as NULL plus a marker, and the marker
+        #  columns tell the two apart.
+        absent_names = []
+        for n in names:
+            if df[n].notna().any():
+                continue
+            if n in float_attribute_names and (df[f'{n}__isnan'].notna().any()
+                                               or df[f'{n}__isinf'].notna().any()):
+                continue
+            absent_names.append(n)
+
+        if len(absent_names) > 0:
+            raise AttributeError(f'Attribute(s) {absent_names} not found '
+                                 f'on any entity in {_collection}.')
 
         # Convert all types correctly (default result will likely contain bytestring values
         for n in names:

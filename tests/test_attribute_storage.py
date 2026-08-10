@@ -6,6 +6,7 @@ The three came out of benchmarking EAV against JSON columns
 what these tests mostly assert is exactly that.
 """
 import os
+import warnings
 
 import pytest
 import sqlalchemy
@@ -218,3 +219,82 @@ class TestPivotNameFilter:
 
         assert len(frame) == 12
         assert frame['sparse'].notna().sum() == 4
+
+
+class TestAttributeTypeLookup:
+    """Which value column each requested attribute lives in is now asked of the
+    whole table and narrowed only when a name turns out to be stored with more
+    than one type. Everything these tests assert is behaviour that has to be the
+    same as when the question was asked of the collection directly."""
+
+    def test_an_attribute_of_another_entity_type_is_still_an_error(self, deep):
+        """The name exists - on Layer - so the cheap lookup finds it. It is the
+        collection it is not in, and that still has to be reported rather than
+        answered with a column of NaN."""
+        assert 'depth' in {name for layer in deep.get(Layer) for name in layer.keys()}
+
+        with pytest.raises(AttributeError, match='depth'):
+            deep.get(Roi).dataframe_of(['depth'])
+
+    def test_a_name_that_exists_nowhere_is_an_error(self, deep):
+        with pytest.raises(AttributeError, match='never_written'):
+            deep.get(Roi).dataframe_of(['never_written'])
+
+    def test_an_empty_collection_is_an_error(self, deep):
+        empty = deep.get(Roi, 'index > 99')
+        assert len(empty) == 0
+
+        with pytest.raises(AttributeError, match='index'):
+            empty.dataframe_of(['index'])
+
+    def test_only_one_of_several_names_missing_is_named(self, deep):
+        with pytest.raises(AttributeError, match=r"\['never_written'\]"):
+            deep.get(Roi).dataframe_of(['index', 'never_written'])
+
+    def test_an_all_nan_float_is_not_mistaken_for_absent(self, deep):
+        """NaN is stored as NULL plus a marker, so the column is empty even
+        though every entity has the attribute."""
+        for roi in deep.get(Roi):
+            roi['score'] = float('nan')
+
+        frame = deep.get(Roi).dataframe_of(['score'])
+
+        assert len(frame) == 12
+        assert frame['score'].isna().all()
+
+    def test_an_all_inf_float_is_not_mistaken_for_absent(self, deep):
+        for roi in deep.get(Roi):
+            roi['score'] = float('inf')
+
+        frame = deep.get(Roi).dataframe_of(['score'])
+
+        assert len(frame) == 12
+        assert (frame['score'] == float('inf')).all()
+
+    def test_a_name_stored_with_two_types_still_warns(self, deep):
+        """The narrow query is only run for names like this one, and it is the
+        only thing that can say what the collection holds."""
+        rois = sorted(deep.get(Roi), key=lambda e: e.uuid)
+        for index, roi in enumerate(rois):
+            roi['mixed'] = index if index % 2 else f'value_{index}'
+
+        with pytest.warns(RuntimeWarning, match='multiple data types'):
+            frame = deep.get(Roi).dataframe_of(['mixed'])
+
+        assert len(frame) == 12
+
+    def test_two_types_across_entity_types_does_not_warn(self, deep):
+        """`count` is an int on Roi and a string on Layer. Within the Roi
+        collection there is nothing ambiguous, so the warning must stay quiet -
+        the cheap lookup sees both types and has to narrow before deciding."""
+        for roi in deep.get(Roi):
+            roi['count'] = 3
+        for layer in deep.get(Layer):
+            layer['count'] = 'three'
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', RuntimeWarning)
+            frame = deep.get(Roi).dataframe_of(['count'])
+
+        assert (frame['count'] == 3).all()
+        assert str(frame['count'].dtype) == 'Int64'
