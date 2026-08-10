@@ -593,6 +593,22 @@ class TestLinkWrites:
         assert populated.backend.count_links_of_type('correlated') == 1
         assert populated.get_link(sessions[1], sessions[0], 'correlated')['r'] == 0.9
 
+    def test_counts_per_kind(self, populated):
+        """Grouped and counted in the database, which is where the dialects can
+        differ - the entity repr calls this on every display."""
+        subject = populated.get(Subject)[0]
+        sessions = list(populated.get(Session))
+
+        with populated:
+            for session_entity in sessions:
+                populated.link(subject, session_entity, 'mean_response')
+            populated.link(subject, sessions[0], 'peak_latency')
+
+        assert subject.link_counts() == {'mean_response': len(sessions),
+                                         'peak_latency': 1}
+        assert sessions[0].link_counts() == {'mean_response': 1, 'peak_latency': 1}
+        assert sessions[1].link_counts() == {'mean_response': 1}
+
     def test_blob_attribute_on_a_link(self, populated):
         """Links get the full attribute machinery, LONGBLOB included."""
         subject = populated.get(Subject)[0]

@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 import _mp_worker
-from conftest import Session, Subject
+from conftest import Recording, Roi, Session, Subject
 from entarchy.core import entity as entity_module
 from entarchy.core.entity import shutdown_worker_pool
 
@@ -169,6 +169,90 @@ class TestEntityHtmlRepr:
 
         rendered = entity._repr_html_()
         assert 'Session' in rendered
+
+
+class TestEntityHtmlReprLinks:
+    """The links line, which is the only place in the repr that links appear:
+    keys() lists attributes, and links are the other half of what an entity has."""
+
+    @pytest.fixture()
+    def linked(self, deep):
+        recording = sorted(deep.get(Recording), key=lambda e: e.id)[0]
+        rois = sorted(deep.get(Roi), key=lambda e: e.uuid)
+
+        with deep:
+            for roi in rois[:3]:
+                deep.link(recording, roi, 'mean_response', mean_dff=0.1)
+            deep.link(recording, rois[0], 'peak_latency', latency=0.3)
+
+        return deep, recording, rois
+
+    def test_omitted_when_the_entity_has_no_links(self, deep):
+        """An entarchy that uses no links reads exactly as it did before."""
+        rendered = deep.get(Roi)[0]._repr_html_()
+
+        assert 'link kind' not in rendered
+        assert 'entity.links(' not in rendered
+
+    def test_lists_kinds_with_counts(self, linked):
+        ent, recording, rois = linked
+
+        rendered = recording._repr_html_()
+
+        assert '2 link kinds' in rendered
+        assert 'mean_response' in rendered and '(3)' in rendered
+        assert 'peak_latency' in rendered and '(1)' in rendered
+        assert 'entity.links(' in rendered
+
+    def test_counts_links_from_either_end(self, linked):
+        """The ROI is the linked end of every one of these, so a count that only
+        looked at linker_uuid would show it as unlinked."""
+        ent, recording, rois = linked
+
+        assert '2 link kinds' in rois[0]._repr_html_()
+
+    def test_singular_for_a_single_kind(self, linked):
+        ent, recording, rois = linked
+        assert '1 link kind<' in rois[1]._repr_html_()
+
+    def test_does_not_load_attribute_values(self, linked):
+        ent, recording, rois = linked
+        recording._attribute_cache.clear()
+
+        recording._repr_html_()
+
+        assert recording._attribute_cache == {}
+
+    def test_kind_list_is_capped(self, linked, monkeypatch):
+        monkeypatch.setattr(entity_module, '_HTML_MAX_LINK_TYPES', 1)
+        ent, recording, rois = linked
+
+        assert 'and 1 more' in recording._repr_html_()
+
+    def test_escapes_the_kind_name(self, deep):
+        """Kind names are invented at runtime and never validated, so they reach
+        the repr as whatever the user typed."""
+        recording = sorted(deep.get(Recording), key=lambda e: e.id)[0]
+        roi = sorted(deep.get(Roi), key=lambda e: e.uuid)[0]
+
+        with deep:
+            deep.link(recording, roi, '<script>alert(1)</script>')
+
+        rendered = recording._repr_html_()
+        assert '<script>' not in rendered
+        assert '&lt;script&gt;' in rendered
+
+    def test_survives_a_backend_that_cannot_count_links(self, deep, monkeypatch):
+        """Links are an addition to the repr, so a backend without them loses the
+        line rather than the whole representation."""
+        entity = deep.get(Roi)[0]
+        monkeypatch.setattr(type(entity), 'link_counts',
+                            lambda self: (_ for _ in ()).throw(RuntimeError('boom')))
+
+        rendered = entity._repr_html_()
+
+        assert 'Roi' in rendered and 'index' in rendered
+        assert 'link kind' not in rendered
 
 
 class TestCollectionHtmlRepr:

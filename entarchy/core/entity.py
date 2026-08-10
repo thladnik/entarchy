@@ -237,9 +237,11 @@ class Entity(object):
 
     def link_types(self) -> list[str]:
         """Which kinds of link touch this entity."""
-        rows = self.entarchy.backend.get_links_for_entity(self.uuid)
+        return list(self.entarchy.backend.count_links_by_type(self.uuid))
 
-        return sorted({row['link_type'] for row in rows})
+    def link_counts(self) -> dict[str, int]:
+        """How many links of each kind touch this entity, keyed by kind."""
+        return self.entarchy.backend.count_links_by_type(self.uuid)
 
     def __repr__(self):
         return f'{self.__class__.__name__}(id=\'{self.id}\' uuid=\'{self.uuid}\')'
@@ -250,6 +252,10 @@ class Entity(object):
         Lists attribute names but deliberately does not read their values: a single
         entity can hold hundreds of megabytes of array data, which must not be
         loaded just because it was the last expression in a cell.
+
+        Link kinds are listed alongside the attributes, since links are the half
+        of an entity that keys() does not show. The line is omitted when nothing
+        links to this entity, so an entarchy that uses no links reads as before.
         """
         try:
             rows = [('type', self.__class__.__name__),
@@ -267,6 +273,12 @@ class Entity(object):
             if len(names) > len(shown):
                 listing += f' <span style="color:#888">... and {len(names) - len(shown)} more</span>'
 
+            try:
+                counts = self.link_counts()
+            except Exception:
+                # A backend without links, or one that cannot be reached
+                counts = {}
+
             body = ''.join(
                 f'<tr><td style="text-align:right;color:#888;padding-right:8px">{html.escape(str(k))}</td>'
                 f'<td style="font-family:monospace">{html.escape(str(v))}</td></tr>'
@@ -276,9 +288,12 @@ class Entity(object):
                     f'<table style="border:none">{body}'
                     f'<tr><td style="text-align:right;color:#888;padding-right:8px;vertical-align:top">'
                     f'{len(names)} attributes</td><td>{listing}</td></tr>'
+                    f'{_links_row_html(counts)}'
                     f'</table>'
                     f'<div style="color:#888;font-size:90%">read values with '
-                    f'<code>entity[&#39;name&#39;]</code></div>'
+                    f'<code>entity[&#39;name&#39;]</code>'
+                    f'{", links with <code>entity.links(&#39;kind&#39;)</code>" if counts else ""}'
+                    f'</div>'
                     f'</div>')
         except Exception:
             # A repr must never break a notebook session
@@ -1502,6 +1517,26 @@ _POOL_CACHE: dict[str, Any] = {}
 #  automatically whenever an object is the last expression in a cell.
 _HTML_MAX_ATTRIBUTES = 40
 _HTML_PREVIEW_ROWS = 5
+_HTML_MAX_LINK_TYPES = 12
+
+
+def _links_row_html(counts: dict[str, int]) -> str:
+    """The link kinds row of the entity repr, or nothing when there are none."""
+    if not counts:
+        return ''
+
+    shown = list(counts)[:_HTML_MAX_LINK_TYPES]
+    listing = ', '.join(f'{html.escape(str(name))} '
+                        f'<span style="color:#888">({counts[name]})</span>'
+                        for name in shown)
+    if len(counts) > len(shown):
+        listing += (f' <span style="color:#888">... and '
+                    f'{len(counts) - len(shown)} more</span>')
+
+    label = f'{len(counts)} link {"kind" if len(counts) == 1 else "kinds"}'
+
+    return (f'<tr><td style="text-align:right;color:#888;padding-right:8px;'
+            f'vertical-align:top">{label}</td><td>{listing}</td></tr>')
 
 
 def _fallback_html(obj: Any) -> str:

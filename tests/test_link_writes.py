@@ -289,6 +289,34 @@ class TestReading:
 
         assert rois[0].link_types() == ['mean_response', 'peak_latency']
 
+    def test_link_counts_on_an_entity(self, wired):
+        ent, recording, rois = wired
+
+        with ent:
+            ent.link(recording, rois[0], 'mean_response')
+            ent.link(recording, rois[1], 'mean_response')
+            ent.link(recording, rois[0], 'peak_latency')
+
+        assert recording.link_counts() == {'mean_response': 2, 'peak_latency': 1}
+        assert rois[1].link_counts() == {'mean_response': 1}
+
+    def test_link_counts_see_both_ends(self, wired):
+        """Counted from either end, so an entity that is only ever the linked
+        end does not look unlinked."""
+        ent, recording, rois = wired
+        ent.define_link_type('granger', Roi, Roi, symmetric=False)
+
+        with ent:
+            ent.link(rois[0], rois[1], 'granger')
+            ent.link(rois[2], rois[0], 'granger')
+
+        assert rois[0].link_counts() == {'granger': 2}
+        assert rois[1].link_counts() == {'granger': 1}
+
+    def test_link_counts_is_empty_without_links(self, wired):
+        ent, recording, rois = wired
+        assert rois[0].link_counts() == {}
+
     def test_get_link_returns_none_for_an_unknown_kind(self, wired):
         ent, recording, rois = wired
 

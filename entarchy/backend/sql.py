@@ -1587,6 +1587,23 @@ class SQLBackend(Backend):
                     for row in query.order_by(Link.link_uuid).all()]
 
     @_retry_on_operational_failure
+    def count_links_by_type(self, entity_uuid: str) -> dict[str, int]:
+        """How many links of each kind touch an entity, ordered by kind.
+
+        Counted in the database rather than by loading the rows, because the
+        callers are a repr and link_types(), and an entity can sit on tens of
+        thousands of links - a pairwise correlation over a layer of ROIs gives
+        every one of them a link to every other.
+        """
+        with self.sql_session as session:
+            rows = (session.query(Link.link_type, sqlalchemy.func.count())
+                    .filter(sqlalchemy.or_(Link.linker_uuid == entity_uuid,
+                                           Link.linked_uuid == entity_uuid))
+                    .group_by(Link.link_type).order_by(Link.link_type).all())
+
+        return {link_type: int(count) for link_type, count in rows}
+
+    @_retry_on_operational_failure
     def get_links_of_type(self, link_type: str) -> list[dict]:
         with self.sql_session as session:
             return [{'link_uuid': row.link_uuid, 'link_type': row.link_type,

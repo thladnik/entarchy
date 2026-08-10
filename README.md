@@ -187,6 +187,11 @@ deliberately cheap: they show identity and attribute *names* without loading
 values, since a single entity can hold hundreds of megabytes of arrays. Use
 `collection.preview()` or `collection.dataframe_of([...])` to read values.
 
+An entity that has links also lists its link kinds and how many of each, counted
+in the database rather than by loading them. The line is left out entirely when
+nothing links to the entity, so an entarchy that uses no links looks unchanged.
+`entity.link_counts()` returns the same thing as a dict.
+
 **One caveat for parallel work.** Worker processes are started with `spawn`, so
 they must import the function being mapped. A function defined in a notebook cell
 lives in a `__main__` that workers cannot import. entarchy detects this and either
