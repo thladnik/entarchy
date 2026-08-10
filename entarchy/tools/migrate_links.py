@@ -31,7 +31,7 @@ import sys
 import sqlalchemy
 
 from ..backend.sql import Base, Link, LinkTypeTable
-from .repair_blobs import _resolve_url
+from ._url import _resolve_url
 
 
 class LinkMigrationError(RuntimeError):

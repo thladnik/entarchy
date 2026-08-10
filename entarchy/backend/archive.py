@@ -36,10 +36,10 @@ import sqlalchemy
 from sqlalchemy import create_engine
 
 from . import asdf_store
-from .sql import AttributeTable, Base, EntityTable, EntityTypeTable, Link, Serializer
+from .sql import AttributeTable, Base, EntityTable, EntityTypeTable, Link
 from .sqlite import SQLiteBackend
 
-__all__ = ['ArchiveBackend', 'ArchiveReadOnlyError', 'Serializer', 'Base',
+__all__ = ['ArchiveBackend', 'ArchiveReadOnlyError', 'Base',
            'EntityTable', 'EntityTypeTable', 'AttributeTable', 'Link']
 
 INDEX_NAME = 'index.sqlite'

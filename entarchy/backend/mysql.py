@@ -9,14 +9,14 @@ from urllib.parse import quote_plus
 import sqlalchemy
 from sqlalchemy import create_engine
 
-from .sql import (AttributeTable, Base, EntityTable, EntityTypeTable, Link, SQLBackend, Serializer,
+from .sql import (AttributeTable, Base, EntityTable, EntityTypeTable, Link, SQLBackend,
                   _build_query_from_collection, _deserialize, _generate_attribute_filters,
                   _get_attribute_fp, _get_entity_type_ancestor_distance, _get_namehash,
                   _read_attribute_data, _retry_on_operational_failure, _write_attribute_data)
 
-# Re-exported so that "from entarchy.backend.mysql import Serializer" and similar
-#  keep working, and so stored pickles referencing this module still resolve
-__all__ = ['MySQLBackend', 'Serializer', 'Base', 'EntityTable', 'EntityTypeTable',
+# The table classes are re-exported because both backends are written against
+#  them; nothing here exists for the sake of already-stored data
+__all__ = ['MySQLBackend', 'Base', 'EntityTable', 'EntityTypeTable',
            'AttributeTable', 'Link']
 
 

@@ -34,7 +34,6 @@ import argparse
 import datetime
 import os
 import pathlib
-import pickle
 import re
 import shutil
 import sys
@@ -45,10 +44,10 @@ import sqlalchemy
 import yaml
 from sqlalchemy.orm import Session
 
-from ..backend import asdf_store
+from ..backend import asdf_store, blob_store
 from ..backend.archive import BLOCK_DIR, INDEX_NAME, META_NAME
 from ..backend.sql import (AttributeTable, Base, EntityTable, EntityTypeTable, Link,
-                          LinkTypeTable, Serializer)
+                          LinkTypeTable, _store_blob)
 
 ARCHIVE_FORMAT_VERSION = 1
 
@@ -442,7 +441,7 @@ def _export_group(session, source_ent, member_uuids, parent_uuid, entity_by_uuid
         AttributeTable.entity_uuid.in_(list(member_uuids))).all()
 
     # Name the file after the entities that actually contribute payloads, which is
-    #  needed before the first Serializer pointer is written
+    #  needed before the first blob pointer is written
     content_types = set()
     for row in rows:
         if row.data_type == 'blob' and row.value_blob is not None:
@@ -466,23 +465,21 @@ def _export_group(session, source_ent, member_uuids, parent_uuid, entity_by_uuid
             where = f'{entity_by_uuid.get(row.entity_uuid, {}).get("id", "?")}.{row.name}'
 
             try:
-                value = pickle.loads(row.value_blob).deserialize(source_ent)
+                value = blob_store.loads(row.value_blob, root_path=source_ent.path)
             except Exception as err:
                 stats['broken'].append((where, str(err)))
                 if not skip_broken:
                     raise ExportError(
                         f'Could not read blob attribute "{row.name}" of entity '
                         f'"{where}": {err}\n'
-                        f'Blobs written by older versions may need repairing first '
-                        f'(python -m entarchy.tools.repair_blobs), or pass --skip-broken '
-                        f'to leave the attribute out of the archive.') from err
+                        f'Pass --skip-broken to leave the attribute out of the '
+                        f'archive.') from err
                 continue
 
-            blobs[key] = asdf_store.encode(value, report, where)
+            blobs[key] = blob_store.encode(value, report, where)
             # The archive keeps a pointer in exactly the same place a live
             #  entarchy does, which is why nothing above the backend changes
-            record['value_blob'] = pickle.dumps(
-                _archive_serializer(type(value), relative_path, key, row.data_size))
+            record['value_blob'] = blob_store.dumps_archived(relative_path, key)
             stats['blobs'] += 1
 
         exported.append(record)
@@ -490,31 +487,19 @@ def _export_group(session, source_ent, member_uuids, parent_uuid, entity_by_uuid
     return exported, blobs, relative_path, content_types
 
 
-def _archive_serializer(value_type: type, relative_path: str, key: str, data_size: int) -> Serializer:
-    serializer = Serializer()
-    serializer._type = value_type
-    serializer._store = asdf_store.make_store(relative_path, key)
-    serializer._data_size = data_size or 0
-
-    return serializer
-
-
 def _blob_pointer_tree(attribute_rows: list[dict]) -> dict:
     """Where each blob lives, so meta.asdf alone is enough to rebuild the index."""
-    keys, stores, types = [], [], []
+    keys, stores = [], []
     for row in attribute_rows:
         if row['data_type'] != 'blob' or row.get('value_blob') is None:
             continue
 
-        serializer = pickle.loads(row['value_blob'])
         keys.append(f'{row["entity_uuid"]}/{row["name"]}')
-        stores.append(getattr(serializer, '_store', ''))
-        types.append(getattr(getattr(serializer, '_type', None), '__name__', ''))
+        stores.append(blob_store.store_of(row['value_blob']))
 
     return {'count': len(keys),
             'key': np.array(keys, dtype=np.str_),
-            'store': np.array(stores, dtype=np.str_),
-            'type_name': np.array(types, dtype=np.str_)}
+            'store': np.array(stores, dtype=np.str_)}
 
 
 def _write_config(source_ent, destination: str) -> None:
@@ -590,23 +575,18 @@ def rebuild_index(archive_path: str, verbose: bool = True) -> int:
         link_rows = _tree_to_table(handle['links'], _LINK_COLUMNS)
         attribute_rows = _tree_to_table(handle['attributes'], _ATTRIBUTE_COLUMNS)
 
-        # Blob pointers are held separately, since value_blob is a pickled
-        #  Serializer rather than a value
+        # Blob pointers are held separately, since value_blob holds a pointer
+        #  rather than the value
         pointer_tree = handle['attribute_blobs']
         pointers = {}
         for index in range(int(pointer_tree['count'])):
-            key = str(pointer_tree['key'][index])
-            pointers[key] = (str(pointer_tree['store'][index]),
-                             str(pointer_tree['type_name'][index]))
+            pointers[str(pointer_tree['key'][index])] = str(pointer_tree['store'][index])
 
     for row in attribute_rows:
         key = f'{row["entity_uuid"]}/{row["name"]}'
         if row['data_type'] == 'blob' and key in pointers:
-            store, type_name = pointers[key]
-            relative_path, blob_key = asdf_store.parse_store(store)
-            value_type = {'ndarray': np.ndarray, 'bytes': bytes}.get(type_name, object)
-            row['value_blob'] = pickle.dumps(
-                _archive_serializer(value_type, relative_path, blob_key, row['data_size']))
+            relative_path, blob_key = asdf_store.parse_store(pointers[key])
+            row['value_blob'] = blob_store.dumps_archived(relative_path, blob_key)
         else:
             row['value_blob'] = None
 
@@ -682,15 +662,15 @@ def import_archive(archive_path: str, destination: str, overwrite: bool = False,
                 if row.value_blob is None:
                     continue
 
-                serializer = pickle.loads(row.value_blob)
-                if not getattr(serializer, '_store', '').startswith(asdf_store.STORE_PREFIX):
+                if not blob_store.store_of(row.value_blob).startswith(asdf_store.STORE_PREFIX):
                     continue
 
-                value = serializer.deserialize(archive_ent)
+                value = blob_store.loads(row.value_blob, root_path=archive_ent.path)
 
-                fresh = Serializer()
-                fresh.serialize(value, destination, row.entity_uuid, row.name, max_blob_size=0)
-                row.value_blob = pickle.dumps(fresh)
+                # max_blob_size 0 puts every payload in a file of its own, which
+                #  is what the live ext/ layout is
+                row.value_blob = _store_blob(value, destination, 0,
+                                             row.entity_uuid, row.name)
                 stats['blobs'] += 1
 
             session.commit()

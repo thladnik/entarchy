@@ -75,14 +75,31 @@ class TestEntityBlobRoundtrip:
         ext_dir = os.path.join(populated.path, 'ext')
         assert os.path.isdir(ext_dir)
 
-    def test_data_size_reflects_payload(self, populated, subject):
-        arr = np.zeros(1000, dtype=np.float64)  # 8000 payload bytes
+    def test_data_size_is_what_was_stored(self, populated, subject):
+        """Bytes actually written, not the size of the value in memory - an
+        array of zeros compresses to a fraction of its 8000 payload bytes."""
+        import sqlite3
+
+        arr = np.zeros(1000, dtype=np.float64)
         subject['sized'] = arr
+
+        con = sqlite3.connect(os.path.join(populated.path, 'test.db'))
+        size, stored = con.execute(
+            "SELECT data_size, LENGTH(value_blob) FROM attributes "
+            "WHERE name = 'sized'").fetchone()
+        con.close()
+
+        assert size == stored
+
+    def test_data_size_tracks_the_value_for_incompressible_data(self, populated, subject):
+        arr = np.random.default_rng(0).random(1000)
+        subject['noise'] = arr
 
         import sqlite3
         con = sqlite3.connect(os.path.join(populated.path, 'test.db'))
-        size = con.execute("SELECT data_size FROM attributes WHERE name = 'sized'").fetchone()[0]
+        size = con.execute("SELECT data_size FROM attributes WHERE name = 'noise'").fetchone()[0]
         con.close()
+
         assert size >= arr.nbytes
 
 
@@ -164,7 +181,7 @@ class TestCollectionWriteRoundtrip:
         max_blob = con.execute(
             "SELECT MAX(LENGTH(value_blob)) FROM attributes WHERE name = 'c_big'").fetchone()[0]
         con.close()
-        assert max_blob < 1024  # only the pickled Serializer stub, not the 512-byte payload x duplication
+        assert max_blob < 1024  # only the pointer to the file, not the payload
 
     def test_update_overwrites_previous_type(self, populated):
         sessions = populated.get(Session)

@@ -15,7 +15,7 @@ from entarchy.backend import SQLiteBackend
 
 asdf = pytest.importorskip('asdf')
 
-from entarchy.backend import asdf_store  # noqa: E402
+from entarchy.backend import asdf_store, blob_store  # noqa: E402
 from entarchy.backend.archive import BLOCK_DIR, INDEX_NAME, META_NAME, ArchiveReadOnlyError  # noqa: E402
 from entarchy.tools import archive as archive_tool  # noqa: E402
 
@@ -596,7 +596,7 @@ class TestImportBack:
             with Session(imported.backend.sql_engine) as session:
                 rows = session.query(AttributeTable).filter(
                     AttributeTable.data_type == 'blob').all()
-                stores = [pickle.loads(row.value_blob)._store for row in rows]
+                stores = [blob_store.store_of(row.value_blob) for row in rows]
 
             assert len(stores) > 0
             assert not any(store.startswith(asdf_store.STORE_PREFIX) for store in stores)

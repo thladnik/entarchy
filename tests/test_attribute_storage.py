@@ -221,6 +221,43 @@ class TestPivotNameFilter:
         assert frame['sparse'].notna().sum() == 4
 
 
+class TestLongStrings:
+    """value_str is Text rather than a bounded VARCHAR. It used to be
+    String(500): SQLite ignores a declared length so a long string round-tripped
+    there, while MySQL rejected the same write."""
+
+    @pytest.mark.parametrize('length', [499, 500, 501, 5000, 100_000])
+    def test_a_string_of_any_length_round_trips(self, populated, length):
+        entity = populated.get(Session)[0]
+        text = 'x' * length
+
+        entity['note'] = text
+        entity._attribute_cache.clear()
+
+        assert entity['note'] == text
+
+    def test_the_column_has_no_declared_length(self):
+        assert AttributeTable.__table__.columns['value_str'].type.length is None
+
+    def test_a_long_string_stays_a_string(self, populated):
+        """It must not be diverted to the blob path: a filter compares against
+        value_str, and a blob-stored string would silently never match."""
+        entity = populated.get(Session)[0]
+        entity['note'] = 'y' * 2000
+
+        collection = populated.get(Session, f'note == "{"y" * 2000}"')
+
+        assert len(collection) == 1
+        assert collection[0].uuid == entity.uuid
+
+    def test_a_long_string_survives_a_collection_write(self, populated):
+        collection = populated.get(Session)
+        collection['note'] = 'z' * 3000
+
+        assert (populated.get(Session).dataframe_of(['note'])['note']
+                == 'z' * 3000).all()
+
+
 class TestAttributeTypeLookup:
     """Which value column each requested attribute lives in is now asked of the
     whole table and narrowed only when a name turns out to be stored with more

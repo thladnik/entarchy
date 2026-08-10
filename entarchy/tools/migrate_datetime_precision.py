@@ -24,7 +24,7 @@ import sys
 
 import sqlalchemy
 
-from .repair_blobs import _resolve_url
+from ._url import _resolve_url
 
 # Columns that carry a timestamp, and therefore need fractional seconds
 TIMESTAMP_COLUMNS = [

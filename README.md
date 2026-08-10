@@ -121,21 +121,28 @@ resolved in this order:
 2. the `ENTARCHY_DB_PASSWORD` environment variable,
 3. an interactive prompt.
 
-### Repairing blob attributes written by older versions
+### How values are stored
 
-Versions prior to this one corrupted blob attributes written through the
-*collection* path (`collection['attr'] = series` / `Collection.update()`);
-reading them fails with `AttributeError: 'Series' object has no attribute
-'deserialize'`. The payload is fully recoverable:
+Scalars — `str`, `int`, `float`, `bool`, `date`, `datetime` — go into a typed
+column of their own, so filters compare against them directly. Strings have no
+length limit.
 
-```sh
-# dry run first, then apply
-python -m entarchy.tools.repair_blobs /path/to/entarchy_dir
-python -m entarchy.tools.repair_blobs /path/to/entarchy_dir --apply
-```
+Everything else is a blob: arrays, lists, dicts, tuples, bytes. Those are
+encoded by `entarchy.backend.blob_store` into a JSON header describing the
+structure plus the arrays as raw buffers, held in the row unless the result
+reaches `max_blob_size` (10 MB by default), in which case it goes to a file
+under `ext/` and the row keeps a pointer.
 
-The tool also accepts a SQLite file path or a full SQLAlchemy URL for
-MySQL-backed entarchies.
+**Nothing stored is a pickle**, which matters twice over. Reading an entarchy
+does not execute code from it, so a dataset from someone else is safe to open;
+and the stored bytes name no Python module, so the data does not depend on
+entarchy's or numpy's internal layout. Values that genuinely cannot be encoded —
+custom classes, object arrays — still fall back to a pickled block, but only
+that value, and the export reports every one.
+
+Compression is decided per value and kept only when it pays, so incompressible
+float traces are stored raw. On real calcium imaging data the format is about
+35% smaller than the pickles it replaced.
 
 ### Archiving to ASDF
 

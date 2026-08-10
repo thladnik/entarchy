@@ -70,10 +70,9 @@ class TestSharedImplementation:
             assert not unexpected, f'{backend.__name__} unexpectedly overrides {unexpected}'
 
     def test_shared_names_are_re_exported(self):
-        """Old import paths keep working, including for already-pickled data."""
+        """Both backends are written against the same table classes."""
         from entarchy.backend import mysql, sqlite
 
-        assert mysql.Serializer is sqlite.Serializer
         assert mysql.AttributeTable is sqlite.AttributeTable
         assert mysql.EntityTable is sqlite.EntityTable
 

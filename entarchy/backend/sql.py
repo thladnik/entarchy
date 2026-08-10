@@ -21,12 +21,13 @@ from typing import Any, Callable, List, Union
 import numpy as np
 import pandas as pd
 import sqlalchemy
-from sqlalchemy import Index, ForeignKey, LargeBinary, String, create_engine, BigInteger, Double
-from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME, LONGBLOB
+from sqlalchemy import (Index, ForeignKey, LargeBinary, String, Text, create_engine,
+                        BigInteger, Double)
+from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME, LONGBLOB, LONGTEXT
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from . import asdf_store
+from . import blob_store
 from .backend import Backend
 from .. import AnalysisEntity, Collection, Entarchy, Entity
 from ..core.links import Endpoint, LinkTypeError, LinkTypeSpec
@@ -35,6 +36,14 @@ from ..core.links import Endpoint, LinkTypeError, LinkTypeSpec
 # MySQL's generic BLOB tops out at 64 KB, which is far too small for the
 #  serialized arrays stored here, so that dialect gets LONGBLOB instead.
 _BLOB_TYPE = LargeBinary().with_variant(LONGBLOB(), 'mysql')
+
+# String attributes were VARCHAR(500). SQLite ignores a declared length, so a
+#  longer string round-tripped there while MySQL raised "Data too long" on the
+#  same write - the code worked or failed depending on the backend, and nothing
+#  routes an oversized string anywhere else. MySQL's plain TEXT only moves the
+#  boundary to 64 KB, so it gets LONGTEXT for the same reason as LONGBLOB above.
+#  The column is not indexed, so there is no key length to stay under.
+_TEXT_TYPE = Text().with_variant(LONGTEXT(), 'mysql')
 
 # MySQL's DATETIME keeps whole seconds only and rounds on insert, so a row written
 #  at 12:30:05.7 is stored as 12:30:06 - in the future relative to the moment it was
@@ -182,7 +191,7 @@ class AttributeTable(Base):
 
     name: Mapped[str] = mapped_column(String(500), primary_key=True, index=True)
 
-    value_str: Mapped[str] = mapped_column(String(500), nullable=True)
+    value_str: Mapped[str] = mapped_column(_TEXT_TYPE, nullable=True)
     value_int: Mapped[int] = mapped_column(BigInteger(), nullable=True)
     value_float: Mapped[float] = mapped_column(Double(), nullable=True)
     value_bool: Mapped[bool] = mapped_column(nullable=True)
@@ -216,98 +225,6 @@ class AttributeTable(Base):
 
     def __repr__(self):
         return f"<Attribute({self.name}, {self.entity})>"
-
-
-class Serializer(object):
-
-    _type: type
-    _store: str
-    _data: bytes
-    _data_size: int = 0
-
-    def __repr__(self):
-        return f'Serializer({self._type}, {self._store})'
-
-    def deserialize(self, _entarchy: Entarchy) -> Any:
-
-        # Archive storage. The value sits in an ASDF block file that records its
-        #  own type, so it comes back complete and none of the logic below applies
-        if self._store.startswith(asdf_store.STORE_PREFIX):
-            relative_path, key = asdf_store.parse_store(self._store)
-            return asdf_store.read_blob(_entarchy.path, relative_path, key,
-                                        memmap=getattr(_entarchy.backend, 'memmap', False))
-
-        # Read from file if needed
-        if self._store != 'internal':
-
-            # TODO: this is a temp fix for existing datasets
-            if self._store.startswith('ext'):
-                path = self._store
-            else:
-                parts = self._store.split('/')
-                path = os.path.join(*parts[parts.index('ext'):])
-
-            # Read binary data from file
-            with open(os.path.join(_entarchy.path, path), 'rb') as f:
-                self._data = f.read()
-
-        # Return data according to original type
-        if self._type is bytes:
-            return self._data
-        elif self._type is np.ndarray:
-            with io.BytesIO(self._data) as buffer:
-                buffer.seek(0)
-                return np.lib.format.read_array(buffer, allow_pickle=True)
-        else:
-            return pickle.loads(self._data)
-
-    def serialize(self, data: Any, _ent_path: str, _entity_uuid: str, attr_name: str, max_blob_size: int):
-
-        self._type = type(data)
-
-        # Serialize data to bytes
-        if isinstance(data, bytes):
-            self._data = data
-        elif isinstance(data, np.ndarray):
-            with io.BytesIO() as buffer:
-                np.lib.format.write_array(buffer, data, allow_pickle=True)
-                buffer.seek(0)
-                self._data = buffer.read()
-        else:
-            self._data = pickle.dumps(data)
-
-        # Save size of data to object
-        self._data_size = self._data.__sizeof__()
-
-        # Store data in file if necessary
-        if self._data_size >= max_blob_size:
-
-            # Save to file
-            _format = 'npy' if self._type is np.ndarray else 'pickle'
-
-            fp, fn = _get_attribute_fp(_ent_path, _entity_uuid, attr_name, _format)
-
-            os.makedirs(fp, exist_ok=True)
-
-            fullpath = f'{fp}/{fn}'
-            self._store = pathlib.Path(fullpath).relative_to(_ent_path).as_posix()
-
-            with open(fullpath, 'wb') as f:
-                f.write(self._data)
-                del self._data
-
-        else:
-            # print(f'> Serialize {self._data.__sizeof__()} bytes directly')
-            self._store = 'internal'
-
-    @property
-    def store(self) -> str:
-        return self._store
-
-    def __sizeof__(self) -> int:
-        # Always include the payload size, so the data_size column reflects
-        #  the actual storage cost for internally stored blobs as well
-        return object.__sizeof__(self) + self._data_size
 
 
 def _retry_on_operational_failure(fun: Callable, retry_num: int = 3) -> Callable:
@@ -824,25 +741,21 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
 
     # Load blob
     if row.data_type == 'blob':
-        ser = None
+        entarchy = _entity.entarchy
         try:
-            ser = pickle.loads(row.value_blob)
-            return ser.deserialize(_entity.entarchy)
+            return blob_store.loads(row.value_blob, root_path=entarchy.path,
+                                    memmap=getattr(entarchy.backend, 'memmap', False))
         except Exception as e:
+            store = '<unreadable>'
+            try:
+                store = blob_store.store_of(row.value_blob)
+            except Exception:
+                pass
 
-            print(f'Failed to deserialize blob attribute "{row.name}" of entity "{_entity}".')
-            print('This may be caused by missing files on disk if the blob was stored externally, '
-                  'or by corrupted data in the database.')
-            # Only report serializer details if unpickling got that far;
-            #  referencing them unconditionally would raise a second,
-            #  misleading exception inside this handler
-            if isinstance(ser, Serializer):
-                print('Store: ', getattr(ser, '_store', '<unknown>'))
-                print('Type:', getattr(ser, '_type', '<unknown>'))
-            elif ser is not None:
-                print(f'Stored object is of unexpected type {type(ser).__name__} '
-                      f'(possibly written by a defective set_collection_attributes; '
-                      f'see entarchy.tools.repair_blobs).')
+            print(f'Failed to read blob attribute "{row.name}" of entity "{_entity}".')
+            print(f'Stored in: {store}')
+            print('This may be caused by a missing file on disk if the value was stored '
+                  'outside the database, or by corrupted data in the row.')
 
             raise e
 
@@ -920,16 +833,9 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
     # Set value on corresponding column based on type
     else:
         data_type = 'blob'
-
-        # Create serializer
-        ser = Serializer()
-        ser.serialize(data, _entity.entarchy.path, _entity.uuid, row.name, _entity.entarchy.max_blob_size)
-
-        # Serialize the serializer
-        data = pickle.dumps(ser)
-
-        # Get size on disk
-        data_size = ser.__sizeof__()
+        data = _store_blob(data, _entity.entarchy.path,
+                           _entity.entarchy.max_blob_size, _entity.uuid, row.name)
+        data_size = len(data)
 
     # Write to row
     row.data_type = data_type
@@ -938,10 +844,33 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
     row.__setattr__(f'value_{data_type}', data)
 
 
+def _store_blob(value: Any, root_path: str, max_blob_size: int,
+                entity_uuid: str, attr_name: str) -> bytes:
+    """Encode a value and decide whether it goes in the row or in a file.
+
+    Values at or above max_blob_size are written to `ext/`, and the row keeps a
+    pointer. The file holds the same encoded bytes, so both paths read alike.
+    """
+    encoded = blob_store.dumps(value, where=attr_name)
+
+    if len(encoded) < max_blob_size:
+        return encoded
+
+    directory, filename = _get_attribute_fp(root_path, entity_uuid, attr_name, 'blob')
+    os.makedirs(directory, exist_ok=True)
+
+    full_path = f'{directory}/{filename}'
+    with open(full_path, 'wb') as f:
+        f.write(encoded)
+
+    return blob_store.dumps_external(
+        pathlib.Path(full_path).relative_to(root_path).as_posix())
+
+
 def _deserialize(data: bytes, _entarchy: Entarchy) -> Any:
 
-    ser: Serializer = pickle.loads(data)
-    return ser.deserialize(_entarchy)
+    return blob_store.loads(data, root_path=_entarchy.path,
+                            memmap=getattr(_entarchy.backend, 'memmap', False))
 
 
 class SQLBackend(Backend):
@@ -2038,23 +1967,13 @@ class SQLBackend(Backend):
 
             # Serialize data
             if data_type_str == 'blob':
-                # Create serialize function for each attribute
-                def _serialize_blob(series: pd.Series) -> Serializer:
-                    ser = Serializer()
-                    ser.serialize(series[attr_name],
-                                  ent.path,
-                                  series['entity_uuid'],
-                                  attr_name,
-                                  ent.max_blob_size)
-                    return ser
-
-                # Apply to each row
-                df_insert['__serializer'] = df_insert.apply(_serialize_blob, axis=1)
-                # Dump each serializer to bytes for storage.
-                #  NOTE: this must pickle the Serializer objects, NOT the whole row
-                #  (df_insert.apply(pickle.dumps, axis=1) stored pickled pandas Series,
-                #  which the read path cannot deserialize).
-                df_insert[attr_name] = df_insert['__serializer'].apply(pickle.dumps)
+                # Encode per row, since where a value is stored depends on how
+                #  big it turns out to be
+                df_insert[attr_name] = df_insert.apply(
+                    lambda series: _store_blob(series[attr_name], ent.path,
+                                               ent.max_blob_size,
+                                               series['entity_uuid'], attr_name),
+                    axis=1)
 
             # Save attribute size
             def _get_attribute_size(series: pd.Series) -> int:
@@ -2071,14 +1990,12 @@ class SQLBackend(Backend):
                 elif data_type_str == 'str':
                     return len(series[attr_name].encode('utf-8'))
                 elif data_type_str == 'blob':
-                    return series['__serializer'].__sizeof__()
+                    # Already encoded above, so this is the real stored size
+                    return len(series[attr_name])
                 else:
                     raise RuntimeError(f'Unsupported data type {data_type_str}.')
 
             df_insert['data_size'] = df_insert.apply(_get_attribute_size, axis=1)
-
-            if data_type_str == 'blob':
-                del df_insert['__serializer']
 
             # Rename value column
             df_insert.rename(columns={attr_name: f'value_{data_type_str}'}, inplace=True)

@@ -512,6 +512,48 @@ class TestAttributeStorage:
                                            value_int=1, data_type='int'))
                 session.commit()
 
+    def test_long_strings_round_trip(self, populated):
+        """The reason value_str is Text: as String(500) this raised
+        DataError 1406 on MySQL while working fine on SQLite."""
+        entity = populated.get(Session)[0]
+
+        for length in (499, 500, 501, 5000, 100_000):
+            text = 'x' * length
+            entity['note'] = text
+            assert fresh_read(entity, 'note') == text
+
+    def test_a_long_string_is_still_filterable(self, populated):
+        entity = populated.get(Session)[0]
+        entity['note'] = 'y' * 2000
+
+        assert len(populated.get(Session, f'note == "{"y" * 2000}"')) == 1
+
+    def test_blobs_round_trip_through_the_server(self, populated):
+        """LONGBLOB carries the container unchanged - no encoding surprises on
+        the way through PyMySQL."""
+        import numpy as np
+
+        entity = populated.get(Session)[0]
+        values = {
+            'array': np.arange(500, dtype=np.float32),
+            'ragged': [np.arange(3), np.arange(5)],
+            'mapping': {'a': np.zeros(4), 'b': 'text'},
+            'raw': b'\x00\x01\x02binary',
+        }
+        for name, value in values.items():
+            entity[name] = value
+
+        for name, value in values.items():
+            got = fresh_read(entity, name)
+            if isinstance(value, np.ndarray):
+                assert np.array_equal(got, value) and got.dtype == value.dtype
+            elif isinstance(value, list):
+                assert all(np.array_equal(a, b) for a, b in zip(got, value))
+            elif isinstance(value, dict):
+                assert np.array_equal(got['a'], value['a']) and got['b'] == value['b']
+            else:
+                assert got == value
+
     def test_collection_read_still_includes_entities_without_the_attribute(self, ent):
         """The pivot's name restriction must not drop them (it is an outer join)."""
         with ent:

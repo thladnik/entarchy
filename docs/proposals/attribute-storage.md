@@ -259,15 +259,63 @@ this dataset the storage-level work was not where the time was.
 
 That is the honest summary of the whole exercise: the model was not the problem.
 
-## What is left
+## Two things this turned up that were not about EAV at all
 
-**Blob attributes are 27% of the rows** on the test entarchy and each holds a
-pickled `Serializer` in `value_blob`, inline in the database unless the payload
-exceeds `max_blob_size` (10 MB). This is orthogonal to EAV-versus-JSON — no
-design here changes it — but it dominates the file size and is the subject of
-its own open question.
+Both are now done, and both are clean breaks: an entarchy written before them
+cannot be read by this version.
 
-**A long string is stored in `value_str`, which is `String(500)`.** SQLite
-ignores declared lengths, so it round-trips; MySQL raises `DataError (1406)
-Data too long`. Nothing routes an oversized string to the blob path, so the same
-write succeeds or fails depending on the backend.
+### Blobs no longer hold a pickle
+
+A blob attribute used to hold a pickled `Serializer` object in `value_blob` —
+27% of the rows on the test entarchy, and essentially all of its 1.12 GB. Two
+problems with that, neither about size:
+
+Reading an entarchy executed code from it. A pickle stream is bytecode for a
+stack machine; `STACK_GLOBAL` imports an arbitrary module attribute and `REDUCE`
+calls it. That is what lets pickle serialize anything, and it means a dataset
+from a collaborator is not safe to open.
+
+And the bytes named Python classes, so the data depended on module layout. A
+pickled list of arrays embeds `numpy._core.multiarray._reconstruct` — a *private*
+path that numpy renamed in 2.0 and now carries a compatibility shim for. The old
+entarchy blobs embed `entarchy.backend.sql.Serializer`, and deleting that class
+made every one of them unreadable, which is the problem stated exactly.
+
+`blob_store` replaces it with a JSON header plus raw array buffers. The header's
+vocabulary is closed — seven encoded kinds, JSON scalars, lists, mappings, and
+array references carrying a dtype and a shape — and the reader is a dispatch
+over that vocabulary with no construct that can import or call anything.
+Malformed input raises `ValueError`.
+
+ASDF was the obvious candidate and does not fit: per value it costs about 580
+bytes of header and 17 ms, which is amortised over the thousands of blobs in an
+archive group file but not over one attribute. Archives still use it; the value
+codec is shared between the two.
+
+Measured over 600 real payloads:
+
+| | write | read | bytes |
+|---|---|---|---|
+| pickle | 0.031 ms | 0.035 ms | 2 550 926 |
+| blob_store | 0.129 ms | 0.047 ms | 1 645 782 |
+
+35% smaller, 4x the write cost and 1.3x the read. In context that write
+difference is about 13% of what an attribute write costs through the API and the
+read difference about 1%, since a single-attribute read is ~0.95 ms of which the
+container is a sliver. Compression is decided per value and kept only when it
+pays, so incompressible float traces are stored raw and cost nothing to read.
+
+On the real payloads the pickle fallback never fired: 2795 attributes written and
+read back with zero mismatches, and nothing in the stored bytes names a module.
+
+### value_str is LONGTEXT
+
+It was `String(500)`. SQLite ignores declared lengths so a longer string
+round-tripped there, while MySQL raised `DataError (1406) Data too long` — the
+same code working or failing depending on the backend. Plain `Text` only moves
+the boundary to 64 KB on MySQL, so the column takes a `LONGTEXT` variant for the
+same reason `value_blob` takes `LONGBLOB`.
+
+Routing long strings to the blob path would have been the wrong fix: `data_type`
+would then depend on a string's length, and a filter comparing against
+`value_str` would silently never match the long ones.
