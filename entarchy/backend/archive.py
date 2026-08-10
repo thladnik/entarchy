@@ -54,6 +54,11 @@ class ArchiveReadOnlyError(RuntimeError):
 class ArchiveBackend(SQLiteBackend):
     """Opens an exported archive. Reads like SQLite, refuses to write."""
 
+    # The index is opened read-only, and an archive is meant to be a fixed
+    #  artefact - refreshing planner statistics would write to it. The export
+    #  analyses the index once instead, so archives ship with statistics already.
+    optimize_on_close = False
+
     def __init__(self, *args, dbname: str = INDEX_NAME, memmap: bool = False,
                  open_file_limit: int = None, debug: bool = False, **kwargs):
         SQLiteBackend.__init__(self, *args, dbname=dbname, debug=debug, **kwargs)

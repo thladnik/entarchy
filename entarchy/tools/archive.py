@@ -362,6 +362,12 @@ def _export(source_ent, destination, collection, compression, meta_compression, 
             connection.execute(sqlalchemy.insert(Link), link_rows)
         if len(attribute_rows) > 0:
             connection.execute(sqlalchemy.insert(AttributeTable), attribute_rows)
+
+        # An archive is read-only, so this is the only chance to give its index
+        #  the statistics SQLite's planner needs. Without them a filter is planned
+        #  from the entity type rather than from the attribute it names, which on
+        #  27 000 entities is the difference between 20 ms and 0.4 ms.
+        connection.execute(sqlalchemy.text('ANALYZE'))
     index_engine.dispose()
 
     # Write the self-describing copy of the metadata
@@ -617,6 +623,10 @@ def rebuild_index(archive_path: str, verbose: bool = True) -> int:
             connection.execute(sqlalchemy.insert(Link), link_rows)
         if len(attribute_rows) > 0:
             connection.execute(sqlalchemy.insert(AttributeTable), attribute_rows)
+
+        # As in export(): a rebuilt index is read-only from here on, so its
+        #  planner statistics have to be collected now or never
+        connection.execute(sqlalchemy.text('ANALYZE'))
     engine.dispose()
 
     total = len(type_rows) + len(entity_rows) + len(link_rows) + len(attribute_rows)

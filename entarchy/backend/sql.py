@@ -201,9 +201,18 @@ class AttributeTable(Base):
     modified: Mapped[datetime.datetime] = mapped_column(_DATETIME_TYPE, default=datetime.datetime.now,
                                                        onupdate=datetime.datetime.now)
 
-    __table_args__ = (
-        Index('ix_unique_name_per_entity_uuid', 'entity_uuid', 'name', unique=True),
-    )
+    # (entity_uuid, name) is already the primary key, which every dialect backs
+    #  with a unique index of its own - SQLite as sqlite_autoindex_attributes_1,
+    #  InnoDB as the clustered index. A second unique index on the same two
+    #  columns in the same order was declared here and simply duplicated it:
+    #  ANALYZE reported identical statistics for both, and it cost 44 MB on a
+    #  27 000 ROI entarchy (65 bytes per attribute row) plus its share of every
+    #  insert. Dropped; existing databases are cleaned by
+    #  entarchy.tools.optimize_storage.
+    #
+    #  The single-column index on `name` (declared on the column itself) is a
+    #  different matter and load bearing: it answers "which entities have this
+    #  attribute", which is what every ../parent and [Ancestor] filter needs.
 
     def __repr__(self):
         return f"<Attribute({self.name}, {self.entity})>"
@@ -1815,13 +1824,31 @@ class SQLBackend(Backend):
                             (AttributeTable.name == n, flag_col), else_=None)).label(flag_label))
                         column_labels.append(flag_label)
 
-            # Construct query
+            # Construct query.
+            #  Restricted to the requested names: a CASE is built for each of
+            #  them, but without this the join still walks every other attribute
+            #  row of every entity only to have each CASE discard it. Entities
+            #  accumulate attributes as analyses add them, so the ratio gets
+            #  worse with the age of an entarchy - on 27 000 entities holding 73
+            #  attributes, reading 5 of them went from 4.45 s to 1.17 s. Reading
+            #  every attribute of a narrow entity costs 10-15% instead, since
+            #  the restriction can then eliminate nothing. That is the trade.
+            #
+            #  The restriction belongs in the join condition and the join has to
+            #  be an outer one. Attributes are per entity rather than per type,
+            #  so an entity may have none of the requested names; as an inner
+            #  join with the names in the WHERE clause, such an entity produces
+            #  no rows at all and silently drops out of the result, where before
+            #  it appeared with NaN. The outer join costs nothing measurable
+            #  over the inner one.
             attribute_query = (
                 session.query(
                     EntityTable.uuid,
                     *cases
                 )
-                .join(AttributeTable, EntityTable.uuid == AttributeTable.entity_uuid)
+                .outerjoin(AttributeTable,
+                           sqlalchemy.and_(EntityTable.uuid == AttributeTable.entity_uuid,
+                                           AttributeTable.name.in_(names)))
                 .filter(EntityTable.uuid.in_(_uuids_of(entity_query)))
                 .group_by(EntityTable.uuid, EntityTable.id)
             )

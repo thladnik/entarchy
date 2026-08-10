@@ -93,6 +93,24 @@ Entarchies created before links existed need their tables migrated:
 python -m entarchy.tools.migrate_links /path/to/entarchy --apply
 ```
 
+### Optimising attribute storage
+
+Attributes are stored one row per attribute, with a typed value column per kind.
+[The proposal](docs/proposals/attribute-storage.md) benchmarks that against
+JSON-column alternatives and explains why it stays — along with three fixes that
+came out of it. An entarchy written before them carries a duplicate index on
+`attributes` (44 MB on a 27 000 ROI dataset) and no SQLite query planner
+statistics:
+
+```sh
+# dry run first, then apply
+python -m entarchy.tools.optimize_storage /path/to/entarchy
+python -m entarchy.tools.optimize_storage /path/to/entarchy --apply
+```
+
+Safe to repeat, and safe on MySQL, where only the index applies. On SQLite the
+freed space goes on the free list; `VACUUM` returns it to the filesystem.
+
 ### Database credentials (MySQL backend)
 
 The database password is **not** written to `entarchy.yaml`. At runtime it is

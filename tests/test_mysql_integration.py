@@ -451,6 +451,85 @@ class TestDatetimePrecisionMigration:
         assert 'full precision already' in capsys.readouterr().out
 
 
+class TestAttributeStorage:
+    """The duplicate index removal against a real server.
+
+    Dropping an index needs a different statement on MySQL than on SQLite, and
+    InnoDB backs the primary key with the clustered index rather than a separate
+    one - so both the tool's SQL and the uniqueness it relies on are worth
+    checking here rather than assuming they carry over.
+    """
+
+    def url_for(self, schema_name):
+        from urllib.parse import quote_plus
+        return (f'mysql+pymysql://{quote_plus(USER)}:{quote_plus(PASSWORD)}'
+                f'@{HOST}/{schema_name}')
+
+    def test_new_entarchies_do_not_have_the_duplicate_index(self, populated, schema_name):
+        from entarchy.tools import optimize_storage
+
+        state = optimize_storage.inspect(self.url_for(schema_name))
+
+        assert state['dialect'] == 'mysql'
+        assert state['has_duplicate_index'] is False
+        # InnoDB keeps its own statistics, so there is nothing to collect
+        assert state['has_statistics'] is None
+        assert state['needs_work'] is False
+
+    def test_drops_the_duplicate_index(self, populated, schema_name):
+        from entarchy.tools import optimize_storage
+
+        url = self.url_for(schema_name)
+        connection = pymysql.connect(host=HOST, user=USER, password=PASSWORD,
+                                     database=schema_name)
+        connection.autocommit(True)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute('CREATE UNIQUE INDEX ix_unique_name_per_entity_uuid '
+                               'ON attributes (entity_uuid, name(255))')
+        finally:
+            connection.close()
+
+        assert optimize_storage.inspect(url)['has_duplicate_index']
+
+        done = optimize_storage.optimize(url, apply_changes=True, verbose=False)
+
+        assert done['dropped_index']
+        assert not optimize_storage.inspect(url)['has_duplicate_index']
+
+    def test_uniqueness_survives_without_it(self, populated, schema_name):
+        """The primary key has to keep the promise the dropped index made."""
+        import sqlalchemy
+        import sqlalchemy.orm
+
+        from entarchy.backend.sql import AttributeTable
+
+        entity = populated.get(Session)[0]
+
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            with sqlalchemy.orm.Session(populated.backend.sql_engine) as session:
+                session.add(AttributeTable(entity_uuid=entity.uuid, name='index',
+                                           value_int=1, data_type='int'))
+                session.commit()
+
+    def test_collection_read_still_includes_entities_without_the_attribute(self, ent):
+        """The pivot's name restriction must not drop them (it is an outer join)."""
+        with ent:
+            subject = Subject(ent, _id='subject', _parent=ent.root)
+            ent.add_new_entity(subject)
+            for i in range(6):
+                session_entity = Session(ent, _id=f's_{i}', _parent=subject)
+                ent.add_new_entity(session_entity)
+                session_entity['index'] = i
+                if i < 2:
+                    session_entity['sparse'] = float(i)
+
+        frame = ent.get(Session).dataframe_of(['index', 'sparse'])
+
+        assert len(frame) == 6
+        assert frame['sparse'].notna().sum() == 2
+
+
 class TestLinkSchema:
     """The link tables against a real server.
 

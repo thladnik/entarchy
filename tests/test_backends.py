@@ -57,6 +57,10 @@ class TestSharedImplementation:
             'db_triggers_enabled', 'get_config',
             # MySQL connection parameters
             'dbhost', 'dbuser', 'dbpassword', '_server_url',
+            # SQLite query planner statistics. InnoDB collects its own, so there
+            #  is nothing here for MySQL to share
+            'analysis_limit', 'optimize_on_close', '_configure_connection',
+            'optimize', 'close',
         }
 
         for backend in (SQLiteBackend, MySQLBackend):
