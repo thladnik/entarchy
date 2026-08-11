@@ -13,6 +13,8 @@ import operator
 import os.path
 import pathlib
 import pickle
+import re
+import shutil
 import datetime
 import time
 import warnings
@@ -786,11 +788,15 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
         row.float_is_nan = False
         row.value_int = None  # may hold the sign of a previous inf value
 
+    # A value the row kept outside the database, which may be left behind by
+    #  what is written below
+    root_path = _entity.entarchy.path
+    replaced_file = (_owned_file_of(row.value_blob, root_path)
+                     if row.data_type == 'blob' else None)
+
     # Set (potential) previous value to None
     if row.data_type is not None:
         row.__setattr__(f'value_{row.data_type}', None)
-
-    # TODO: with ext storage for blobs, we should also delete previous files on disk
 
     # Handle scalars and datetime values
     if type(data) in (str, float, int, bool, datetime.date, datetime.datetime):
@@ -826,15 +832,19 @@ def _write_attribute_data(_entity: Entity, row: AttributeTable, data: Any):
     # Set value on corresponding column based on type
     else:
         data_type = 'blob'
-        data = _store_blob(data, _entity.entarchy.path,
+        data = _store_blob(data, root_path,
                            _entity.entarchy.max_blob_size, _entity.uuid, row.name)
-        data_size = len(data)
+        # For a value kept outside the row, the size that matters is the file's
+        data_size = _stored_size(data, root_path)
 
     # Write to row
     row.data_type = data_type
     row.data_size = data_size
     # Set data
     row.__setattr__(f'value_{data_type}', data)
+
+    _discard_replaced_file(replaced_file, data if data_type == 'blob' else None,
+                           root_path)
 
 
 def _store_blob(value: Any, root_path: str, max_blob_size: int,
@@ -844,6 +854,9 @@ def _store_blob(value: Any, root_path: str, max_blob_size: int,
     Values at or above max_blob_size are written to `ext/`, and the row keeps a
     pointer. The file holds the same encoded bytes, so both paths read alike.
     """
+    if isinstance(value, blob_store.MediaFile):
+        return _store_media(value, root_path, entity_uuid, attr_name)
+
     encoded = blob_store.dumps(value, where=attr_name)
 
     if len(encoded) < max_blob_size:
@@ -858,6 +871,122 @@ def _store_blob(value: Any, root_path: str, max_blob_size: int,
 
     return blob_store.dumps_external(
         pathlib.Path(full_path).relative_to(root_path).as_posix())
+
+
+# Media files are sharded two levels deep rather than the eight `ext/` uses.
+#  There is one per attribute that holds one - hundreds, not the hundreds of
+#  thousands `ext/` has to spread - and every extra level costs path length that
+#  Windows counts against a 260 character limit, on top of an original file name
+#  that can itself be seventy characters of acquisition metadata.
+MEDIA_SHARD_LEVELS = 2
+MEDIA_NAME_LIMIT = 60
+
+
+def _get_media_fp(root_path: str, entity_uuid: str, attr_name: str,
+                  source_name: str) -> tuple[str, str]:
+    """Where a media file goes: sharded by entity, named for legibility.
+
+    The original file name is kept alongside the attribute hash - somebody will
+    browse this directory eventually, and `fish_embedded_frame.avi` tells them
+    more than a hash does.
+    """
+    _uuid = entity_uuid.replace('-', '')
+    shards = [_uuid[4 * i:4 * (i + 1)] for i in range(MEDIA_SHARD_LEVELS)]
+    directory = pathlib.PurePath(root_path, 'media', *shards).as_posix()
+
+    stem, extension = os.path.splitext(os.path.basename(source_name))
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', stem).strip('_')[:MEDIA_NAME_LIMIT]
+    extension = re.sub(r'[^A-Za-z0-9.]+', '', extension)[:16]
+
+    return directory, f'{_get_namehash(attr_name)[:12]}_{safe or "media"}{extension}'
+
+
+def _store_media(media: 'blob_store.MediaFile', root_path: str,
+                 entity_uuid: str, attr_name: str) -> bytes:
+    """Take a media file into the entarchy and return the pointer to it.
+
+    An entarchy is meant to be self-contained, so the file is copied in rather
+    than referenced where it lies. A MediaFile that is already stored under this
+    root is copied to the place this attribute would put it, so that two
+    entities never share one file - there is no reference counting, and deleting
+    one attribute would otherwise take the other's data with it.
+    """
+    source = media.path
+    if not os.path.exists(source):
+        raise FileNotFoundError(f'Cannot store media attribute "{attr_name}": '
+                                f'"{source}" does not exist.')
+
+    directory, filename = _get_media_fp(root_path, entity_uuid, attr_name,
+                                        media.relative_path or source)
+    os.makedirs(directory, exist_ok=True)
+    destination = f'{directory}/{filename}'
+
+    if os.path.abspath(source) != os.path.abspath(destination):
+        if media.move:
+            shutil.move(source, destination)
+        else:
+            shutil.copyfile(source, destination)
+
+    return blob_store.dumps_media({
+        'path': pathlib.Path(destination).relative_to(root_path).as_posix(),
+        'media_type': media.media_type,
+        'bytes': os.path.getsize(destination),
+        'sha256': blob_store.sha256_of(destination),
+    })
+
+
+def _stored_size(raw: bytes, root_path: str) -> int:
+    """How many bytes this value actually occupies, wherever they are.
+
+    A pointer is a few hundred bytes; the file it names can be gigabytes, and
+    data_size is meant to say where the storage went.
+    """
+    owned = _owned_file_of(raw, root_path)
+    if owned is None:
+        return len(raw)
+
+    try:
+        return os.path.getsize(owned)
+    except OSError:
+        return len(raw)
+
+
+def _owned_file_of(raw: bytes, root_path: str) -> Union[str, None]:
+    """The file a stored value keeps outside the row, if it keeps one."""
+    if raw is None:
+        return None
+
+    try:
+        header, _ = blob_store._unpack(raw)
+    except ValueError:
+        return None
+
+    relative = header.get('x') or (header['m']['path'] if 'm' in header else None)
+
+    return None if relative is None else os.path.join(root_path, relative)
+
+
+def _discard_replaced_file(previous: Union[str, None], written: bytes,
+                           root_path: str) -> None:
+    """Remove the file a replaced value left behind.
+
+    An `ext/` payload keeps the same name when it is rewritten, so it is
+    overwritten in place - but a value that shrinks below max_blob_size, or a
+    media file replaced by one with a different name, would otherwise leave the
+    old file on disk for good.
+    """
+    if previous is None:
+        return
+
+    current = _owned_file_of(written, root_path)
+    if current is not None and os.path.abspath(current) == os.path.abspath(previous):
+        return
+
+    try:
+        os.remove(previous)
+    except OSError:
+        # Never fail a write because a stale file could not be cleaned up
+        pass
 
 
 def _deserialize(data: bytes, _entarchy: Entarchy) -> Any:
@@ -1064,6 +1193,21 @@ class SQLBackend(Backend):
             names = [row.name for row in query.all()]
 
         return names
+
+    @_retry_on_operational_failure
+    def get_media_attribute_names(self, entity_uuid: str) -> list[str]:
+        """Which of an entity's attributes hold media files.
+
+        Only the pointer header is inspected, so this stays cheap for an entity
+        that also holds large payloads.
+        """
+        with self.sql_session as session:
+            rows = (session.query(AttributeTable.name, AttributeTable.value_blob)
+                    .filter(AttributeTable.entity_uuid == entity_uuid,
+                            AttributeTable.data_type == 'blob').all())
+
+        return sorted(row.name for row in rows
+                      if blob_store.media_info(row.value_blob) is not None)
 
     @_retry_on_operational_failure
     def get_entity_attributes(self, _entity: Entity, names: list[str]) -> tuple[Any, ...]:
@@ -1983,8 +2127,8 @@ class SQLBackend(Backend):
                 elif data_type_str == 'str':
                     return len(series[attr_name].encode('utf-8'))
                 elif data_type_str == 'blob':
-                    # Already encoded above, so this is the real stored size
-                    return len(series[attr_name])
+                    # Already encoded above; a pointer's size is the file it names
+                    return _stored_size(series[attr_name], ent.path)
                 else:
                     raise RuntimeError(f'Unsupported data type {data_type_str}.')
 

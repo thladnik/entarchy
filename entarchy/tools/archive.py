@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import pathlib
 import re
@@ -276,8 +277,8 @@ def _export(source_ent, destination, collection, compression, meta_compression, 
 
     selected = _select_uuids(source_ent, collection)
     report = asdf_store.EncodingReport()
-    stats = {'entities': 0, 'attributes': 0, 'blobs': 0, 'block_files': 0,
-             'broken': [], 'bytes': 0}
+    stats = {'entities': 0, 'attributes': 0, 'blobs': 0, 'media': 0,
+             'block_files': 0, 'broken': [], 'bytes': 0}
 
     index_engine = sqlalchemy.create_engine(
         f'sqlite:///{pathlib.Path(destination).as_posix()}/{INDEX_NAME}')
@@ -322,8 +323,9 @@ def _export(source_ent, destination, collection, compression, meta_compression, 
                 groups.items(), key=lambda item: (item[0] is not None, item[0] or ''))):
 
             group_rows, blobs, relative_path, content_types = _export_group(
-                session, source_ent, member_uuids, parent_uuid, entity_by_uuid,
-                type_name_by_pk, group_index, report, stats, skip_broken)
+                session, source_ent, destination, member_uuids, parent_uuid,
+                entity_by_uuid, type_name_by_pk, group_index, report, stats,
+                skip_broken)
 
             if len(blobs) > 0:
                 full_path = os.path.join(destination, relative_path)
@@ -433,8 +435,8 @@ def _group_file_name(parent_uuid, parent_id: str, content_types: set, group_inde
             f'_{str(parent_uuid)[:8]}.asdf')
 
 
-def _export_group(session, source_ent, member_uuids, parent_uuid, entity_by_uuid,
-                  type_name_by_pk, group_index, report, stats,
+def _export_group(session, source_ent, destination, member_uuids, parent_uuid,
+                  entity_by_uuid, type_name_by_pk, group_index, report, stats,
                   skip_broken) -> tuple[list[dict], dict, str, set]:
     """Copy one group's attribute rows, moving blob payloads into ASDF."""
     rows = session.query(AttributeTable).filter(
@@ -464,6 +466,18 @@ def _export_group(session, source_ent, member_uuids, parent_uuid, entity_by_uuid
             key = f'{row.entity_uuid}/{row.name}'
             where = f'{entity_by_uuid.get(row.entity_uuid, {}).get("id", "?")}.{row.name}'
 
+            # A media file is copied rather than encoded: entarchy never
+            #  interprets it, and an ASDF block holding an opaque gigabyte would
+            #  make the group file unreadable for everything else in it. The
+            #  pointer is unchanged because the path inside the archive is the
+            #  same one it had inside the entarchy.
+            media = blob_store.media_info(row.value_blob)
+            if media is not None:
+                _copy_media(source_ent.path, destination, media['path'],
+                            where, stats, skip_broken)
+                exported.append(record)
+                continue
+
             try:
                 value = blob_store.loads(row.value_blob, root_path=source_ent.path)
             except Exception as err:
@@ -487,18 +501,55 @@ def _export_group(session, source_ent, member_uuids, parent_uuid, entity_by_uuid
     return exported, blobs, relative_path, content_types
 
 
+def _copy_media(source_root: str, destination: str, relative_path: str,
+                where: str, stats: dict, skip_broken: bool) -> None:
+    """Bring a media file into the archive at the path it already has.
+
+    Keeping the relative path means the pointer in the index needs no rewriting,
+    and an archive resolves it exactly as the entarchy did.
+    """
+    source = os.path.join(source_root, relative_path)
+    if not os.path.exists(source):
+        stats['broken'].append((where, f'media file "{relative_path}" is missing'))
+        if not skip_broken:
+            raise ExportError(
+                f'Media file for "{where}" is missing: "{source}". Pass '
+                f'--skip-broken to write the archive without it.')
+        return
+
+    target = os.path.join(destination, relative_path)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copyfile(source, target)
+
+    stats['media'] += 1
+    stats['bytes'] += os.path.getsize(target)
+
+
 def _blob_pointer_tree(attribute_rows: list[dict]) -> dict:
-    """Where each blob lives, so meta.asdf alone is enough to rebuild the index."""
-    keys, stores = [], []
+    """Where each blob lives, so meta.asdf alone is enough to rebuild the index.
+
+    Two kinds. An `asdf` entry names a block file and a key inside it; a `media`
+    entry carries the whole header, since a media pointer records a type, a size
+    and a digest that the path alone does not.
+    """
+    keys, kinds, stores = [], [], []
     for row in attribute_rows:
         if row['data_type'] != 'blob' or row.get('value_blob') is None:
             continue
 
         keys.append(f'{row["entity_uuid"]}/{row["name"]}')
-        stores.append(blob_store.store_of(row['value_blob']))
+
+        media = blob_store.media_info(row['value_blob'])
+        if media is not None:
+            kinds.append('media')
+            stores.append(json.dumps(media))
+        else:
+            kinds.append('asdf')
+            stores.append(blob_store.store_of(row['value_blob']))
 
     return {'count': len(keys),
             'key': np.array(keys, dtype=np.str_),
+            'kind': np.array(kinds, dtype=np.str_),
             'store': np.array(stores, dtype=np.str_)}
 
 
@@ -519,6 +570,8 @@ def _print_summary(destination: str, stats: dict, report) -> None:
     print(f'Archive written to {destination}')
     print(f'  {stats["entities"]} entities, {stats["attributes"]} attributes, '
           f'{stats["blobs"]} blobs in {stats["block_files"]} block file(s)')
+    if stats['media'] > 0:
+        print(f'  {stats["media"]} media file(s) copied')
     print(f'  {stats["bytes"] / 1024 ** 2:.1f} MB total')
 
     if report.ragged_packed > 0:
@@ -578,13 +631,18 @@ def rebuild_index(archive_path: str, verbose: bool = True) -> int:
         pointer_tree = handle['attribute_blobs']
         pointers = {}
         for index in range(int(pointer_tree['count'])):
-            pointers[str(pointer_tree['key'][index])] = str(pointer_tree['store'][index])
+            pointers[str(pointer_tree['key'][index])] = (
+                str(pointer_tree['kind'][index]), str(pointer_tree['store'][index]))
 
     for row in attribute_rows:
         key = f'{row["entity_uuid"]}/{row["name"]}'
         if row['data_type'] == 'blob' and key in pointers:
-            relative_path, blob_key = asdf_store.parse_store(pointers[key])
-            row['value_blob'] = blob_store.dumps_archived(relative_path, blob_key)
+            kind, store = pointers[key]
+            if kind == 'media':
+                row['value_blob'] = blob_store.dumps_media(json.loads(store))
+            else:
+                relative_path, blob_key = asdf_store.parse_store(store)
+                row['value_blob'] = blob_store.dumps_archived(relative_path, blob_key)
         else:
             row['value_blob'] = None
 
@@ -647,7 +705,7 @@ def import_archive(archive_path: str, destination: str, overwrite: bool = False,
 
     # Move the payloads out of ASDF and into the ext/ layout a live entarchy uses
     archive_ent = _EntarchyHandle(archive_path)
-    stats = {'blobs': 0}
+    stats = {'blobs': 0, 'media': 0}
 
     try:
         engine = sqlalchemy.create_engine(
@@ -658,6 +716,18 @@ def import_archive(archive_path: str, destination: str, overwrite: bool = False,
 
             for row in rows:
                 if row.value_blob is None:
+                    continue
+
+                # A media file is copied to the same relative path, so its
+                #  pointer needs no rewriting
+                media = blob_store.media_info(row.value_blob)
+                if media is not None:
+                    source = os.path.join(archive_path, media['path'])
+                    target = os.path.join(destination, media['path'])
+                    if os.path.exists(source):
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        shutil.copyfile(source, target)
+                        stats['media'] += 1
                     continue
 
                 if not blob_store.store_of(row.value_blob).startswith(asdf_store.STORE_PREFIX):
@@ -677,7 +747,9 @@ def import_archive(archive_path: str, destination: str, overwrite: bool = False,
         archive_ent.backend.close()
 
     if verbose:
-        print(f'Imported {archive_path} to {destination} ({stats["blobs"]} blob(s) materialised)')
+        print(f'Imported {archive_path} to {destination} '
+              f'({stats["blobs"]} blob(s) materialised, '
+              f'{stats["media"]} media file(s) copied)')
 
     return stats
 

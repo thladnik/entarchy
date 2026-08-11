@@ -533,6 +533,125 @@ class TestRebuildIndex:
             len(broken.get(Roi))
 
 
+class TestMediaFiles:
+    """A media file must be copied into the archive rather than encoded into a
+    block - entarchy never interprets it, and an opaque gigabyte in a group file
+    would drag on everything else stored beside it."""
+
+    @pytest.fixture()
+    def with_media(self, source, tmp_path):
+        clip = tmp_path / 'behaviour.avi'
+        clip.write_bytes(b'FAKE-AVI' + bytes(range(256)) * 20)
+
+        recording = sorted(source.get(Recording), key=lambda e: e.id)[0]
+        recording.set_media('video', clip)
+
+        destination = (tmp_path / 'media_archive').as_posix()
+        stats = archive_tool.export(source, destination, verbose=False)
+
+        ent = DeepArchy(destination)
+        yield source, ent, destination, clip
+        ent.backend.close()
+        asdf_store.close_asdf_files()
+
+    def test_the_file_is_in_the_archive(self, with_media):
+        _, ent, destination, clip = with_media
+
+        stored = sorted(ent.get(Recording), key=lambda e: e.id)[0]['video']
+
+        assert stored.exists()
+        assert stored.path.startswith(destination)
+        assert stored.read_bytes() == clip.read_bytes()
+
+    def test_the_relative_path_is_unchanged(self, with_media):
+        source, ent, _, _ = with_media
+
+        live = sorted(source.get(Recording), key=lambda e: e.id)[0]['video']
+        archived = sorted(ent.get(Recording), key=lambda e: e.id)[0]['video']
+
+        assert archived.relative_path == live.relative_path
+
+    def test_the_digest_survives(self, with_media):
+        _, ent, _, _ = with_media
+
+        assert sorted(ent.get(Recording), key=lambda e: e.id)[0]['video'].verify()
+
+    def test_it_is_not_in_a_block_file(self, with_media):
+        """The archive's blocks hold encoded values; a media file is neither."""
+        _, _, destination, clip = with_media
+        payload = clip.read_bytes()
+
+        for name in os.listdir(os.path.join(destination, BLOCK_DIR)):
+            with open(os.path.join(destination, BLOCK_DIR, name), 'rb') as f:
+                assert payload not in f.read()
+
+    def test_export_counts_it(self, source, tmp_path):
+        clip = tmp_path / 'behaviour.avi'
+        clip.write_bytes(b'x' * 100)
+        sorted(source.get(Recording), key=lambda e: e.id)[0].set_media('video', clip)
+
+        stats = archive_tool.export(source, (tmp_path / 'counted').as_posix(), verbose=False)
+
+        assert stats['media'] == 1
+
+    def test_rebuild_restores_the_pointer(self, with_media):
+        _, ent, destination, clip = with_media
+        ent.backend.close()
+        asdf_store.close_asdf_files()
+        os.remove(os.path.join(destination, INDEX_NAME))
+
+        archive_tool.rebuild_index(destination, verbose=False)
+
+        rebuilt = DeepArchy(destination)
+        try:
+            stored = sorted(rebuilt.get(Recording), key=lambda e: e.id)[0]['video']
+            assert stored.exists()
+            assert stored.verify()
+            assert stored.read_bytes() == clip.read_bytes()
+        finally:
+            rebuilt.backend.close()
+
+    def test_import_brings_the_file_across(self, with_media, tmp_path):
+        _, ent, destination, clip = with_media
+        ent.backend.close()
+        asdf_store.close_asdf_files()
+
+        imported_path = (tmp_path / 'imported_media').as_posix()
+        archive_tool.import_archive(destination, imported_path, verbose=False)
+
+        imported = DeepArchy(imported_path)
+        try:
+            stored = sorted(imported.get(Recording), key=lambda e: e.id)[0]['video']
+            assert stored.path.startswith(imported_path)
+            assert stored.read_bytes() == clip.read_bytes()
+            assert stored.verify()
+        finally:
+            imported.backend.close()
+
+    def test_a_missing_media_file_is_reported(self, source, tmp_path):
+        clip = tmp_path / 'behaviour.avi'
+        clip.write_bytes(b'x' * 100)
+        recording = sorted(source.get(Recording), key=lambda e: e.id)[0]
+        recording.set_media('video', clip)
+        os.remove(recording['video'].path)
+
+        with pytest.raises(archive_tool.ExportError, match='is missing'):
+            archive_tool.export(source, (tmp_path / 'broken').as_posix(), verbose=False)
+
+    def test_skip_broken_writes_the_archive_without_it(self, source, tmp_path):
+        clip = tmp_path / 'behaviour.avi'
+        clip.write_bytes(b'x' * 100)
+        recording = sorted(source.get(Recording), key=lambda e: e.id)[0]
+        recording.set_media('video', clip)
+        os.remove(recording['video'].path)
+
+        stats = archive_tool.export(source, (tmp_path / 'partial').as_posix(),
+                                    verbose=False, skip_broken=True)
+
+        assert len(stats['broken']) == 1
+        assert 'missing' in stats['broken'][0][1]
+
+
 class TestImportBack:
 
     def test_imported_entarchy_is_writable(self, source, archived, tmp_path):

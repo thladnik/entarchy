@@ -243,6 +243,44 @@ class Entity(object):
         """How many links of each kind touch this entity, keyed by kind."""
         return self.entarchy.backend.count_links_by_type(self.uuid)
 
+    def set_media(self, name: str, source, media_type: str = None,
+                  move: bool = False) -> 'MediaFile':
+        """Take a file into the entarchy and attach it under `name`.
+
+        For anything large and opaque - video, raw image stacks, a protocol
+        document. The file is copied under the entarchy's `media/` directory, so
+        the entarchy stays self-contained and can be moved or copied whole:
+
+            recording.set_media('video', '/data/behaviour.avi')
+            recording['video'] = MediaFile('/data/behaviour.avi')   # equivalent
+
+        A method as well as an assignment because copying a gigabyte should not
+        look like setting a value. `move=True` takes the source instead of
+        copying it, for an ingest that owns the file.
+
+        Reading the attribute back gives a MediaFile, which is os.PathLike - so
+        it goes straight to whatever reads that kind of file. entarchy never
+        decodes it.
+
+        Returns:
+            MediaFile: the stored file, as reading the attribute would give it.
+        """
+        from ..backend.blob_store import MediaFile
+
+        self[name] = (source if isinstance(source, MediaFile)
+                      else MediaFile(source, media_type=media_type, move=move))
+
+        return self[name]
+
+    def media(self) -> list[str]:
+        """Which attributes of this entity are media files.
+
+        Reads pointers only, so it costs nothing even when the entity also
+        holds large blobs - asking `self[name]` for each would decode every one
+        of them.
+        """
+        return self.entarchy.backend.get_media_attribute_names(self.uuid)
+
     def __repr__(self):
         return f'{self.__class__.__name__}(id=\'{self.id}\' uuid=\'{self.uuid}\')'
 
@@ -461,6 +499,16 @@ class Entity(object):
 
             if not res:
                 raise RuntimeError(f'Failed to update entity attributes {names} in backend.')
+
+            # A MediaFile assigned to an attribute names a source file outside
+            #  the entarchy; what was stored is the copy taken of it. Keeping the
+            #  source in the cache would hand back a handle to a file entarchy
+            #  does not own and may not keep, so the next read comes from the row.
+            from ..backend.blob_store import MediaFile
+
+            for name, written in zip(names, values):
+                if isinstance(written, MediaFile) and not written.is_stored:
+                    self._attribute_cache.pop(name, None)
 
             # Reset list
             self._attributes_to_update = []

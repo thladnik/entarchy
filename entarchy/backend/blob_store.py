@@ -34,8 +34,12 @@ an archive group file holds but not over one attribute value.
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import math
+import mimetypes
+import os
+import pathlib
 import pickle
 import zlib
 from typing import Any, Union
@@ -402,16 +406,199 @@ def dumps_archived(relative_path: str, key: str) -> bytes:
     return _pack({'z': [relative_path, key]}, [], compress=False)
 
 
+def dumps_media(info: dict) -> bytes:
+    """A pointer to a media file kept under the entarchy root.
+
+    Unlike the other two, the file is not an encoded value - entarchy stores it
+    and never interprets it. See MediaFile.
+    """
+    return _pack({'m': dict(info)}, [], compress=False)
+
+
+def media_info(raw: bytes) -> Union[dict, None]:
+    """The media header of a stored value, or None if it is not one.
+
+    Cheap: it reads the header and no file. Used by the archive tooling, which
+    has to copy the file rather than encode the value.
+    """
+    try:
+        header, _ = _unpack(raw)
+    except ValueError:
+        return None
+
+    return header.get('m')
+
+
 def store_of(raw: bytes) -> str:
     """Where the value actually lives: 'internal', a path, or 'asdf:<file>#<key>'."""
     header, _ = _unpack(raw)
 
     if 'x' in header:
         return header['x']
+    if 'm' in header:
+        return header['m']['path']
     if 'z' in header:
         return f'asdf:{header["z"][0]}#{header["z"][1]}'
 
     return 'internal'
+
+
+# ---------------------------------------------------------------------------
+# Media files: kept inside the entarchy, never interpreted
+# ---------------------------------------------------------------------------
+
+SHA_CHUNK = 1024 * 1024
+DEFAULT_MEDIA_TYPE = 'application/octet-stream'
+
+
+def guess_media_type(path: str) -> str:
+    return mimetypes.guess_type(str(path))[0] or DEFAULT_MEDIA_TYPE
+
+
+def sha256_of(path: str, chunk_size: int = SHA_CHUNK) -> str:
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(chunk_size), b''):
+            digest.update(block)
+
+    return digest.hexdigest()
+
+
+class MediaFile(os.PathLike):
+    """A file entarchy keeps but does not read.
+
+    Video, raw image stacks, anything large and opaque. Two lives:
+
+    **As a source.** `MediaFile('/data/behaviour.avi')` names a file to take in.
+    Assigning it to an attribute copies it under the entarchy's `media/` and
+    records its type, size and digest:
+
+        recording['video'] = MediaFile('/data/behaviour.avi')
+        recording.set_media('video', '/data/behaviour.avi')   # the same thing
+
+    **As a stored value.** Reading the attribute back gives one bound to the
+    entarchy. Building it touches no file, so a DataFrame of a thousand of them
+    costs nothing and a missing file surfaces when something opens it rather
+    than when it is read:
+
+        video = recording['video']
+        reader = imageio.get_reader(video)    # MediaFile is os.PathLike
+        with video.open() as f: ...
+
+    The point is what entarchy does not do: no decoding, no transcoding, no
+    codec dependency. The file goes in byte for byte, which is also what makes
+    the recorded digest worth anything.
+    """
+
+    __slots__ = ('_source', '_relative_path', '_root_path', '_media_type',
+                 '_bytes', '_sha256', 'move')
+
+    def __init__(self, source: Union[str, os.PathLike] = None, media_type: str = None,
+                 move: bool = False, *, relative_path: str = None, root_path: str = None,
+                 bytes_: int = None, sha256: str = None):
+        if source is None and relative_path is None:
+            raise ValueError('A MediaFile needs a source path.')
+
+        self._source = None if source is None else os.fspath(source)
+        self._relative_path = relative_path
+        self._root_path = None if root_path is None else str(root_path)
+        self._media_type = media_type or (guess_media_type(self._source)
+                                          if self._source is not None else None)
+        self._bytes = bytes_
+        self._sha256 = sha256
+
+        # Whether storing it should move the source rather than copy it. Useful
+        #  for an ingest that owns the file and would rather not write it twice.
+        self.move = move
+
+    @classmethod
+    def _from_header(cls, info: dict, root_path: str) -> 'MediaFile':
+        return cls(relative_path=info['path'], root_path=root_path,
+                   media_type=info.get('media_type'), bytes_=info.get('bytes'),
+                   sha256=info.get('sha256'))
+
+    @property
+    def is_stored(self) -> bool:
+        """Whether this names a file inside an entarchy rather than a source."""
+        return self._relative_path is not None
+
+    @property
+    def relative_path(self) -> Union[str, None]:
+        return self._relative_path
+
+    @property
+    def path(self) -> str:
+        """Absolute path of the file this refers to.
+
+        Posix separators, as Entarchy.path uses, so joining the two does not
+        produce a path with both kinds in it.
+        """
+        if self._relative_path is None:
+            return pathlib.PurePath(os.path.abspath(self._source)).as_posix()
+
+        return pathlib.PurePath(self._root_path, self._relative_path).as_posix()
+
+    @property
+    def media_type(self) -> str:
+        return self._media_type or DEFAULT_MEDIA_TYPE
+
+    @property
+    def bytes(self) -> int:
+        if self._bytes is None:
+            self._bytes = os.path.getsize(self.path)
+
+        return self._bytes
+
+    @property
+    def sha256(self) -> Union[str, None]:
+        """The digest recorded when the file was stored, if there is one."""
+        return self._sha256
+
+    def exists(self) -> bool:
+        return os.path.exists(self.path)
+
+    def verify(self) -> bool:
+        """Whether the file on disk still matches the digest recorded for it."""
+        if self._sha256 is None:
+            raise ValueError(f'No digest was recorded for {self!r}, so there is '
+                             f'nothing to verify against.')
+
+        return self.exists() and sha256_of(self.path) == self._sha256
+
+    def open(self, mode: str = 'rb'):
+        return open(self.path, mode)
+
+    def read_bytes(self) -> bytes:
+        with self.open() as f:
+            return f.read()
+
+    def as_header(self) -> dict:
+        return {'path': self._relative_path, 'media_type': self.media_type,
+                'bytes': self._bytes, 'sha256': self._sha256}
+
+    def __fspath__(self) -> str:
+        return self.path
+
+    def __str__(self) -> str:
+        return self.path
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, MediaFile):
+            return NotImplemented
+
+        return (self.is_stored == other.is_stored
+                and (self._relative_path == other._relative_path
+                     if self.is_stored else self.path == other.path))
+
+    def __hash__(self) -> int:
+        return hash((self._relative_path, self.path))
+
+    def __repr__(self) -> str:
+        if self.is_stored:
+            return (f'MediaFile({self._relative_path!r}, {self.media_type}, '
+                    f'{self._bytes} bytes)')
+
+        return f'MediaFile(source={self._source!r}, {self.media_type})'
 
 
 def loads(raw: bytes, root_path: Union[str, None] = None, memmap: bool = False) -> Any:
@@ -420,9 +607,13 @@ def loads(raw: bytes, root_path: Union[str, None] = None, memmap: bool = False) 
     `root_path` is the entarchy directory, needed only when the value lives in a
     file of its own rather than in the row.
     """
-    import os
-
     header, arrays = _unpack(raw)
+
+    if 'm' in header:
+        if root_path is None:
+            raise ValueError(f'Media file "{header["m"]["path"]}" cannot be resolved '
+                             f'without the entarchy path.')
+        return MediaFile._from_header(header['m'], str(root_path))
 
     if 'x' in header:
         if root_path is None:

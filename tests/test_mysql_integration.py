@@ -201,6 +201,22 @@ class TestBlobs:
         assert np.array_equal(fresh_read(entity, 'external'), arr)
         assert os.path.isdir(os.path.join(populated.path, 'ext'))
 
+    def test_media_files_live_beside_the_entarchy(self, populated, tmp_path):
+        """The server holds the pointer; the file stays in the entarchy
+        directory, which is local whichever backend is in use."""
+        from entarchy import MediaFile
+
+        source = tmp_path / 'behaviour.avi'
+        source.write_bytes(b'FAKE-AVI' + bytes(range(256)) * 10)
+
+        entity = populated.get(Session)[0]
+        entity['video'] = MediaFile(source)
+
+        stored = fresh_read(entity, 'video')
+        assert stored.path.startswith(populated.path)
+        assert stored.read_bytes() == source.read_bytes()
+        assert stored.verify()
+
     def test_generic_objects(self, populated):
         entity = populated.get(Session)[0]
         for key, value in [('list', [1, 2, 'x']), ('dict', {'a': [1, 2]}), ('none', None)]:

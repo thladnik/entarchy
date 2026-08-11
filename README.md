@@ -139,6 +139,51 @@ Compression is decided per value and kept only when it pays, so incompressible
 float traces are stored raw. On real calcium imaging data the format is about
 35% smaller than the pickles it replaced.
 
+### Media files
+
+Video, raw image stacks, anything large and opaque. The file is taken into the
+entarchy rather than referenced where it lies, because an entarchy has to be
+self-contained — everything it needs is under its own path or in the database
+its `entarchy.yaml` names.
+
+```python
+recording.set_media('video', '/data/fish1/fish_embedded_frame.avi')
+recording['video'] = MediaFile('/data/fish1/fish_embedded_frame.avi')  # equivalent
+```
+
+An assignment as well as a method, but the method exists because copying a
+gigabyte should not look like setting a value. `MediaFile(path, move=True)`
+takes the source instead of copying it.
+
+Reading gives a `MediaFile`, which is `os.PathLike` — so it goes straight to
+whatever reads that kind of file:
+
+```python
+video = recording['video']
+reader = imageio.get_reader(video)
+capture = cv2.VideoCapture(str(video))
+with video.open() as f: ...
+
+video.media_type    # 'video/x-msvideo'
+video.bytes         # 408944640
+video.exists(), video.verify()   # against the digest recorded on write
+recording.media()   # ['video']
+```
+
+Building the handle touches no file, so a DataFrame of a thousand of them costs
+nothing and a missing file surfaces when something opens it rather than when the
+attribute is read.
+
+**entarchy never decodes it.** No codec dependency, no transcoding, no frame
+access — the file goes in byte for byte, which is what makes the digest worth
+anything. Frames are what a decoder is for; what belongs in entarchy beside the
+video is the metadata you filter on and the frame times that make it alignable.
+
+Files live under `media/`, sharded by entity, keeping their original name.
+Replacing a media attribute removes the file it replaced, and `to_asdf` copies
+media into the archive at the same relative path, so an archive is self-contained
+too.
+
 ### Archiving to ASDF
 
 An entarchy, or a collection out of one, can be exported to a self-describing
