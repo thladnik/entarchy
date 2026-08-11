@@ -156,10 +156,16 @@ class TestLayout:
         assert not os.path.isabs(relative)
         assert os.path.exists(os.path.join(populated.path, relative))
 
-    def test_the_name_keeps_the_original(self, subject, source_file):
+    def test_the_name_comes_from_the_attribute_not_the_source(self, subject, source_file):
+        """An acquisition file name can be seventy characters of instrument
+        settings; keeping it would make every media path as long as whatever
+        the microscope wrote."""
+        from entarchy.backend.sql import _get_namehash
+
         subject['video'] = MediaFile(source_file)
 
-        assert subject['video'].relative_path.endswith('_behaviour.avi')
+        assert subject['video'].relative_path.endswith(f'{_get_namehash("video")}.avi')
+        assert 'behaviour' not in subject['video'].relative_path
 
     def test_two_attributes_do_not_collide(self, subject, source_file):
         subject['video_a'] = MediaFile(source_file)
@@ -168,30 +174,40 @@ class TestLayout:
         assert subject['video_a'].relative_path != subject['video_b'].relative_path
         assert subject['video_a'].exists() and subject['video_b'].exists()
 
-    def test_paths_stay_short_enough_for_windows(self, tmp_path):
-        """Two shard levels rather than eight: an acquisition file name can be
-        seventy characters before the entarchy path is even counted."""
+    def test_the_path_length_does_not_depend_on_the_source(self, tmp_path):
+        """Windows counts every character against a 260 limit, so the path a
+        media file gets has to be bounded whatever it was called."""
+        short = _get_media_fp(str(tmp_path), 'aaaabbbb-cccc-dddd-eeee-ffff00001111',
+                              'some/attribute', 'a.tif')
         long_name = ('2026-01-15_fish1_5dpf_jf7_14laser_651gain_2hz_2p6mag_'
                      '00001_cropped_0001.tif')
-        directory, filename = _get_media_fp(str(tmp_path), 'aaaabbbb-cccc-dddd-eeee-ffff00001111',
-                                            'some/attribute', long_name)
+        long = _get_media_fp(str(tmp_path), 'aaaabbbb-cccc-dddd-eeee-ffff00001111',
+                             'some/attribute', long_name)
 
-        relative = os.path.relpath(os.path.join(directory, filename), str(tmp_path))
-        assert len(relative) < 120
+        assert short == long
 
-    def test_a_hostile_source_name_is_sanitised(self, subject, tmp_path):
+        relative = os.path.relpath(os.path.join(*long), str(tmp_path))
+        assert len(relative) < 80
+
+    def test_a_hostile_source_name_cannot_reach_the_path(self, subject, tmp_path):
         odd = tmp_path / 'we ird (name)!.avi'
         odd.write_bytes(b'x')
 
         subject['video'] = MediaFile(odd)
 
-        assert '(' not in subject['video'].relative_path
-        assert ' ' not in subject['video'].relative_path
+        stored = subject['video']
+        assert stored.relative_path.endswith('.avi')
+        for character in ' ()!':
+            assert character not in stored.relative_path
+        assert stored.read_bytes() == b'x' 
 
 
 class TestReplacement:
 
-    def test_overwriting_removes_the_old_file(self, subject, source_file, tmp_path):
+    def test_overwriting_with_the_same_kind_replaces_in_place(self, subject,
+                                                              source_file, tmp_path):
+        """The name comes from the attribute, so a replacement of the same kind
+        lands on the same path - there is nothing left over to clean up."""
         subject['video'] = MediaFile(source_file)
         first = subject['video'].path
 
@@ -199,6 +215,22 @@ class TestReplacement:
         replacement.write_bytes(b'SECOND')
         subject['video'] = MediaFile(replacement)
 
+        assert subject['video'].path == first
+        assert subject['video'].read_bytes() == b'SECOND'
+        assert subject['video'].verify()
+
+    def test_overwriting_with_another_format_removes_the_old_file(self, subject,
+                                                                  source_file, tmp_path):
+        """A different extension is a different path, so the old file would be
+        left behind."""
+        subject['video'] = MediaFile(source_file)
+        first = subject['video'].path
+
+        replacement = tmp_path / 'sources' / 'behaviour.mp4'
+        replacement.write_bytes(b'SECOND')
+        subject['video'] = MediaFile(replacement)
+
+        assert subject['video'].path != first
         assert not os.path.exists(first)
         assert subject['video'].read_bytes() == b'SECOND'
 

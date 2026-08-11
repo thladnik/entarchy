@@ -873,32 +873,32 @@ def _store_blob(value: Any, root_path: str, max_blob_size: int,
         pathlib.Path(full_path).relative_to(root_path).as_posix())
 
 
-# Media files are sharded two levels deep rather than the eight `ext/` uses.
-#  There is one per attribute that holds one - hundreds, not the hundreds of
-#  thousands `ext/` has to spread - and every extra level costs path length that
-#  Windows counts against a 260 character limit, on top of an original file name
-#  that can itself be seventy characters of acquisition metadata.
+# Two shard levels rather than the eight `ext/` uses. Sharding by uuid puts one
+#  directory per entity either way - the extra levels spread nothing, since the
+#  leaf holds only that entity's files - and every level costs path length that
+#  Windows counts against a 260 character limit.
 MEDIA_SHARD_LEVELS = 2
-MEDIA_NAME_LIMIT = 60
 
 
 def _get_media_fp(root_path: str, entity_uuid: str, attr_name: str,
                   source_name: str) -> tuple[str, str]:
-    """Where a media file goes: sharded by entity, named for legibility.
+    """Where a media file goes: sharded by entity, named for its attribute.
 
-    The original file name is kept alongside the attribute hash - somebody will
-    browse this directory eventually, and `fish_embedded_frame.avi` tells them
-    more than a hash does.
+    Named the way `ext/` payloads are - the hash of the attribute name - rather
+    than after the source file. An acquisition file name can be seventy
+    characters of instrument settings, and putting it in the path makes the
+    length of every media path depend on whatever the microscope wrote.
+
+    The extension is kept, because it is short, it tells a reader browsing the
+    directory what kind of file this is, and some decoders dispatch on it.
     """
     _uuid = entity_uuid.replace('-', '')
     shards = [_uuid[4 * i:4 * (i + 1)] for i in range(MEDIA_SHARD_LEVELS)]
     directory = pathlib.PurePath(root_path, 'media', *shards).as_posix()
 
-    stem, extension = os.path.splitext(os.path.basename(source_name))
-    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', stem).strip('_')[:MEDIA_NAME_LIMIT]
-    extension = re.sub(r'[^A-Za-z0-9.]+', '', extension)[:16]
+    extension = re.sub(r'[^A-Za-z0-9.]+', '', os.path.splitext(source_name)[1])[:16]
 
-    return directory, f'{_get_namehash(attr_name)[:12]}_{safe or "media"}{extension}'
+    return directory, f'{_get_namehash(attr_name)}{extension}'
 
 
 def _store_media(media: 'blob_store.MediaFile', root_path: str,
