@@ -27,8 +27,12 @@ if TYPE_CHECKING:
 class Entarchy(object):
     """Entarchy is a class that represents a system of hierarchically organized entities.
     """
-    _base_version: str = '0.1'
-    _base_compat_version_list: list[str] = ['0.1']
+    # 0.2 changed how attribute values are stored: blobs hold an encoded
+    #  container rather than a pickled object, and value_str is unbounded. A 0.1
+    #  directory cannot be read, and is refused here rather than failing later
+    #  inside a value read.
+    _base_version: str = '0.2'
+    _base_compat_version_list: list[str] = ['0.2']
     _implementation_version: str
     _implementation_compat_version_list: list[str]
     _hierarchy_root_type: Type[Entity]
@@ -55,10 +59,11 @@ class Entarchy(object):
         self._config = yaml.safe_load(open(os.path.join(path, 'entarchy.yaml'), 'r'))
 
         if self._config['base_version'] not in self._base_compat_version_list:
-            raise RuntimeError(f'Base version in configuration '
-                               f'("{self._config["base_version"]}") '
-                               f'is not compatible with current base version '
-                               f'("{self._base_version}"). ')
+            raise RuntimeError(
+                f'"{self._path}" was written by entarchy base version '
+                f'{self._config["base_version"]}; this is {self._base_version}, which '
+                f'reads {", ".join(self._base_compat_version_list)}. The storage format '
+                f'changed between them, so the data has to be regenerated.')
 
         if self._config['implementation_version'] not in self._implementation_compat_version_list:
             raise RuntimeError(f'Implementation version in configuration '

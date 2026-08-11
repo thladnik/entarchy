@@ -216,8 +216,7 @@ class AttributeTable(Base):
     #  columns in the same order was declared here and simply duplicated it:
     #  ANALYZE reported identical statistics for both, and it cost 44 MB on a
     #  27 000 ROI entarchy (65 bytes per attribute row) plus its share of every
-    #  insert. Dropped; existing databases are cleaned by
-    #  entarchy.tools.optimize_storage.
+    #  insert. Dropped.
     #
     #  The single-column index on `name` (declared on the column itself) is a
     #  different matter and load bearing: it answers "which entities have this
@@ -284,26 +283,26 @@ class _QueryContext:
         self.link_spec = link_spec
 
 
-def _build_query_from_collection(_collection: Collection,
-                                 _session: sqlalchemy.orm.Session
+def _build_query_from_collection(coll: Collection,
+                                 sess: sqlalchemy.orm.Session
                                  ) -> sqlalchemy.orm.Query:
 
-    entity_type_name = _collection.entity_type.__name__
-    as_tree = _collection.as_tree
-    creation_time = _collection.init_time
+    entity_type_name = coll.entity_type.__name__
+    as_tree = coll.as_tree
+    creation_time = coll.init_time
 
     # Create base query
-    _query = _session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
+    _query = sess.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
     _query = _query.filter(EntityTable.created <= creation_time)
 
     link_spec = None
-    if getattr(_collection, 'link_type', None) is not None:
+    if getattr(coll, 'link_type', None) is not None:
         # A link collection is a collection of carrier entities narrowed to one kind
-        link_spec = _collection.link_type_spec
+        link_spec = coll.link_type_spec
         _query = (_query.join(Link, Link.link_uuid == EntityTable.uuid)
-                  .filter(Link.link_type == _collection.link_type))
+                  .filter(Link.link_type == coll.link_type))
 
-        endpoint_filter = _endpoint_membership_filter(_collection, _session)
+        endpoint_filter = _endpoint_membership_filter(coll, sess)
         if endpoint_filter is not None:
             _query = _query.filter(endpoint_filter)
 
@@ -312,12 +311,12 @@ def _build_query_from_collection(_collection: Collection,
         return _query
 
     filters = _generate_attribute_filters(
-        _QueryContext(entity_type_name, link_spec), _session, as_tree)
+        _QueryContext(entity_type_name, link_spec), sess, as_tree)
 
     return _query.filter(filters)
 
 
-def _endpoint_membership_filter(_collection: Collection, _session: sqlalchemy.orm.Session):
+def _endpoint_membership_filter(coll: Collection, sess: sqlalchemy.orm.Session):
     """Restrict a link collection to links whose ends lie in given collections.
 
     Each constraint is a (linker collection, linked collection) pair, either side
@@ -326,7 +325,7 @@ def _endpoint_membership_filter(_collection: Collection, _session: sqlalchemy.or
     and is not limited by how many parameters a statement may bind - spelling the
     members out as uuids gives up around sixteen thousand of them.
     """
-    constraints = getattr(_collection, 'endpoint_constraints', None)
+    constraints = getattr(coll, 'endpoint_constraints', None)
     if not constraints:
         return None
 
@@ -335,10 +334,10 @@ def _endpoint_membership_filter(_collection: Collection, _session: sqlalchemy.or
         parts = []
         if linker_collection is not None:
             parts.append(Link.linker_uuid.in_(
-                _uuids_of(_build_query_from_collection(linker_collection, _session))))
+                _uuids_of(_build_query_from_collection(linker_collection, sess))))
         if linked_collection is not None:
             parts.append(Link.linked_uuid.in_(
-                _uuids_of(_build_query_from_collection(linked_collection, _session))))
+                _uuids_of(_build_query_from_collection(linked_collection, sess))))
 
         if len(parts) == 1:
             clauses.append(parts[0])
@@ -479,14 +478,10 @@ def _split_endpoint_traversal(_session, rest: str, endpoint: Endpoint,
     return 0, rest
 
 
-def _generate_attribute_filters(context: Union[_QueryContext, str],
+def _generate_attribute_filters(context: _QueryContext,
                                 _session: sqlalchemy.orm.Session,
                                 as_tree: dict[str, ...]) -> Any:
 
-    # A bare entity type name is still accepted, so that anything calling this
-    #  directly keeps working
-    if isinstance(context, str):
-        context = _QueryContext(context)
     entity_type_name = context.entity_type_name
 
     _operator = as_tree['operator'].upper()
@@ -765,10 +760,8 @@ def _read_attribute_data(_entity: Entity, row: AttributeTable):
     # Check for inf and NaNs
     if row.data_type == 'float' and val is None:
         if row.float_is_inf:
-            # Sign of infinity is kept in the (otherwise unused) value_int column;
-            #  legacy rows without a sign default to +inf
-            sign = -1.0 if (row.value_int is not None and row.value_int < 0) else 1.0
-            return sign * float('inf')
+            # Sign of infinity is kept in the (otherwise unused) value_int column
+            return -1.0 * float('inf') if row.value_int < 0 else float('inf')
         elif row.float_is_nan:
             return float('nan')
 

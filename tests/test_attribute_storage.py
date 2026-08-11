@@ -27,17 +27,12 @@ def _index_names(ent, table='attributes'):
             sqlalchemy.inspect(ent.backend.sql_engine).get_indexes(table)}
 
 
-def _readd_duplicate_index(ent):
-    """Put the index back, as a database written by an older entarchy has it."""
-    with ent.backend.sql_engine.begin() as connection:
-        connection.execute(sqlalchemy.text(
-            'CREATE UNIQUE INDEX ix_unique_name_per_entity_uuid '
-            'ON attributes (entity_uuid, name)'))
+class TestIndexes:
 
-
-class TestDuplicateIndexIsGone:
-
-    def test_not_created_for_a_new_entarchy(self, ent):
+    def test_the_attributes_table_has_no_redundant_unique_index(self, ent):
+        """The primary key on (entity_uuid, name) is already backed by a unique
+        index in every dialect; a second one on the same columns cost 44 MB on a
+        27 000 ROI entarchy and served nothing."""
         assert 'ix_unique_name_per_entity_uuid' not in _index_names(ent)
 
     def test_the_name_index_is_kept(self, ent):
@@ -70,35 +65,22 @@ class TestDuplicateIndexIsGone:
 
 class TestOptimizeStorageTool:
 
-    def test_reports_a_current_database_as_done(self, populated):
+    def test_reports_the_database(self, populated):
         state = optimize_storage.inspect(_url(populated))
 
-        assert state['has_duplicate_index'] is False
+        assert state['dialect'] == 'sqlite'
         assert state['attribute_rows'] > 0
 
-    def test_finds_and_drops_the_duplicate_index(self, populated):
-        _readd_duplicate_index(populated)
-        assert optimize_storage.inspect(_url(populated))['has_duplicate_index']
-
-        done = optimize_storage.optimize(_url(populated), apply_changes=True, verbose=False)
-
-        assert done['dropped_index']
-        assert 'ix_unique_name_per_entity_uuid' not in _index_names(populated)
-
-    def test_dry_run_changes_nothing(self, populated):
-        _readd_duplicate_index(populated)
-
+    def test_dry_run_collects_nothing(self, populated):
         done = optimize_storage.optimize(_url(populated), apply_changes=False, verbose=False)
 
-        assert not done['dropped_index']
-        assert 'ix_unique_name_per_entity_uuid' in _index_names(populated)
+        assert not done['analysed']
 
     def test_is_repeatable(self, populated):
-        _readd_duplicate_index(populated)
         optimize_storage.optimize(_url(populated), apply_changes=True, verbose=False)
         again = optimize_storage.optimize(_url(populated), apply_changes=True, verbose=False)
 
-        assert not again['dropped_index']
+        assert not again['analysed']
 
     def test_collects_planner_statistics(self, populated):
         optimize_storage.optimize(_url(populated), apply_changes=True, verbose=False)

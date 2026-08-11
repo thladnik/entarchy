@@ -20,9 +20,26 @@ def rewrite_config(path, **changes):
 class TestConfigValidation:
 
     def test_incompatible_base_version_raises(self, ent):
+        """The storage format is not backward compatible, so this is what makes
+        an unreadable directory say so rather than fail deep inside a value read."""
         rewrite_config(ent.path, base_version='0.0')
-        with pytest.raises(RuntimeError, match='Base version'):
+        with pytest.raises(RuntimeError, match='storage format changed'):
             LabArchy(ent.path)
+
+    def test_the_version_message_names_the_directory_and_both_versions(self, ent):
+        rewrite_config(ent.path, base_version='0.1')
+
+        with pytest.raises(RuntimeError) as raised:
+            LabArchy(ent.path)
+
+        assert '0.1' in str(raised.value)
+        assert LabArchy._base_version in str(raised.value)
+        assert ent.path in str(raised.value)
+
+    def test_a_new_entarchy_records_the_current_base_version(self, ent):
+        config = yaml.safe_load(open(os.path.join(ent.path, 'entarchy.yaml')))
+
+        assert config['base_version'] == LabArchy._base_version
 
     def test_incompatible_implementation_version_raises(self, ent):
         rewrite_config(ent.path, implementation_version='99.9')

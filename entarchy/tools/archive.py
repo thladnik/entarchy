@@ -569,9 +569,7 @@ def rebuild_index(archive_path: str, verbose: bool = True) -> int:
                                                  type_tree['name'])]
 
         entity_rows = _tree_to_table(handle['entities'], _ENTITY_COLUMNS)
-        # Archives written before link types existed have no such entry
-        link_type_rows = (_tree_to_table(handle['link_types'], _LINK_TYPE_COLUMNS)
-                          if 'link_types' in handle else [])
+        link_type_rows = _tree_to_table(handle['link_types'], _LINK_TYPE_COLUMNS)
         link_rows = _tree_to_table(handle['links'], _LINK_COLUMNS)
         attribute_rows = _tree_to_table(handle['attributes'], _ATTRIBUTE_COLUMNS)
 

@@ -228,13 +228,13 @@ dataframe_of, 8 of 23 attributes:  5644 -> 3363 ms  1.68x
 
 ### Applying them to an existing entarchy
 
-```
-python -m entarchy.tools.optimize_storage <entarchy or URL>          # dry run
-python -m entarchy.tools.optimize_storage <entarchy or URL> --apply
-```
+There is no migration. The blob format change below makes a directory written
+before these fixes unreadable anyway, and the version in `entarchy.yaml` refuses
+to open one, so the answer is to regenerate.
 
-Safe to repeat. On SQLite the space the index held goes on the free list; run
-`VACUUM` to return it to the filesystem.
+`entarchy.tools.optimize_storage` remains for the one thing that is maintenance
+rather than migration: collecting SQLite planner statistics for a database that
+is read far more than it is written.
 
 ## What the fixes are actually worth
 

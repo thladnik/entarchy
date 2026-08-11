@@ -87,20 +87,16 @@ most of every possible pair unless told otherwise — see
 [the proposal](docs/proposals/link-entities.md) for the reasoning and the
 measurements.
 
-Entarchies created before links existed need their tables migrated:
-
-```sh
-python -m entarchy.tools.migrate_links /path/to/entarchy --apply
-```
-
-### Optimising attribute storage
+### Query planner statistics (SQLite)
 
 Attributes are stored one row per attribute, with a typed value column per kind.
 [The proposal](docs/proposals/attribute-storage.md) benchmarks that against
-JSON-column alternatives and explains why it stays — along with three fixes that
-came out of it. An entarchy written before them carries a duplicate index on
-`attributes` (44 MB on a 27 000 ROI dataset) and no SQLite query planner
-statistics:
+JSON-column alternatives and explains why it stays.
+
+SQLite plans entarchy's filters badly without statistics — driving a query from
+the entity type rather than from the attribute it names. The backend collects
+them when it closes, so this is only for a database that is read far more than
+it is written:
 
 ```sh
 # dry run first, then apply
@@ -108,8 +104,7 @@ python -m entarchy.tools.optimize_storage /path/to/entarchy
 python -m entarchy.tools.optimize_storage /path/to/entarchy --apply
 ```
 
-Safe to repeat, and safe on MySQL, where only the index applies. On SQLite the
-freed space goes on the free list; `VACUUM` returns it to the filesystem.
+MySQL is not covered: InnoDB maintains its own.
 
 ### Database credentials (MySQL backend)
 
