@@ -126,3 +126,82 @@ class TestParentAttributesInDataFrame:
         df = pd.DataFrame(index=rois.index, columns=['../depth'], data=[1.0] * len(rois))
         with pytest.raises(RuntimeError, match='parent attributes'):
             rois.update(df)
+
+
+class TestParentAttributeAlignment:
+    """Parent values belong to the entity they were looked up for.
+
+    The parent lookup and the attribute pivot are two queries ordered
+    independently of one another - the pivot groups without an ORDER BY, and
+    only SQLite happens to emit groups in key order. Pairing them off by
+    position therefore has to be wrong somewhere, and these force it.
+    """
+
+    def _expected(self, deep):
+        """What each ROI's layer depth is, worked out one entity at a time."""
+        return {roi.uuid: roi.parent['depth'] for roi in deep.get(Roi)}
+
+    def test_values_follow_the_entity_not_the_row(self, deep, monkeypatch):
+        expected = self._expected(deep)
+        backend = deep.backend
+        original = backend.get_collection_parent_uuids
+
+        # The contract is that the order of this call does not matter
+        monkeypatch.setattr(backend, 'get_collection_parent_uuids',
+                            lambda collection: list(reversed(original(collection))))
+
+        df = deep.get(Roi).dataframe_of(['../depth'])
+
+        assert len(df) == 12
+        for uuid, depth in expected.items():
+            assert df.loc[uuid, '../depth'] == depth
+
+    def test_a_rotated_lookup_gives_the_same_answer(self, deep, monkeypatch):
+        """Reversing happens to be self-inverse for a symmetric layout; a
+        rotation is not, so it catches an off-by-a-block pairing too."""
+        expected = self._expected(deep)
+        backend = deep.backend
+        original = backend.get_collection_parent_uuids
+
+        def rotated(collection):
+            rows = original(collection)
+            return rows[5:] + rows[:5]
+
+        monkeypatch.setattr(backend, 'get_collection_parent_uuids', rotated)
+
+        df = deep.get(Roi).dataframe_of(['index', '../depth', '[Animal]strain'])
+
+        for uuid, depth in expected.items():
+            assert df.loc[uuid, '../depth'] == depth
+        assert set(df['[Animal]strain']) == {'wildtype'}
+
+    def test_depth_agrees_with_the_entity_itself(self, deep):
+        """Without any monkeypatching: the frame must say what the entities say."""
+        df = deep.get(Roi).dataframe_of(['../depth'])
+
+        for roi in deep.get(Roi):
+            assert df.loc[roi.uuid, '../depth'] == roi.parent['depth']
+
+    def test_an_entity_whose_parent_is_missing_reads_as_none(self, deep):
+        """The lookup is a mapping now, so an entity it has nothing for has to
+        come out as None rather than shifting every later row up by one."""
+        backend = deep.backend
+        original = backend.get_collection_parent_uuids
+        rows = original(deep.get(Roi))
+        dropped = rows[3][0]
+
+        deep.backend.get_collection_parent_uuids = (
+            lambda collection: [row for row in rows if row[0] != dropped])
+        try:
+            df = deep.get(Roi).dataframe_of(['../depth'])
+        finally:
+            deep.backend.get_collection_parent_uuids = original
+
+        import pandas as pd
+
+        assert len(df) == 12
+        # None in a column of floats, so pandas holds it as NaN
+        assert pd.isna(df.loc[dropped, '../depth'])
+        for roi in deep.get(Roi):
+            if roi.uuid != dropped:
+                assert df.loc[roi.uuid, '../depth'] == roi.parent['depth']

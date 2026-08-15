@@ -1095,7 +1095,16 @@ class Collection(object):
 
             # print('Get parent attributes:', parent_attribute_names_to_fetch)
             parent_df = pd.DataFrame(index=self._cache.index)
-            uuids, parent_uuids = list(zip(*self.entarchy.backend.get_collection_parent_uuids(self)))
+
+            # Which parent each entity has, keyed by the entity rather than
+            #  taken in the order it arrives. This query and the pivot that
+            #  filled the cache are ordered independently of one another - the
+            #  pivot groups without an ORDER BY, and MySQL 8 dropped the
+            #  implicit ordering of GROUP BY that SQLite happens to give - so
+            #  pairing them off by position was trusting them to agree. Where
+            #  they did not, every parent value landed on the wrong entity.
+            parent_of = dict(self.entarchy.backend.get_collection_parent_uuids(self))
+
             for parent_attr in parent_attribute_names_to_fetch:
 
                 if parent_attr.startswith('../'):
@@ -1111,9 +1120,11 @@ class Collection(object):
                                                                      self.entity_type.__name__,
                                                                      parent_entity_type_name)
 
-                # Create a list of parent values
+                # Create a list of parent values, in the order of the rows they
+                #  are about
                 parent_values = []
-                for parent_uuid in parent_uuids:
+                for entity_uuid in self._cache.index:
+                    parent_uuid = parent_of.get(entity_uuid)
 
                     _parent_value = None
                     parent_entity = None
