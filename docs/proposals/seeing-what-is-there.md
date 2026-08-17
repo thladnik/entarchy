@@ -91,7 +91,7 @@ that renders all of them.
 description = roi.describe()
 
 description.attributes   # name, type, bytes, value        (values for scalars)
-description.links        # kind, direction, other end, attributes of the link
+description.links        # kind, count, direction, attribute names it carries
 description.media        # name, media type, bytes, present
 description.children     # type, count
 description.ancestry     # type, id  — up to the root
@@ -99,6 +99,47 @@ description.ancestry     # type, id  — up to the root
 description              # renders whole, in a notebook
 print(description)       # renders whole, in a terminal
 ```
+
+### What the links section says without reading links
+
+There is a middle ground between "327 links of kind `phase_frames`" and reading
+327 link entities, and it is the more useful half: **which attribute names those
+links carry.** A kind's names are its shape — `phase_frames` carries
+`start_index` and `end_index`, a correlation carries `r` and `p_value` — and
+that is what a reader wants when they meet a kind they did not create.
+
+It costs a `DISTINCT` over the links touching the entity, joined to the
+attributes table. Both `linker_uuid` and `linked_uuid` are indexed and the
+attributes primary key is `(entity_uuid, name)`, so it rides indexes throughout,
+and it scales with *this entity's* links rather than with the entarchy's:
+
+| entity | links | `count_links_by_type` | + attribute names |
+|---|---|---|---|
+| a Phase | 1 | 1.6 ms | 1.7 ms |
+| an Imaging | 327 | 1.4 ms | 7.8 ms |
+| a synthetic hub | 20,000 | 23.0 ms | 147.7 ms |
+
+So the default can be: kinds, counts, and the attribute names each kind carries.
+147 ms in the pathological case is acceptable for something a reader asked for
+by name; if it needs a guard, the guard is a link-count threshold above which
+the names are skipped and said to be skipped — **not** a `LIMIT` on the query,
+which does not help. `DISTINCT` has to scan everything before it can stop, and
+`LIMIT 50` measured 148.8 ms against 147.7 ms for the full answer.
+
+The entarchy-wide version of the same question — what does kind *k* carry
+anywhere — is a different matter: **726 ms** for `phase_frames`, because it
+scans all 17,079 of them. That belongs behind an explicit ask, or on the link
+type registry, or nowhere.
+
+**A wrinkle this turned up.** The names come back as
+`['end_index', 'id', 'start_index', 'uuid']`. `id` and `uuid` are entity
+bookkeeping stored as attribute rows, not the link's payload, so a description
+has to filter them. Worse, they are only there for links made one at a time:
+`ent.link()` builds a full entity and gets them, while `link_from_frame()`
+writes through the core and does not, so the same kind of link has different
+attribute names depending on how it was created. Cosmetic for a description,
+which filters both away — but it is an inconsistency between the two write
+paths, and worth a look on its own.
 
 For a collection the same sections, asked of the set rather than of one entity:
 
@@ -141,16 +182,15 @@ columns. Worth measuring after the fix rather than assuming it is solved, and
 worth a default cap on how many columns a preview reads, named in the output.
 
 **2. Links can be unbounded.** A ROI in a correlation analysis can have
-thousands. `describe()` must cap what it lists and say that it capped —
-`link_counts()` is already the cheap total, so the counts can be exact while the
-listing is not. Silently showing the first ten of four thousand would be worse
-than showing none.
+thousands. `describe()` must cap what it *lists* and say that it capped —
+`link_counts()` is the cheap exact total, so the counts stay right while the
+listing does not pretend to be complete. Silently showing the first ten of four
+thousand would be worse than showing none.
 
 **3. Reading a link's attributes means reading link entities.** The counts come
-from an indexed `GROUP BY`; the *contents* do not. If `description.links` shows
-link attributes it is doing real work per link, and that has to be opt-in
-(`roi.describe(links=True)`) rather than the default for an entity that might
-have thousands.
+from an indexed `GROUP BY`; the *contents* do not. Showing the values of every
+link is real work per link, and that has to be opt-in (`roi.describe(links=True)`)
+rather than the default for an entity that might have thousands.
 
 **4. Media must not be verified.** `MediaFile.verify()` re-hashes the whole
 file — 114 MB for one behaviour video. `exists()` is a stat call and is the
@@ -190,7 +230,8 @@ rather than `<Description object at 0x…>`.
    one query. `get_attribute_data_types` is the collection-level half of this
    and can be extended rather than duplicated.
 3. `Description`, its sections, and both reprs.
-4. `Entity.describe()` — attributes, media, ancestry, children, link counts.
+4. `Entity.describe()` — attributes, media, ancestry, children, and the links
+   section: kind, count, and the attribute names each kind carries.
 5. `Collection.describe()` — the same, aggregated, with the `entities` coverage
    column.
 6. Opt-in depth: `links=True` for link contents, `verify=True` for media
