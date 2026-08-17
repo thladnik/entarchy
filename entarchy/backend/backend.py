@@ -105,6 +105,13 @@ class Backend(object):
     def set_entity_attributes(self, _entity: Entity, names: Iterable[str], value: Iterable[Any]):
         raise NotImplementedError('')
 
+    def get_attribute_data_types(self, names: list[str]) -> dict[str, set[str]]:
+        """How each named attribute is stored, as a set of type names per name.
+
+        Names stored nowhere are absent from the result.
+        """
+        raise NotImplementedError('')
+
     # Collection related methods
 
     def get_collection_count(self, _collection: Collection) -> int:

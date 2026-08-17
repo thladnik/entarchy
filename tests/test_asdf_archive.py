@@ -210,6 +210,44 @@ class TestQueryEquivalence:
         assert roi.parent.parent.parent['strain'] == 'wildtype'
 
 
+class TestSortedReads:
+    """An archive keeps the uuids, so a sorted read must give the identical
+    order - which is the case the Python-side sort exists for. An ORDER BY
+    would take the archive's SQLite collation rather than the source's."""
+
+    def test_order_matches_the_source(self, source, archived):
+        ent, _ = archived
+
+        for keys in (('index',), ('-index',), ('[Layer]depth', 'index'),
+                     ('id',), ('-[Recording]rate', 'index')):
+            assert ([r.uuid for r in ent.get(Roi).sort(*keys)]
+                    == [r.uuid for r in source.get(Roi).sort(*keys)]), keys
+
+    def test_natural_order_matches_the_source(self, source, archived):
+        ent, _ = archived
+        assert ([r.uuid for r in ent.get(Roi).sort('id', natural=True)]
+                == [r.uuid for r in source.get(Roi).sort('id', natural=True)])
+
+    def test_ties_break_identically(self, source, archived):
+        """Every ROI shares its index with three others, so this is all ties."""
+        ent, _ = archived
+        assert ([r.uuid for r in ent.get(Roi).sort('index')]
+                == [r.uuid for r in source.get(Roi).sort('index')])
+
+    def test_dataframe_order_matches_the_source(self, source, archived):
+        ent, _ = archived
+        frame = ent.get(Roi).sort('-index').dataframe_of(['index'])
+        expected = source.get(Roi).sort('-index').dataframe_of(['index'])
+
+        assert list(frame.index) == list(expected.index)
+        assert list(frame['index']) == list(expected['index'])
+
+    def test_a_blob_is_refused_in_an_archive_too(self, archived):
+        ent, _ = archived
+        with pytest.raises(TypeError, match='stored as blobs'):
+            ent.get(Roi).sort('dff')
+
+
 class TestValueFidelity:
 
     def test_scalars(self, source, archived):

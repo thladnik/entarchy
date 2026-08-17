@@ -1,7 +1,12 @@
 # Proposal: sorting entity collections
 
-Status: **proposed**. Nothing built. The measurements below are of the current
-code, not of an implementation.
+Status: **implemented**. `Collection.sort()`, the access paths, the `map_async`
+interaction and the refusals are all in place. Three things came out differently
+from what is proposed below; they are noted under "What changed in the building".
+
+On the real entarchy — 42,521 ROIs — sorting by one key takes **3.58 s** and by
+three keys, two of them parent attributes, **5.31 s**. The second is dominated by
+the existing per-entity parent read in `dataframe_of` rather than by the sort.
 
 Measured against: entarchy at `731d516`, SQLite 3.40.1, MySQL 8.0.46,
 Windows 11 / Python 3.10.
@@ -274,20 +279,43 @@ the uuid tiebreaker, `sort('dff_max')` over ROIs where many share a rounded
 value gives an order that depends on pandas' sort kind. `kind='stable'` plus the
 uuid key makes it reproducible.
 
+## What changed in the building
+
+**A stored NaN is not told apart from a missing attribute.** Pitfall 9 below
+says it must not be, and the SQL does carry enough to distinguish them — but
+`get_collection_attributes` uses the `float_is_nan` marker to *reconstruct* NaN
+into the value column and then drops the marker, so by the time a caller sees
+the frame the two are the same value. Telling them apart would mean either
+changing what the pivot returns or a second query per key. `missing=` therefore
+places both together, and `sort()` says so.
+
+**`natural=` is decided by whether a column already has an order, not by whether
+it is `object`.** The pivot hands text back as pandas `string` dtype, so the
+obvious `dtype == object` test silently did nothing. The check is now "not
+numeric and not datetime", which is the actual intent: natural ordering is for
+text, and anything with its own numeric or temporal order is left alone.
+
+**The uuid tiebreaker is per entarchy.** It makes ties reproducible for one
+entarchy and for archives exported from it, which keep the uuids. Two separately
+built entarchies holding the same values give their entities different UUID4s,
+so their tied blocks come out in different orders. The cross-backend tests
+assert agreement on keys without ties, and assert the tiebreaking *rule*
+separately.
+
 ## Plan
 
-1. Fix the positional join in `dataframe_of`, with a regression test. Independent
-   of the rest.
-2. Give the pivot and `get_collection_parent_uuids` an explicit `ORDER BY uuid`,
+1. ~~Fix the positional join in `dataframe_of`~~ — done, and it was a live bug.
+2. ~~Explicit `ORDER BY uuid` on the pivot and `get_collection_parent_uuids`~~,
    so the unsorted case is specified rather than incidental.
-3. `Collection.sort()` — state, `_derive` carrying it, resolution through the
-   pivot, uuid tiebreaker.
-4. Wire the read paths: `__getitem__`, slices, `__iter__`, `dataframe_of`.
-5. Decide and implement the `map_async` interaction; decide the set-operation
-   rule.
-6. `natural=` and the blob refusal.
-
-Steps 1 and 2 are worth doing on their own merits even if sorting is dropped.
+3. ~~`Collection.sort()`~~ — state, resolution through the pivot, uuid tiebreaker.
+4. ~~Wire the read paths~~: `__getitem__`, slices, `__iter__`, `preview`,
+   `_repr_html_`, `dataframe_of`, `map`, `map_async`. All of them go through one
+   `_rows()`, so they cannot drift apart.
+5. ~~The `map_async` interaction~~: `_locality` now defaults to off on a sorted
+   collection, since grouping by parent would undo the order. ~~Set operations
+   and `where()` drop the sort~~, which falls out of `_derive` building a fresh
+   collection.
+6. ~~`natural=` and the blob refusal.~~
 
 ## Open questions
 

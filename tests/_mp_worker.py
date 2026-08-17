@@ -84,3 +84,10 @@ def fail_on_odd_index(session):
     if session['index'] % 2 == 1:
         raise ValueError(f'deliberate failure for {session.id}')
     session['succeeded'] = True
+
+
+def record_order(entity):
+    """Stamp when this entity was processed, to check processing order."""
+    import time
+
+    entity['processed_at'] = time.perf_counter_ns()

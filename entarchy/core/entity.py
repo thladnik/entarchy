@@ -4,6 +4,7 @@ import atexit
 import datetime
 import functools
 import html
+import re
 import sys
 import time
 import traceback
@@ -628,6 +629,17 @@ class Collection(object):
         self._pending_changes: dict[str, list[int]] = {}
         self._init_time = datetime.datetime.now()
 
+        # What sort() asked for, and the (uuid, id) order it works out to.
+        #  Both None on an unsorted collection, which is the default and keeps
+        #  the backend's uuid order.
+        self._sort_keys: list[tuple[str, bool]] = None
+        self._sort_natural: bool = False
+        self._sort_missing: str = 'last'
+        self._sort_order: list[tuple[str, str]] = None
+        # Resolving the order reads attributes, which goes back through
+        #  dataframe_of, which asks for the order. Set while that is in flight.
+        self._sort_resolving: bool = False
+
     def _derive(self, _as_tree) -> 'Collection':
         """A collection like this one, with a different filter tree.
 
@@ -637,6 +649,195 @@ class Collection(object):
         collection_type = self.entity_type.collection_type or Collection
 
         return collection_type(self.entarchy, self.entity_type, _as_tree)
+
+    def sort(self, *keys: str, natural: bool = False,
+             missing: str = 'last') -> 'Collection':
+        """A collection like this one, read in the order of the given keys.
+
+            rois.sort('index')                      # ascending
+            rois.sort('-dff_max')                   # descending
+            rois.sort('layer_index', '-dff_max')    # major, then minor
+            rois.sort('id', natural=True)           # Roi_2 before Roi_10
+            rois.sort('snr', missing='first')
+
+        Parent attributes work as keys, in either spelling:
+
+            rois.sort('[Animal]id', '[Layer]index', 'index')
+
+        The order is worked out in Python, from values read through the same
+        pivot `dataframe_of` uses, rather than as a SQL ORDER BY. The backends
+        do not agree about string order - SQLite compares bytes, MySQL 8
+        defaults to a case-insensitive collation - and `ArchiveBackend` is
+        SQLite, so an archive would otherwise sort differently from the
+        entarchy it was exported from. Sorting here costs one read of the key
+        columns and gives the same answer everywhere.
+
+        uuid is always appended as a final key, so entities that tie on
+        everything asked for still come back in a reproducible order - the same
+        order every time for this entarchy and for an archive exported from it,
+        though not for a different entarchy holding the same values, since
+        uuids are not shared between them.
+
+        Set operations and `where()` drop the sort, because the order of a union
+        of two differently sorted collections has no meaning worth guessing at.
+        Sort the result instead.
+
+        Args:
+            *keys: attribute names, each optionally prefixed with '-' for
+                descending.
+            natural: compare digit runs inside text as numbers, so `Roi_2`
+                precedes `Roi_10`. Applies only to text keys; numeric ones are
+                already in numeric order.
+            missing: 'last' (default) or 'first', for entities that do not have
+                the attribute. A stored NaN is not distinguished from a missing
+                attribute and is placed with it.
+
+        Returns:
+            Collection: a new collection; this one is unchanged.
+        """
+        if len(keys) == 0:
+            raise ValueError('sort() needs at least one attribute name to sort by.')
+
+        if missing not in ('first', 'last'):
+            raise ValueError(f'missing must be "first" or "last", not {missing!r}.')
+
+        parsed = []
+        for key in keys:
+            if not isinstance(key, str):
+                raise TypeError(f'Sort keys are attribute names; got {key!r}.')
+            descending = key.startswith('-')
+            name = key[1:] if descending else key
+            if len(name) == 0:
+                raise ValueError('An empty sort key is not an attribute name.')
+            parsed.append((name, descending))
+
+        self._refuse_unsortable([name for name, _ in parsed])
+
+        sorted_collection = self._derive(self._as_tree)
+        sorted_collection._sort_keys = parsed
+        sorted_collection._sort_natural = natural
+        sorted_collection._sort_missing = missing
+
+        return sorted_collection
+
+    def _refuse_unsortable(self, names: list[str]) -> None:
+        """Reject keys that cannot be put in an order, before any work is done.
+
+        A blob is an encoded container - a magic number, a header, then raw
+        buffers - so ordering by one would compare those bytes and look like it
+        had worked. Better to say so while the caller is still looking at the
+        line that asked for it.
+        """
+        stored_names = [_attribute_name_of(name) for name in names]
+        types = self.entarchy.backend.get_attribute_data_types(stored_names)
+
+        unknown = [given for given, stored in zip(names, stored_names)
+                   if stored not in types]
+        if len(unknown) > 0:
+            raise AttributeError(
+                f'Cannot sort by {unknown}: not stored on any entity.')
+
+        blobs = [given for given, stored in zip(names, stored_names)
+                 if 'blob' in types[stored]]
+        if len(blobs) > 0:
+            raise TypeError(
+                f'Cannot sort by {blobs}: stored as blobs, and a blob is an '
+                f'encoded container rather than a value with an order. Sort by '
+                f'something derived from it instead.')
+
+    def _ordered_rows(self) -> list[tuple[str, str]]:
+        """The (uuid, id) rows of this collection in its sort order, or None.
+
+        None means unsorted, which every caller reads as "ask the backend".
+        """
+        if self._sort_keys is None or self._sort_resolving:
+            return None
+
+        if self._sort_order is None:
+            self._sort_resolving = True
+            try:
+                self._sort_order = self._resolve_sort()
+            finally:
+                self._sort_resolving = False
+
+        return self._sort_order
+
+    def _resolve_sort(self) -> list[tuple[str, str]]:
+        """Work out the order once, by reading the key columns."""
+        rows = self.entarchy.backend.get_collection_entities_by_slice(
+            self, slice(None, None, None))
+        if len(rows) == 0:
+            return []
+
+        names = [name for name, _ in self._sort_keys]
+        frame = self.dataframe_of(names)
+
+        # Columns are labelled by position rather than by name: the index is
+        #  called 'uuid' and so is the tiebreaker, and pandas refuses to sort by
+        #  a label that is both. Integers cannot collide with it.
+        ordering = pd.DataFrame(index=frame.index)
+        for position, (name, _) in enumerate(self._sort_keys):
+            column = frame[name]
+
+            # Only text is reordered by reading its digits as numbers; doing it
+            #  to a column that already has a numeric or temporal order would
+            #  stringify it and undo that order. Asked as "has its own order"
+            #  rather than "is object", because the pivot hands back pandas
+            #  string dtype for text rather than object.
+            if self._sort_natural and not (
+                    pd.api.types.is_numeric_dtype(column)
+                    or pd.api.types.is_datetime64_any_dtype(column)):
+                column = column.map(_natural_sort_key, na_action='ignore')
+
+            ordering[position] = column
+
+        # The tiebreaker. Without it, entities equal on every key asked for come
+        #  back in whatever order the sort happened to leave them, and "the
+        #  first ten by response" can change membership between runs.
+        tiebreak = len(self._sort_keys)
+        ordering[tiebreak] = ordering.index
+
+        ordering = ordering.sort_values(
+            by=list(range(tiebreak + 1)),
+            ascending=[not descending for _, descending in self._sort_keys] + [True],
+            na_position=self._sort_missing,
+            kind='stable')
+
+        id_of = dict(rows)
+        if set(id_of) != set(ordering.index):
+            raise RuntimeError(
+                f'{self} produced {len(id_of)} entities but {len(ordering.index)} '
+                f'rows of attributes; refusing to guess how they pair up.')
+
+        return [(uuid, id_of[uuid]) for uuid in ordering.index]
+
+    @property
+    def is_sorted(self) -> bool:
+        """Whether an order was asked for, as opposed to the backend's own."""
+        return self._sort_keys is not None
+
+    @property
+    def sort_keys(self) -> list[str]:
+        """The keys this collection was sorted by, as sort() would take them."""
+        if self._sort_keys is None:
+            return []
+
+        return [f'-{name}' if descending else name
+                for name, descending in self._sort_keys]
+
+    def _rows(self, _slice: slice = None) -> list[tuple[str, str]]:
+        """(uuid, id) for this collection in its order, optionally sliced.
+
+        The one place that decides whether an access path follows a sort or the
+        backend's uuid order, so that they cannot drift apart.
+        """
+        ordered = self._ordered_rows()
+
+        if ordered is None:
+            return self.entarchy.backend.get_collection_entities_by_slice(
+                self, slice(None, None, None) if _slice is None else _slice)
+
+        return ordered if _slice is None else ordered[_slice]
 
     def _as_endpoint(self):
         """What this collection is, as a link endpoint constraint would see it."""
@@ -747,8 +948,7 @@ class Collection(object):
             count = len(self)
             title = self.name or self.entity_type.__name__
 
-            rows = self.entarchy.backend.get_collection_entities_by_slice(
-                self, slice(0, _HTML_PREVIEW_ROWS))
+            rows = self._rows(slice(0, _HTML_PREVIEW_ROWS))
 
             if count == 0:
                 body = ('<div style="color:#888;font-size:90%">no matching entities</div>')
@@ -790,7 +990,7 @@ class Collection(object):
             pandas.DataFrame
         """
 
-        rows = self.entarchy.backend.get_collection_entities_by_slice(self, slice(0, n))
+        rows = self._rows(slice(0, n))
         if len(rows) == 0:
             return pd.DataFrame()
 
@@ -800,7 +1000,10 @@ class Collection(object):
         if attribute_names is None:
             attribute_names = [name for name in subset.columns if name != 'uuid']
 
-        return subset.dataframe_of(attribute_names)
+        # The subset is a fresh collection and so carries none of this one's
+        #  order; put the rows back the way they were asked for
+        return subset.dataframe_of(attribute_names).reindex(
+            [_uuid for _uuid, _ in rows])
 
     # Access methods
 
@@ -811,14 +1014,22 @@ class Collection(object):
             if item < 0:
                 item = len(self) + item
 
-            _uuid, _id = self.entarchy.backend.get_collection_entity_by_index(self, item)
+            ordered = self._ordered_rows()
+            if ordered is None:
+                _uuid, _id = self.entarchy.backend.get_collection_entity_by_index(self, item)
+            else:
+                if not 0 <= item < len(ordered):
+                    raise IndexError(f'{self} has {len(ordered)} entities; '
+                                     f'no index {item}.')
+                _uuid, _id = ordered[item]
+
             return self.get_entity(_uuid=_uuid, _id=_id)
 
         # Return slice
         elif isinstance(item, slice):
 
             # Get data
-            res = self.entarchy.backend.get_collection_entities_by_slice(self, item)
+            res = self._rows(item)
 
             result = [self.get_entity(_uuid=_uuid, _id=_id) for _uuid, _id in res]
 
@@ -1155,18 +1366,26 @@ class Collection(object):
             if uuid_requested:
                 df['uuid'] = df.index
 
-            return df[original_attribute_order]
+            return self._in_sort_order(df[original_attribute_order])
 
         df = self._cache[attribute_names].copy()
 
         if uuid_requested:
             df['uuid'] = df.index
 
-        return df[original_attribute_order]
+        return self._in_sort_order(df[original_attribute_order])
 
-        # TODO: return final DataFrame in custom order
-        # if self._query_custom_orderby:
-        #     return self._cache.loc[self._pk_order, attribute_names]
+    def _in_sort_order(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Put a frame in the collection's order, if one was asked for.
+
+        The cache is indexed by uuid, so this is a reindex rather than a second
+        read - which is what makes sorting in Python affordable here.
+        """
+        ordered = self._ordered_rows()
+        if ordered is None:
+            return df
+
+        return df.reindex([_uuid for _uuid, _ in ordered])
 
     def get_entity(self, _uuid: str, _id: str) -> Entity:
 
@@ -1207,7 +1426,7 @@ class Collection(object):
                   _use_gpu: bool = False,
                   _gpu_max_device_num: int = None,
                   _calibrate: bool = True,
-                  _locality: bool = True,
+                  _locality: bool = None,
                   **kwargs) -> None:
         """Apply a function to each Entity of the collection in parallel worker processes.
 
@@ -1239,6 +1458,8 @@ class Collection(object):
             _locality (bool): Group entities by parent, so a worker processes entities
                 that share a parent together and can reuse the parent's cached
                 attributes. Set to False to keep the collection's own order.
+                Defaults to True, except on a sorted collection, where grouping
+                would undo the order that was asked for.
             **kwargs: Passed on to the function.
 
         Returns:
@@ -1248,7 +1469,7 @@ class Collection(object):
         import multiprocessing as mp
 
         # Address entities by UUID rather than shipping pickled Entity objects
-        entity_rows = self.entarchy.backend.get_collection_entities_by_slice(self, slice(None, None, None))
+        entity_rows = self._rows()
         entity_count = len(entity_rows)
 
         print(f'Run function {_fun.__name__} on {self} with args '
@@ -1287,6 +1508,13 @@ class Collection(object):
         #  the (often large) attributes of their parent instead of jumping between
         #  parents in UUID order. Entities are stored with random UUID4 keys, so
         #  the unsorted order has no locality at all.
+        #
+        #  A sorted collection is the exception: regrouping would silently undo
+        #  the order that was asked for, so locality is off by default there and
+        #  has to be asked for. Passing it explicitly still wins either way.
+        if _locality is None:
+            _locality = not self.is_sorted
+
         parent_uuids = {}
         if _locality:
             try:
@@ -1578,6 +1806,37 @@ _HTML_MAX_ATTRIBUTES = 40
 _HTML_PREVIEW_ROWS = 5
 _HTML_MAX_LINK_TYPES = 12
 
+# Wide enough for any count of anything an entarchy is likely to hold, and the
+#  padding only has to be consistent within one sort to be correct.
+_NATURAL_DIGIT_WIDTH = 20
+_NATURAL_DIGIT_RUN = re.compile(r'\d+')
+
+
+def _natural_sort_key(value: Any) -> str:
+    """A string that orders the way a reader expects: Roi_2 before Roi_10.
+
+    Digit runs are zero padded to a fixed width, so what comes back is still an
+    ordinary string. A tuple of alternating text and numbers would order just as
+    well until two ids disagree about their shape - `Roi_2` against `Roi_2b` -
+    and then comparing int against str raises.
+    """
+    return _NATURAL_DIGIT_RUN.sub(
+        lambda match: match.group(0).zfill(_NATURAL_DIGIT_WIDTH), str(value))
+
+
+def _attribute_name_of(key: str) -> str:
+    """The stored name behind a key, which may address a parent.
+
+    `../depth` and `[Layer]depth` are both stored as `depth`, on the parent.
+    """
+    if key.startswith('../'):
+        return key.replace('../', '')
+
+    if key.startswith('[') and ']' in key:
+        return key.split(']', 1)[1]
+
+    return key
+
 
 def _links_row_html(counts: dict[str, int]) -> str:
     """The link kinds row of the entity repr, or nothing when there are none."""
@@ -1821,8 +2080,7 @@ class CollectionIterator(object):
     def __init__(self, _collection: Collection):
         self._collection = _collection
         self._current_index = 0
-        self._results = self._collection.entarchy.backend.get_collection_entities_by_slice(self._collection,
-                                                                                           slice(None, None, None))
+        self._results = self._collection._rows()
 
     def __next__(self):
         # No more results: reset iteration counter and offset and stop iteration

@@ -732,3 +732,102 @@ class TestParallel:
 
         out = populated.get(Session)[['score', 'doubled']]
         assert (out['doubled'] == out['score'] * 2).all()
+
+
+class TestSortingAgreesAcrossBackends:
+    """The reason Collection.sort() orders in Python rather than as ORDER BY.
+
+    Neither backend pins a collation, so each takes its server default: SQLite
+    compares bytes, MySQL 8 defaults to utf8mb4_0900_ai_ci, which is case- and
+    accent-insensitive. `ORDER BY value_str` therefore answers differently on
+    the two - and since ArchiveBackend is SQLite, an archive would sort
+    differently from the MySQL entarchy it was exported from.
+
+    These build the same entities in both and assert the orders are identical.
+    """
+
+    # Chosen so that byte order and a case-insensitive collation disagree:
+    # binary puts every capital before every lowercase, ai_ci interleaves them
+    LABELS = ['abc', 'ABC', 'Zeta', 'alpha', 'Roi_2', 'Roi_10', 'Roi_1', 'plane0']
+
+    def _fill(self, entarchy):
+        with entarchy:
+            subject = Subject(entarchy, _id='subject_a', _parent=entarchy.root)
+            entarchy.add_new_entity(subject)
+
+            for index, label in enumerate(self.LABELS):
+                session = Session(entarchy, _id=f'sess_{index}', _parent=subject)
+                entarchy.add_new_entity(session)
+                session['index'] = index
+                session['label'] = label
+                session['score'] = float(index % 3)
+
+        return entarchy
+
+    @pytest.fixture()
+    def sqlite_twin(self, tmp_path):
+        from entarchy.backend import SQLiteBackend
+
+        path = (tmp_path / 'twin').as_posix()
+        twin = LabArchy.create(path, SQLiteBackend(path, dbname='twin.db'))
+        yield self._fill(twin)
+        twin.backend.close()
+
+    def _order(self, entarchy, *keys, **kwargs):
+        """The labels of the sorted collection, which is what has to agree."""
+        return [s['label'] for s in entarchy.get(Session).sort(*keys, **kwargs)]
+
+    def test_text_key_orders_the_same(self, ent, sqlite_twin):
+        self._fill(ent)
+
+        mysql_order = self._order(ent, 'label')
+        sqlite_order = self._order(sqlite_twin, 'label')
+
+        assert mysql_order == sqlite_order
+        # And it is byte order, which is what Python and SQLite both give
+        assert mysql_order == sorted(self.LABELS)
+
+    def test_a_case_insensitive_collation_does_not_leak_in(self, ent, sqlite_twin):
+        """The specific disagreement: ai_ci sorts abc before ABC and puts Zeta
+        among the lowercase words. Byte order does neither."""
+        self._fill(ent)
+
+        order = self._order(ent, 'label')
+
+        assert order.index('ABC') < order.index('abc')
+        assert order.index('Zeta') < order.index('alpha')
+
+    def test_natural_order_agrees(self, ent, sqlite_twin):
+        self._fill(ent)
+
+        assert (self._order(ent, 'label', natural=True)
+                == self._order(sqlite_twin, 'label', natural=True))
+
+    def test_a_key_without_ties_agrees(self, ent, sqlite_twin):
+        self._fill(ent)
+
+        assert self._order(ent, 'index') == self._order(sqlite_twin, 'index')
+
+    def test_ties_break_by_uuid_here_too(self, ent):
+        """The tiebreaker rule is the same on both, but the uuids are not.
+
+        Two separately built entarchies give their entities different UUID4s,
+        so their tied blocks come out in different orders. What is guaranteed is
+        reproducibility within one entarchy - and across an entarchy and an
+        archive exported from it, which keeps the uuids - rather than between
+        two that merely hold the same values.
+        """
+        self._fill(ent)
+
+        frame = ent.get(Session).sort('score').dataframe_of(['score'])
+        assert list(frame['score']) == sorted(frame['score'])
+
+        for score in set(frame['score']):
+            block = frame[frame['score'] == score]
+            assert list(block.index) == sorted(block.index)
+
+    def test_descending_and_missing_agree(self, ent, sqlite_twin):
+        self._fill(ent)
+
+        assert (self._order(ent, '-label', missing='first')
+                == self._order(sqlite_twin, '-label', missing='first'))

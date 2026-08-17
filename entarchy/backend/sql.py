@@ -1796,8 +1796,10 @@ class SQLBackend(Backend):
             # Get entity query for collection
             entity_query = _build_query_from_collection(_collection, session)
 
-            # res = parent_query.all()
-            res = entity_query.all()
+            # Ordered so that the unordered case is specified rather than left
+            #  to the plan. Callers must still pair by uuid - this agrees with
+            #  the attribute pivot's order, but nothing should depend on that.
+            res = entity_query.order_by(EntityTable.uuid).all()
 
         return [(r.uuid, r.parent_uuid) for r in res]
 
@@ -1819,6 +1821,31 @@ class SQLBackend(Backend):
             names = [row.name for row in attribute_query.all()]
 
         return names
+
+    @_retry_on_operational_failure
+    def get_attribute_data_types(self, names: list[str]) -> dict[str, set[str]]:
+        """How each named attribute is stored, anywhere in the entarchy.
+
+        A set per name, because one name may be stored with several types -
+        `int` for the entities that got a whole number and `float` for the
+        rest. Asked of the whole table rather than of a collection, which is
+        what makes it an index read; the caller decides whether the ambiguity
+        matters.
+
+        Names not stored anywhere are absent from the result rather than
+        mapping to an empty set, so a caller can tell "no such attribute" from
+        "stored, and here is how".
+        """
+        types: dict[str, set[str]] = {}
+        if len(names) == 0:
+            return types
+
+        with self.sql_session as session:
+            for row in (session.query(AttributeTable.name, AttributeTable.data_type)
+                        .filter(AttributeTable.name.in_(names)).distinct().all()):
+                types.setdefault(row.name, set()).add(row.data_type)
+
+        return types
 
     @_retry_on_operational_failure
     def get_collection_attributes(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
@@ -1934,6 +1961,10 @@ class SQLBackend(Backend):
                                            AttributeTable.name.in_(names)))
                 .filter(EntityTable.uuid.in_(_uuids_of(entity_query)))
                 .group_by(EntityTable.uuid, EntityTable.id)
+                # SQLite emits groups in key order as a side effect of grouping
+                #  and MySQL 8 does not, so say it. Collection.sort() reorders
+                #  afterwards; this only fixes what "unsorted" means.
+                .order_by(EntityTable.uuid)
             )
 
         # Create DataFrame from query result
