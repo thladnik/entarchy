@@ -1,6 +1,22 @@
 # Proposal: seeing what an entity or collection holds
 
-Status: **proposed**. Nothing built. The measurements are of the current code.
+Status: **implemented**, steps 1–5. `Entity.describe()`, `Collection.describe()`,
+the `Description` object and both reprs are in place, and `preview()` no longer
+reads blobs. Step 6's `verify=True` is in; `links=True` for link *contents* is
+not, because the links section turned out to say enough without them — see
+"What changed in the building".
+
+On the entarchy this was measured against:
+
+| | |
+|---|---|
+| `Recording.describe()` | 0.38 s — against `preview(3)` reading 653 MB |
+| `Phase.describe()` | 0.01 s |
+| `describe()` over 42,521 ROIs | 4.56 s |
+
+The first useful thing it said, unprompted: `ants/x` is on **33,468 of 42,521**
+ROIs. The 9,053 without it are exactly the tailtracking ones, which have no
+registration output — a fact about the data that took a column to notice.
 
 Measured against: entarchy at `089c45a`, on the vxpy entarchy at
 `E:/data/entarchy_vxpy` — 8 animals, 38 recordings, 42,521 ROIs, 1.6 million
@@ -222,22 +238,49 @@ already confusing; it has to degrade to partial output rather than fail.
 The vxpy work happens in both, so `__repr__` has to render a usable text table
 rather than `<Description object at 0x…>`.
 
+## What changed in the building
+
+**Three things had to be filtered that the proposal did not anticipate**, all of
+them the same shape: storage detail showing through as though it were data.
+
+- `id` and `uuid` are stored as attribute rows, so every attributes section
+  opened with two rows repeating the headline. Filtered, and named as
+  `BOOKKEEPING_NAMES` so the links section filters the same two for the same
+  reason.
+- A link's carrier entity is parented to its linker, which keeps the entity tree
+  valid — and made a ROI with five links report five `LinkEntity` children.
+  Links have their own section; they are not children.
+- Every entity's ancestry began with the entarchy root, which every entity has
+  and which therefore says nothing. Dropped, so a top-level entity has no
+  ancestry section at all rather than one row of nothing.
+
+**Media reads as `media` in the attributes section, not `blob`.** It is stored
+as a blob like anything else, but saying so sends a reader looking for an array.
+
+**`links=True` for link contents was not built.** The section already gives the
+kind, the count and what it carries, and the case for reading every link to show
+its values did not survive having the names there. `verify=True` for media
+digests is in, and off by default, because it re-reads every byte.
+
+**The value cut uses three dots rather than an ellipsis character.** A
+description is printed to whatever console is there, and a Windows one on a
+legacy code page raises on `…` rather than showing it.
+
 ## Plan
 
-1. Fix `preview()` to exclude blobs by default and name what it excluded.
-   Independent of everything else, and the current behaviour is a trap.
-2. A backend method for per-entity attribute metadata — name, type, size — in
-   one query. `get_attribute_data_types` is the collection-level half of this
-   and can be extended rather than duplicated.
-3. `Description`, its sections, and both reprs.
-4. `Entity.describe()` — attributes, media, ancestry, children, and the links
-   section: kind, count, and the attribute names each kind carries.
-5. `Collection.describe()` — the same, aggregated, with the `entities` coverage
-   column.
-6. Opt-in depth: `links=True` for link contents, `verify=True` for media
-   digests.
-
-Step 1 is worth doing on its own. Steps 2–5 are the proposal proper.
+1. ~~Fix `preview()` to exclude blobs by default and name what it excluded.~~
+   Done — the omitted names are printed and recorded in
+   `df.attrs['blobs_omitted']`, and `blobs=True` asks for them.
+2. ~~A backend method for per-entity attribute metadata.~~ Done, plus the
+   collection-level, link-name, link-count and child-count queries the sections
+   needed: `get_entity_attribute_metadata`,
+   `get_collection_attribute_metadata`, `get_link_attribute_names`,
+   `count_collection_links_by_type`, `count_child_entities`,
+   `count_collection_child_entities`.
+3. ~~`Description`, its sections, and both reprs.~~
+4. ~~`Entity.describe()`.~~
+5. ~~`Collection.describe()`.~~
+6. `verify=True` done; `links=True` not built, see above.
 
 ## Open questions
 

@@ -273,6 +273,122 @@ class Entity(object):
 
         return self[name]
 
+    def describe(self, values: bool = True, verify: bool = False) -> 'describe_mod.Description':
+        """What this entity holds: attributes, links, media, children, ancestry.
+
+            roi.describe()                  # renders whole
+            roi.describe().attributes       # a DataFrame
+
+        Blobs are reported by type and size rather than read, so this costs a
+        handful of indexed queries however much data the entity carries. The
+        sizes are bytes as stored - the encoded, compressed container - not the
+        size in memory once decoded.
+
+        Args:
+            values: read and inline the values of scalar attributes. They are
+                cheap and are their own summary; pass False for the shape alone.
+            verify: re-hash media files to check they are intact. Off by
+                default because it re-reads every byte of them.
+
+        Returns:
+            Description: sections that are DataFrames, rendering together.
+        """
+        from . import describe as describe_mod
+
+        backend = self.entarchy.backend
+        notes = []
+
+        metadata = backend.get_entity_attribute_metadata(self.uuid)
+
+        inlined = {}
+        if values:
+            scalar_names = [name for name, data_type, _ in metadata
+                            if data_type in describe_mod.SCALAR_TYPES]
+            if len(scalar_names) > 0:
+                try:
+                    read = self[scalar_names]
+                    if len(scalar_names) == 1:
+                        read = (read,)
+                    inlined = dict(zip(scalar_names, read))
+                except Exception as exc:
+                    notes.append(f'scalar values could not be read: {exc}')
+
+        try:
+            counts = self.link_counts()
+        except Exception:
+            counts = {}
+
+        carried = {}
+        if counts:
+            total_links = sum(counts.values())
+            if total_links <= describe_mod.LINK_NAME_LIMIT:
+                try:
+                    carried = backend.get_link_attribute_names(self.uuid)
+                except Exception as exc:
+                    notes.append(f'link attribute names could not be read: {exc}')
+            else:
+                notes.append(
+                    f'{total_links} links: what they carry was not looked up, '
+                    f'which needs a scan of all of them past '
+                    f'{describe_mod.LINK_NAME_LIMIT}.')
+
+        try:
+            children = backend.count_child_entities(self.uuid)
+        except Exception:
+            children = {}
+
+        # A link's carrier entity is parented to its linker, which keeps the
+        #  entity tree valid - but they are links, they have their own section,
+        #  and counting them here would tell a ROI it has 20 000 children
+        children.pop('LinkEntity', None)
+
+        headline = {'type': type(self).__name__, 'id': self.id, 'uuid': self.uuid}
+        try:
+            headline['path'] = self.path
+        except Exception:
+            pass
+
+        media_names = []
+        try:
+            media_names = self.media()
+        except Exception:
+            pass
+
+        sections = {
+            'attributes': describe_mod.attribute_rows(metadata, inlined, media_names),
+            'links': describe_mod.link_rows(counts, carried),
+            'media': describe_mod.media_rows(self, media_names, verify=verify),
+            'children': describe_mod.count_rows(children, 'type', 'count'),
+            'ancestry': self._ancestry_rows(),
+        }
+
+        return describe_mod.Description(
+            subject=f'{type(self).__name__} {self.id}',
+            headline=headline, sections=sections, notes=notes)
+
+    def _ancestry_rows(self) -> 'pd.DataFrame':
+        """This entity's parents, outermost first.
+
+        The entarchy root is left out: every entity has it, so a row saying so
+        carries nothing. An entity at the top of the hierarchy therefore has no
+        ancestry section rather than one row of nothing.
+
+        `seen` guards the walk rather than trusting the tree, because a
+        description is reached for when something is already wrong and a cycle
+        must not hang the session.
+        """
+        chain = []
+        entity = self.parent
+        seen = set()
+
+        while entity is not None and entity.uuid not in seen:
+            seen.add(entity.uuid)
+            if not isinstance(entity, EntarchyEntity):
+                chain.append({'type': type(entity).__name__, 'id': entity.id})
+            entity = entity.parent
+
+        return pd.DataFrame(list(reversed(chain)), columns=['type', 'id'])
+
     def media(self) -> list[str]:
         """Which attributes of this entity are media files.
 
@@ -1032,13 +1148,83 @@ class Collection(object):
             # A repr must never break a notebook session
             return _fallback_html(self)
 
-    def preview(self, n: int = 10, attribute_names: list[str] = None) -> pd.DataFrame:
+    def describe(self, links: bool = True) -> 'describe_mod.Description':
+        """What this collection holds, asked of the set rather than of one entity.
+
+            rois.describe()                 # renders whole
+            rois.describe().attributes      # a DataFrame
+
+        The attributes section gains the column a single entity cannot show:
+        `entities`, how many members actually carry each name. Attributes are
+        per entity rather than per type, so `ants/x` on 34 000 of 42 521 ROIs is
+        a fact about the data worth meeting without going looking for it.
+
+        Args:
+            links: count the link kinds touching this collection. One query, but
+                over every member, so it can be turned off for a large one.
+
+        Returns:
+            Description: sections that are DataFrames, rendering together.
+        """
+        from . import describe as describe_mod
+
+        backend = self.entarchy.backend
+        notes = []
+        count = len(self)
+
+        try:
+            metadata = backend.get_collection_attribute_metadata(self)
+        except Exception as exc:
+            metadata = []
+            notes.append(f'attributes could not be read: {exc}')
+
+        link_counts = {}
+        if links and count > 0:
+            try:
+                link_counts = backend.count_collection_links_by_type(self)
+            except Exception as exc:
+                notes.append(f'link counts could not be read: {exc}')
+
+        children = {}
+        if count > 0:
+            try:
+                children = backend.count_collection_child_entities(self)
+            except Exception as exc:
+                notes.append(f'child counts could not be read: {exc}')
+
+            # Link carriers are parented to their linker; they are links, and
+            #  the links section is where they belong
+            children.pop('LinkEntity', None)
+
+        sections = {
+            'attributes': describe_mod.collection_attribute_rows(metadata, count),
+            'links': describe_mod.link_rows(link_counts),
+            'children': describe_mod.count_rows(children, 'type', 'count'),
+        }
+
+        return describe_mod.Description(
+            subject=self.name or f'{count} {self.entity_type.__name__}',
+            headline={'entity type': self.entity_type.__name__,
+                      'entities': count,
+                      'order': self.order},
+            sections=sections, notes=notes)
+
+    def preview(self, n: int = 10, attribute_names: list[str] = None,
+                blobs: bool = False) -> pd.DataFrame:
         """Return the first n entities as a DataFrame, for interactive inspection.
+
+        Blobs are left out unless asked for, because a preview that reads them is
+        not a preview: three rows of a Recording in the vxpy schema came to 653 MB
+        of array data, and three rows of a Layer to 196 MB. Which names were left
+        out is printed and recorded in `df.attrs['blobs_omitted']`, so their
+        absence is visible rather than silent.
 
         Args:
             n (int): Number of entities to show.
             attribute_names (list of str): Attributes to include. Defaults to the
-                scalar attributes of the collection, so large blobs are not loaded.
+                scalar attributes of the collection. Named attributes are taken
+                as asked for, blob or not.
+            blobs (bool): Include blob attributes in the default selection.
 
         Returns:
             pandas.DataFrame
@@ -1051,13 +1237,30 @@ class Collection(object):
         subset = self.entarchy.get(self.entity_type,
                                    ' OR '.join(f'uuid == "{_uuid}"' for _uuid, _ in rows))
 
+        omitted = []
         if attribute_names is None:
             attribute_names = [name for name in subset.columns if name != 'uuid']
 
+            if not blobs:
+                types = self.entarchy.backend.get_attribute_data_types(attribute_names)
+                omitted = sorted(name for name in attribute_names
+                                 if 'blob' in types.get(name, set()))
+                attribute_names = [name for name in attribute_names
+                                   if name not in set(omitted)]
+
+        if len(omitted) > 0:
+            shown = ', '.join(omitted[:5])
+            more = f' and {len(omitted) - 5} more' if len(omitted) > 5 else ''
+            print(f'preview: left out {len(omitted)} blob attribute(s) - {shown}{more}. '
+                  f'Pass blobs=True or name them to read them.')
+
         # The subset is a fresh collection and so carries none of this one's
         #  order; put the rows back the way they were asked for
-        return subset.dataframe_of(attribute_names).reindex(
+        frame = subset.dataframe_of(attribute_names).reindex(
             [_uuid for _uuid, _ in rows])
+        frame.attrs['blobs_omitted'] = omitted
+
+        return frame
 
     # Access methods
 

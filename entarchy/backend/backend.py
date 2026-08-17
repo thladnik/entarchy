@@ -112,6 +112,27 @@ class Backend(object):
         """
         raise NotImplementedError('')
 
+    def get_entity_attribute_metadata(self, entity_uuid: str) -> list[tuple[str, str, int]]:
+        """(name, data_type, data_size) for every attribute of one entity."""
+        raise NotImplementedError('')
+
+    def get_collection_attribute_metadata(
+            self, _collection: Collection) -> list[tuple[str, str, int, int]]:
+        """(name, data_type, entity_count, total_size) across a collection."""
+        raise NotImplementedError('')
+
+    def get_link_attribute_names(self, entity_uuid: str) -> dict[str, list[str]]:
+        """Which attribute names the links touching an entity carry, per kind."""
+        raise NotImplementedError('')
+
+    def count_collection_links_by_type(self, _collection: Collection) -> dict[str, int]:
+        """How many links of each kind touch any entity of a collection."""
+        raise NotImplementedError('')
+
+    def count_child_entities(self, entity_uuid: str) -> dict[str, int]:
+        """How many children an entity has, by entity type name."""
+        raise NotImplementedError('')
+
     # Collection related methods
 
     def get_collection_count(self, _collection: Collection) -> int:

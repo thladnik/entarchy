@@ -1848,6 +1848,127 @@ class SQLBackend(Backend):
         return types
 
     @_retry_on_operational_failure
+    def get_entity_attribute_metadata(self, entity_uuid: str) -> list[tuple[str, str, int]]:
+        """(name, data_type, data_size) for every attribute of one entity.
+
+        The shape of a value without reading it. Both columns are written on
+        every attribute row, so this answers "what is here and what does it
+        cost" from the primary key alone - which is what lets a description of
+        an entity holding hundreds of megabytes cost one query.
+
+        `data_size` is bytes as stored: the encoded, compressed container,
+        rather than the size in memory once decoded.
+        """
+        with self.sql_session as session:
+            rows = (session.query(AttributeTable.name, AttributeTable.data_type,
+                                  AttributeTable.data_size)
+                    .filter(AttributeTable.entity_uuid == entity_uuid)
+                    .order_by(AttributeTable.name).all())
+
+        return [(row.name, row.data_type, int(row.data_size or 0)) for row in rows]
+
+    @_retry_on_operational_failure
+    def get_collection_attribute_metadata(
+            self, _collection: Collection) -> list[tuple[str, str, int, int]]:
+        """(name, data_type, entity_count, total_size) across a collection.
+
+        Grouped by name and type rather than by name alone, because one name may
+        be stored with several types - `int` where a whole number was written and
+        `float` elsewhere - and collapsing that here would hide exactly the thing
+        worth seeing.
+        """
+        with self.sql_session as session:
+            entity_query = _build_query_from_collection(_collection, session)
+
+            rows = (session.query(AttributeTable.name, AttributeTable.data_type,
+                                  sqlalchemy.func.count(),
+                                  sqlalchemy.func.sum(AttributeTable.data_size))
+                    .filter(AttributeTable.entity_uuid.in_(_uuids_of(entity_query)))
+                    .group_by(AttributeTable.name, AttributeTable.data_type)
+                    .order_by(AttributeTable.name).all())
+
+        return [(name, data_type, int(count), int(total or 0))
+                for name, data_type, count, total in rows]
+
+    @_retry_on_operational_failure
+    def get_link_attribute_names(self, entity_uuid: str) -> dict[str, list[str]]:
+        """Which attribute names the links touching an entity carry, per kind.
+
+        A kind's names are its shape - `phase_frames` carries `start_index` and
+        `end_index` - and that is what a reader meeting an unfamiliar kind wants,
+        without reading the links themselves.
+
+        Rides ix_link_linker, ix_link_linked and the attributes primary key, so
+        it scales with this entity's links rather than the entarchy's: measured
+        1.7 ms at one link, 7.8 ms at 327, 148 ms at 20 000. A LIMIT would not
+        help - DISTINCT has to scan before it can stop - so a caller that needs
+        a guard should decide from the link count instead.
+        """
+        with self.sql_session as session:
+            rows = (session.query(Link.link_type, AttributeTable.name)
+                    .join(AttributeTable, AttributeTable.entity_uuid == Link.link_uuid)
+                    .filter(sqlalchemy.or_(Link.linker_uuid == entity_uuid,
+                                           Link.linked_uuid == entity_uuid))
+                    .distinct().all())
+
+        carried: dict[str, set] = {}
+        for link_type, name in rows:
+            carried.setdefault(link_type, set()).add(name)
+
+        return {link_type: sorted(names) for link_type, names in sorted(carried.items())}
+
+    @_retry_on_operational_failure
+    def count_collection_links_by_type(self, _collection: Collection) -> dict[str, int]:
+        """How many links of each kind touch any entity of a collection.
+
+        A link with both ends inside the collection is counted once, which is
+        what makes this a count of links rather than of endpoints.
+        """
+        with self.sql_session as session:
+            entity_query = _build_query_from_collection(_collection, session)
+            uuids = _uuids_of(entity_query)
+
+            rows = (session.query(Link.link_type, sqlalchemy.func.count(
+                        sqlalchemy.distinct(Link.link_uuid)))
+                    .filter(sqlalchemy.or_(Link.linker_uuid.in_(uuids),
+                                           Link.linked_uuid.in_(uuids)))
+                    .group_by(Link.link_type).order_by(Link.link_type).all())
+
+        return {link_type: int(count) for link_type, count in rows}
+
+    @_retry_on_operational_failure
+    def count_child_entities(self, entity_uuid: str) -> dict[str, int]:
+        """How many children an entity has, by entity type name."""
+        with self.sql_session as session:
+            rows = (session.query(EntityTypeTable.name, sqlalchemy.func.count())
+                    .select_from(EntityTable)
+                    .join(EntityTypeTable, EntityTable.entity_type_pk == EntityTypeTable.pk)
+                    .filter(EntityTable.parent_uuid == entity_uuid)
+                    .group_by(EntityTypeTable.name)
+                    .order_by(EntityTypeTable.name).all())
+
+        return {name: int(count) for name, count in rows}
+
+    @_retry_on_operational_failure
+    def count_collection_child_entities(self, _collection: Collection) -> dict[str, int]:
+        """How many children the entities of a collection have, by type name.
+
+        Asked of parent_uuid directly rather than by building a query per child
+        type, so it stays one query however many levels the schema declares.
+        """
+        with self.sql_session as session:
+            entity_query = _build_query_from_collection(_collection, session)
+
+            rows = (session.query(EntityTypeTable.name, sqlalchemy.func.count())
+                    .select_from(EntityTable)
+                    .join(EntityTypeTable, EntityTable.entity_type_pk == EntityTypeTable.pk)
+                    .filter(EntityTable.parent_uuid.in_(_uuids_of(entity_query)))
+                    .group_by(EntityTypeTable.name)
+                    .order_by(EntityTypeTable.name).all())
+
+        return {name: int(count) for name, count in rows}
+
+    @_retry_on_operational_failure
     def get_collection_attributes(self, _collection: Collection, names: list[str]) -> pd.DataFrame:
 
         entity_type_name = _collection.entity_type.__name__
