@@ -317,13 +317,38 @@ separately.
    collection.
 6. ~~`natural=` and the blob refusal.~~
 
-## Open questions
+## The three questions, answered
 
-- Should `natural=True` be the default for `id`? It is what every caller has
-  wanted so far, but a default that inspects the key's contents is a default
-  that sometimes surprises.
-- Should `sort()` on an unsorted-by-default collection make the *implicit* uuid
-  order explicit in the repr, so `preview()` shows what one is looking at?
-- Is there a case for `sort_by_hierarchy()` — parent id, then child id, down the
-  tree? It is what most printed output wants, and it is tedious to spell out
-  as `sort('[Animal]id', '[Recording]id', 'id')`.
+All three were taken, and all three are built.
+
+**`natural=True` is the default**, for every text key rather than only for `id`.
+Entity ids are numbered — `Roi_0` to `Roi_1299`, `plane0` to `plane4` — and
+nobody reading them means the order that puts `Roi_100` third. The worry was
+that a default which inspects the key's contents sometimes surprises; what
+contains it is that it applies only to text, and a key that already has a
+numeric or temporal order is left in it. Byte order is `natural=False`.
+
+**The order is stated rather than implied.** `Collection.order` reports it in
+the words `sort()` would take, and says `uuid` rather than nothing when nothing
+was asked for — an arbitrary order is not an absent one. Both reprs carry it,
+and the HTML one puts it beside the truncation notice, which is exactly where it
+decides *which* five rows are being looked at.
+
+**`sort_by_hierarchy()` exists.** Each ancestor's id down the tree, then the
+entity's own, read from the entarchy's declared hierarchy so it follows whatever
+levels a schema has:
+
+```python
+rois.sort_by_hierarchy()
+# the same as, in the vxpy schema
+rois.sort('[Animal]id', '[Recording]id', '[Imaging]id', '[Layer]id', 'id')
+```
+
+## Still open
+
+- Sort push-down for the narrow case where it is safe — a numeric key, no ties,
+  no archive involved. Worth revisiting only if entarchies grow by an order of
+  magnitude; at 42,521 ROIs one key costs 3.58 s and the answer is the same
+  everywhere, which was the point of doing it here.
+- Telling a stored NaN from a missing attribute, which needs the pivot to stop
+  collapsing the two before a caller sees them.

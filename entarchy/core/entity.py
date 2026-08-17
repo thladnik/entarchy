@@ -650,14 +650,15 @@ class Collection(object):
 
         return collection_type(self.entarchy, self.entity_type, _as_tree)
 
-    def sort(self, *keys: str, natural: bool = False,
+    def sort(self, *keys: str, natural: bool = True,
              missing: str = 'last') -> 'Collection':
         """A collection like this one, read in the order of the given keys.
 
             rois.sort('index')                      # ascending
             rois.sort('-dff_max')                   # descending
             rois.sort('layer_index', '-dff_max')    # major, then minor
-            rois.sort('id', natural=True)           # Roi_2 before Roi_10
+            rois.sort('id')                         # Roi_2 before Roi_10
+            rois.sort('id', natural=False)          # Roi_10 before Roi_2
             rois.sort('snr', missing='first')
 
         Parent attributes work as keys, in either spelling:
@@ -686,8 +687,11 @@ class Collection(object):
             *keys: attribute names, each optionally prefixed with '-' for
                 descending.
             natural: compare digit runs inside text as numbers, so `Roi_2`
-                precedes `Roi_10`. Applies only to text keys; numeric ones are
-                already in numeric order.
+                precedes `Roi_10`. On by default, because entity ids are
+                numbered - `Roi_0` to `Roi_1299`, `plane0` to `plane4` - and
+                nobody reading them means the order that puts `Roi_100` second.
+                Applies only to text keys; a key that already has a numeric or
+                temporal order is left in it. Pass False for byte order.
             missing: 'last' (default) or 'first', for entities that do not have
                 the attribute. A stored NaN is not distinguished from a missing
                 attribute and is placed with it.
@@ -719,6 +723,47 @@ class Collection(object):
         sorted_collection._sort_missing = missing
 
         return sorted_collection
+
+    def sort_by_hierarchy(self, natural: bool = True,
+                          missing: str = 'last') -> 'Collection':
+        """A collection read down the tree: each ancestor's id, then its own.
+
+            rois.sort_by_hierarchy()
+            # the same as
+            rois.sort('[Animal]id', '[Recording]id', '[Imaging]id',
+                      '[Layer]id', 'id')
+
+        Which is the order almost anything printed wants, and tedious enough to
+        spell out that it tends not to be. The chain is read from the entarchy's
+        own hierarchy, so it follows whatever levels the schema declares.
+
+        Returns:
+            Collection: a new collection; this one is unchanged.
+        """
+        path = _find_path(self.entarchy.hierarchy, self.entity_type.__name__)
+        if path is None:
+            raise LookupError(
+                f'{self.entity_type.__name__} is not in this entarchy\'s '
+                f'hierarchy, so it has no ancestors to sort by.')
+
+        # The last entry of the path is this type itself, which addresses its
+        #  own id rather than an ancestor's
+        keys = [f'[{ancestor}]id' for ancestor in path[:-1]] + ['id']
+
+        return self.sort(*keys, natural=natural, missing=missing)
+
+    @property
+    def order(self) -> str:
+        """How this collection is read, in the words sort() would take.
+
+        Says `uuid` when nothing was asked for, rather than nothing at all: the
+        order is arbitrary but it is not absent, and a reader looking at the
+        first ten rows deserves to know which ten they are.
+        """
+        if self._sort_keys is None:
+            return 'uuid'
+
+        return ', '.join(self.sort_keys)
 
     def _refuse_unsortable(self, names: list[str]) -> None:
         """Reject keys that cannot be put in an order, before any work is done.
@@ -934,8 +979,9 @@ class Collection(object):
         if self.name is not None:
             return self.name
         if self.__class__.__name__ == 'Collection':
-            return f'{self.__class__.__name__}(entity_type=\'{self.entity_type.__name__}\', count={len(self)})'
-        return f'{self.__class__.__name__}(count={len(self)})'
+            return (f'{self.__class__.__name__}(entity_type=\'{self.entity_type.__name__}\', '
+                    f'count={len(self)}, order=\'{self.order}\')')
+        return f'{self.__class__.__name__}(count={len(self)}, order=\'{self.order}\')'
 
     def _repr_html_(self) -> str:
         """Rich representation for notebooks.
@@ -957,8 +1003,16 @@ class Collection(object):
                     f'<tr><td style="font-family:monospace;padding-right:12px">{html.escape(str(_id))}</td>'
                     f'<td style="font-family:monospace;color:#888">{html.escape(str(_uuid))}</td></tr>'
                     for _uuid, _id in rows)
-                more = (f'<div style="color:#888;font-size:90%">showing {len(rows)} of {count}</div>'
-                        if count > len(rows) else '')
+                # Which rows these are depends entirely on the order, and an
+                #  unsorted collection is in uuid order rather than in no order
+                #  at all - so say which, especially when this is a truncated
+                #  view of something much larger
+                more = (f'<div style="color:#888;font-size:90%">'
+                        f'showing {len(rows)} of {count}, ordered by '
+                        f'<code>{html.escape(self.order)}</code></div>'
+                        if count > len(rows) else
+                        f'<div style="color:#888;font-size:90%">ordered by '
+                        f'<code>{html.escape(self.order)}</code></div>')
                 body = (f'<table style="border:none">'
                         f'<tr><th style="text-align:left;color:#888">id</th>'
                         f'<th style="text-align:left;color:#888">uuid</th></tr>'
@@ -1788,7 +1842,8 @@ class LinkCollection(Collection):
         if self.name is not None:
             return self.name
         pinned = ' (endpoints restricted)' if self._endpoint_constraints else ''
-        return f'LinkCollection(\'{self._link_type}\'{pinned}, count={len(self)})'
+        return (f'LinkCollection(\'{self._link_type}\'{pinned}, '
+                f'count={len(self)}, order=\'{self.order}\')')
 
 
 # Per-worker state for Collection.map_async.

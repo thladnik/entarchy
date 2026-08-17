@@ -129,20 +129,87 @@ class TestSortOrder:
 
 class TestNaturalOrder:
 
-    def test_lexicographic_by_default(self, sortable):
+    def test_natural_is_the_default(self, sortable):
+        """Entity ids are numbered, and nobody reading Roi_0 .. Roi_11 means the
+        order that puts Roi_10 third."""
         ids = [roi.id for roi in sortable.get(Roi).sort('id')]
-        assert ids[:6] == ['Roi_0', 'Roi_0', 'Roi_1', 'Roi_1', 'Roi_10', 'Roi_10']
-
-    def test_natural_reads_digits_as_numbers(self, sortable):
-        ids = [roi.id for roi in sortable.get(Roi).sort('id', natural=True)]
         assert ids[:6] == ['Roi_0', 'Roi_0', 'Roi_1', 'Roi_1', 'Roi_2', 'Roi_2']
         assert ids[-2:] == ['Roi_11', 'Roi_11']
 
+    def test_byte_order_can_still_be_asked_for(self, sortable):
+        ids = [roi.id for roi in sortable.get(Roi).sort('id', natural=False)]
+        assert ids[:6] == ['Roi_0', 'Roi_0', 'Roi_1', 'Roi_1', 'Roi_10', 'Roi_10']
+
+    def test_the_two_differ(self, sortable):
+        assert ([r.uuid for r in sortable.get(Roi).sort('id')]
+                != [r.uuid for r in sortable.get(Roi).sort('id', natural=False)])
+
     def test_numeric_keys_are_left_alone(self, sortable):
         """Padding the digits of a float column would sort 10.0 before 9.0."""
-        plain = indices(sortable.get(Roi).sort('index'))
-        natural = indices(sortable.get(Roi).sort('index', natural=True))
+        plain = indices(sortable.get(Roi).sort('index', natural=False))
+        natural = indices(sortable.get(Roi).sort('index'))
         assert plain == natural == sorted(list(range(12)) * 2)
+
+    def test_text_without_digits_is_unaffected(self, sortable):
+        assert ([r.uuid for r in sortable.get(Recording).sort('id')]
+                == [r.uuid for r in sortable.get(Recording).sort('id', natural=False)])
+
+
+class TestSortByHierarchy:
+
+    def test_walks_down_the_tree(self, sortable):
+        rois = sortable.get(Roi).sort_by_hierarchy()
+        assert rois.sort_keys == ['[Animal]id', '[Recording]id', '[Layer]id', 'id']
+
+    def test_is_the_same_as_spelling_it_out(self, sortable):
+        spelled = sortable.get(Roi).sort('[Animal]id', '[Recording]id',
+                                         '[Layer]id', 'id')
+        assert ([r.uuid for r in sortable.get(Roi).sort_by_hierarchy()]
+                == [r.uuid for r in spelled])
+
+    def test_groups_by_parent_then_orders_within(self, sortable):
+        rois = sortable.get(Roi).sort_by_hierarchy()
+
+        layers = [roi.parent.id for roi in rois]
+        assert layers == ['plane0'] * 12 + ['plane1'] * 12
+        # And naturally within each, since natural is the default
+        assert [roi.id for roi in rois][:3] == ['Roi_0', 'Roi_1', 'Roi_2']
+
+    def test_a_root_type_sorts_by_its_own_id(self, sortable):
+        animals = sortable.get(Animal).sort_by_hierarchy()
+        assert animals.sort_keys == ['id']
+
+    def test_an_intermediate_type(self, sortable):
+        layers = sortable.get(Layer).sort_by_hierarchy()
+        assert layers.sort_keys == ['[Animal]id', '[Recording]id', 'id']
+        assert [layer.id for layer in layers] == ['plane0', 'plane1']
+
+    def test_byte_order_can_be_asked_for(self, sortable):
+        rois = sortable.get(Roi).sort_by_hierarchy(natural=False)
+        assert [r.id for r in rois][:3] == ['Roi_0', 'Roi_1', 'Roi_10']
+
+
+class TestOrderIsVisible:
+
+    def test_an_unsorted_collection_says_uuid(self, sortable):
+        rois = sortable.get(Roi)
+        assert rois.order == 'uuid'
+        assert "order='uuid'" in repr(rois)
+
+    def test_a_sorted_collection_names_its_keys(self, sortable):
+        rois = sortable.get(Roi).sort('[Layer]depth', '-index')
+        assert rois.order == '[Layer]depth, -index'
+        assert "order='[Layer]depth, -index'" in repr(rois)
+
+    def test_the_html_repr_says_the_order(self, sortable):
+        assert 'ordered by' in sortable.get(Roi)._repr_html_()
+        assert '<code>uuid</code>' in sortable.get(Roi)._repr_html_()
+        assert '<code>-index</code>' in sortable.get(Roi).sort('-index')._repr_html_()
+
+    def test_the_html_repr_escapes_the_order(self, sortable):
+        """Keys carry user-chosen attribute names straight into the page."""
+        html_out = sortable.get(Roi).sort('[Layer]depth')._repr_html_()
+        assert '[Layer]depth' in html_out
 
 
 class TestTies:

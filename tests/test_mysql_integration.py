@@ -780,8 +780,8 @@ class TestSortingAgreesAcrossBackends:
     def test_text_key_orders_the_same(self, ent, sqlite_twin):
         self._fill(ent)
 
-        mysql_order = self._order(ent, 'label')
-        sqlite_order = self._order(sqlite_twin, 'label')
+        mysql_order = self._order(ent, 'label', natural=False)
+        sqlite_order = self._order(sqlite_twin, 'label', natural=False)
 
         assert mysql_order == sqlite_order
         # And it is byte order, which is what Python and SQLite both give
@@ -789,13 +789,15 @@ class TestSortingAgreesAcrossBackends:
 
     def test_a_case_insensitive_collation_does_not_leak_in(self, ent, sqlite_twin):
         """The specific disagreement: ai_ci sorts abc before ABC and puts Zeta
-        among the lowercase words. Byte order does neither."""
+        among the lowercase words. Byte order does neither, and neither does
+        natural order, which only changes how digit runs compare."""
         self._fill(ent)
 
-        order = self._order(ent, 'label')
+        for natural in (True, False):
+            order = self._order(ent, 'label', natural=natural)
 
-        assert order.index('ABC') < order.index('abc')
-        assert order.index('Zeta') < order.index('alpha')
+            assert order.index('ABC') < order.index('abc')
+            assert order.index('Zeta') < order.index('alpha')
 
     def test_natural_order_agrees(self, ent, sqlite_twin):
         self._fill(ent)
