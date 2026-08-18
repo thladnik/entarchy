@@ -671,6 +671,11 @@ def _chunk_by_bound_parameters(records: list[dict], columns: int):
         yield records[start:start + rows_per_statement]
 
 
+# The stored types a minimum, a maximum and a distinct count mean something
+#  for. A blob has none of the three, and asking would mean decoding it.
+_DISTRIBUTION_TYPES = ('str', 'int', 'float', 'bool', 'date', 'datetime')
+
+
 def _uuids_of(entity_query: sqlalchemy.orm.Query):
     """A subquery selecting a collection's entity uuids, for use with IN.
 
@@ -1967,6 +1972,154 @@ class SQLBackend(Backend):
                     .order_by(EntityTypeTable.name).all())
 
         return {name: int(count) for name, count in rows}
+
+
+    @_retry_on_operational_failure
+    def get_collection_attribute_distribution(
+            self, _collection: Collection,
+            data_types: list[str] = None) -> dict[tuple[str, str], dict[str, Any]]:
+        """The range and the spread of the scalar attributes of a collection.
+
+        One entry per (name, data_type) carrying `min`, `max` and `distinct`,
+        and for floats also `nan`, `plus_inf` and `minus_inf`. Keyed by name
+        *and* type because a name written as `int` on some entities and `float`
+        on others has a range in each, and merging them here would hide the
+        thing worth seeing.
+
+        NaN and infinity are stored as a flag with a null value column, some
+        dialects rejecting them outright - so MIN, MAX and DISTINCT pass over
+        them, and a range that let it go at that would silently be a range over
+        the finite values alone. They are counted here so the caller can say so.
+
+        Args:
+            data_types: which stored types to ask about, defaulting to every
+                scalar type. That costs one query each and the entity subquery
+                is the expensive part of every one of them, so a caller that
+                already knows which types the collection uses should say.
+        """
+        wanted = [t for t in (data_types if data_types is not None
+                              else _DISTRIBUTION_TYPES)
+                  if t in _DISTRIBUTION_TYPES]
+
+        distribution: dict[tuple[str, str], dict[str, Any]] = {}
+        if len(wanted) == 0:
+            return distribution
+
+        with self.sql_session as session:
+            entity_query = _build_query_from_collection(_collection, session)
+            uuids = _uuids_of(entity_query)
+
+            for data_type in wanted:
+                column = getattr(AttributeTable, f'value_{data_type}')
+                selected = [AttributeTable.name,
+                            sqlalchemy.func.min(column),
+                            sqlalchemy.func.max(column),
+                            sqlalchemy.func.count(sqlalchemy.distinct(column))]
+
+                if data_type == 'float':
+                    # The sign of an infinity lives in the otherwise unused
+                    #  value_int column, which is what tells the two ends apart
+                    selected += [
+                        sqlalchemy.func.sum(sqlalchemy.case(
+                            (AttributeTable.float_is_nan, 1), else_=0)),
+                        sqlalchemy.func.sum(sqlalchemy.case(
+                            (sqlalchemy.and_(AttributeTable.float_is_inf,
+                                             AttributeTable.value_int > 0), 1), else_=0)),
+                        sqlalchemy.func.sum(sqlalchemy.case(
+                            (sqlalchemy.and_(AttributeTable.float_is_inf,
+                                             AttributeTable.value_int < 0), 1), else_=0)),
+                    ]
+
+                rows = (session.query(*selected)
+                        .filter(AttributeTable.entity_uuid.in_(uuids),
+                                AttributeTable.data_type == data_type)
+                        .group_by(AttributeTable.name)
+                        .order_by(AttributeTable.name).all())
+
+                for row in rows:
+                    entry = {'min': row[1], 'max': row[2],
+                             'distinct': int(row[3] or 0),
+                             'nan': 0, 'plus_inf': 0, 'minus_inf': 0}
+                    if data_type == 'float':
+                        entry['nan'] = int(row[4] or 0)
+                        entry['plus_inf'] = int(row[5] or 0)
+                        entry['minus_inf'] = int(row[6] or 0)
+
+                    distribution[(row[0], data_type)] = entry
+
+        return distribution
+
+    @_retry_on_operational_failure
+    def count_entities_by_type(self) -> dict[str, int]:
+        """How many entities of each type the whole entarchy holds.
+
+        A type that has been declared but never used is absent rather than
+        zero: this counts what is there, and the hierarchy is what says what
+        could be.
+        """
+        with self.sql_session as session:
+            rows = (session.query(EntityTypeTable.name, sqlalchemy.func.count())
+                    .select_from(EntityTable)
+                    .join(EntityTypeTable, EntityTable.entity_type_pk == EntityTypeTable.pk)
+                    .group_by(EntityTypeTable.name)
+                    .order_by(EntityTypeTable.name).all())
+
+        return {name: int(count) for name, count in rows}
+
+    @_retry_on_operational_failure
+    def get_link_type_totals(self) -> dict[str, dict[str, int]]:
+        """How many links of each kind there are, and what they cost.
+
+        `{kind: {'links': n, 'bytes': b}}`. An outer join, so a kind whose links
+        carry no attributes still reports its count rather than dropping out;
+        the link count is over distinct carriers because the join multiplies a
+        link by its attributes.
+
+        Kinds that are registered but unused are absent - `get_link_types()` is
+        the registry, this is the census.
+        """
+        with self.sql_session as session:
+            rows = (session.query(
+                        Link.link_type,
+                        sqlalchemy.func.count(sqlalchemy.distinct(Link.link_uuid)),
+                        sqlalchemy.func.sum(AttributeTable.data_size))
+                    .outerjoin(AttributeTable,
+                               AttributeTable.entity_uuid == Link.link_uuid)
+                    .group_by(Link.link_type)
+                    .order_by(Link.link_type).all())
+
+        return {link_type: {'links': int(count), 'bytes': int(total or 0)}
+                for link_type, count, total in rows}
+
+    @_retry_on_operational_failure
+    def get_attribute_storage(self) -> list[tuple[str, str, str, int, int]]:
+        """(entity_type, name, data_type, entity_count, total_bytes), entarchy-wide.
+
+        Where the bytes actually are. Grouped rather than summed, so the same
+        answer serves both "what does a Recording cost" and "which attribute is
+        the largest thing in here" without having to ask twice.
+
+        This is the one query in the describe family that scans the whole
+        attributes table rather than riding an index, there being no way to
+        total what has not been looked at. It groups down to a row per
+        attribute name per entity type, so what comes back stays small however
+        large the scan.
+        """
+        with self.sql_session as session:
+            rows = (session.query(EntityTypeTable.name, AttributeTable.name,
+                                  AttributeTable.data_type,
+                                  sqlalchemy.func.count(),
+                                  sqlalchemy.func.sum(AttributeTable.data_size))
+                    .select_from(AttributeTable)
+                    .join(EntityTable, EntityTable.uuid == AttributeTable.entity_uuid)
+                    .join(EntityTypeTable,
+                          EntityTable.entity_type_pk == EntityTypeTable.pk)
+                    .group_by(EntityTypeTable.name, AttributeTable.name,
+                              AttributeTable.data_type)
+                    .order_by(EntityTypeTable.name, AttributeTable.name).all())
+
+        return [(type_name, name, data_type, int(count), int(total or 0))
+                for type_name, name, data_type, count, total in rows]
 
     @_retry_on_operational_failure
     def get_collection_attributes(self, _collection: Collection, names: list[str]) -> pd.DataFrame:

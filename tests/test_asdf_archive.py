@@ -248,6 +248,67 @@ class TestSortedReads:
             ent.get(Roi).sort('dff')
 
 
+
+class TestDescriptionsMatchTheSource:
+    """An archive is meant to answer the same questions as what it came from,
+    and the two describes are exactly those questions asked of the whole thing.
+
+    The source fixture already holds a NaN and both infinities, which are the
+    values a range is most likely to get wrong: they are stored as a flag with
+    a null value column and survive the export as flags too.
+    """
+
+    def _named(self, frame, key, name):
+        match = frame[frame[key] == name]
+        assert len(match) == 1, f'{name} not in {list(frame[key])}'
+        return match.iloc[0]
+
+    def test_the_entity_census_matches(self, source, archived):
+        ent, _ = archived
+        assert (ent.backend.count_entities_by_type()
+                == source.backend.count_entities_by_type())
+
+    def test_the_link_totals_match(self, source, archived):
+        ent, _ = archived
+        assert (ent.backend.get_link_type_totals()
+                == source.backend.get_link_type_totals())
+
+    def test_the_stored_sizes_match(self, source, archived):
+        """An archive re-encodes every blob into ASDF, so this is a real claim
+        rather than a tautology: the index carries the size the value had."""
+        ent, _ = archived
+        assert ent.backend.get_attribute_storage() == source.backend.get_attribute_storage()
+
+    def test_the_headline_matches_except_for_where_it_is(self, source, archived):
+        ent, _ = archived
+        here, there = ent.describe().headline, source.describe().headline
+
+        assert here['entities'] == there['entities']
+        assert here['links'] == there['links']
+        assert here['stored'] == there['stored']
+        assert here['backend'] == 'ArchiveBackend'
+
+    def test_a_distribution_matches(self, source, archived):
+        ent, _ = archived
+        assert (ent.get(Roi).describe(distribution=True).attributes.to_dict()
+                == source.get(Roi).describe(distribution=True).attributes.to_dict())
+
+    def test_the_special_floats_survive_into_the_range(self, source, archived):
+        """One ROI carries NaN, +inf and -inf, each on its own attribute."""
+        ent, _ = archived
+        frame = ent.get(Roi).describe(distribution=True).attributes
+
+        assert self._named(frame, 'name', 'big_float')['max'] == float('inf')
+        assert self._named(frame, 'name', 'small_float')['min'] == float('-inf')
+        assert self._named(frame, 'name', 'odd_float')['distinct'] == 1
+        assert self._named(frame, 'name', 'odd_float')['min'] == ''
+
+    def test_nan_is_still_called_out(self, archived):
+        ent, _ = archived
+        description = ent.get(Roi).describe(distribution=True)
+
+        assert any('odd_float' in note for note in description.notes)
+
 class TestValueFidelity:
 
     def test_scalars(self, source, archived):

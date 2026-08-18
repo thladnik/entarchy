@@ -833,3 +833,133 @@ class TestSortingAgreesAcrossBackends:
 
         assert (self._order(ent, '-label', missing='first')
                 == self._order(sqlite_twin, '-label', missing='first'))
+
+
+class TestDescribeAgreesAcrossBackends:
+    """A description is computed by the database rather than in Python, so it
+    inherits whatever the server does - which for text means the collation.
+
+    These build the same entities in both and say which parts have to agree.
+    """
+
+    # 'abc' and 'ABC' are one value under a case-insensitive collation and two
+    #  under a binary one, which is the whole divergence in one pair
+    LABELS = ['abc', 'ABC', 'Zeta', 'alpha']
+    SCORES = [1.5, 2.5, float('nan'), float('inf')]
+
+    def _fill(self, entarchy):
+        with entarchy:
+            subject = Subject(entarchy, _id='subject_a', _parent=entarchy.root)
+            entarchy.add_new_entity(subject)
+
+            for index, label in enumerate(self.LABELS):
+                session = Session(entarchy, _id=f'sess_{index}', _parent=subject)
+                entarchy.add_new_entity(session)
+                session['index'] = index
+                session['label'] = label
+                session['score'] = self.SCORES[index]
+                session['good'] = (index % 2 == 0)
+
+        return entarchy
+
+    @pytest.fixture()
+    def sqlite_twin(self, tmp_path):
+        from entarchy.backend import SQLiteBackend
+
+        path = (tmp_path / 'twin').as_posix()
+        twin = LabArchy.create(path, SQLiteBackend(path, dbname='twin.db'))
+        yield self._fill(twin)
+        twin.backend.close()
+
+    def _row(self, entarchy, name):
+        description = entarchy.get(Session).describe(distribution=True)
+        frame = description.attributes
+        match = frame[frame['name'] == name]
+
+        # describe() turns a backend failure into a note and carries on, so a
+        #  missing row can mean the query never ran. Say so rather than leaving
+        #  a bare list to be puzzled over
+        assert len(match) == 1, (f'{name} not in {list(frame["name"])}; '
+                                 f'notes: {description.notes}')
+
+        return match.iloc[0]
+
+    def test_an_integer_range_agrees(self, ent, sqlite_twin):
+        self._fill(ent)
+        here, there = self._row(ent, 'index'), self._row(sqlite_twin, 'index')
+
+        assert (here['min'], here['max'], here['distinct']) == (0, 3, 4)
+        assert (here['min'], here['max']) == (there['min'], there['max'])
+        assert here['distinct'] == there['distinct']
+
+    def test_a_boolean_range_agrees(self, ent, sqlite_twin):
+        self._fill(ent)
+        assert self._row(ent, 'good')['distinct'] == self._row(sqlite_twin, 'good')['distinct']
+
+    def test_nan_and_infinity_agree(self, ent, sqlite_twin):
+        """Neither server stores them as numbers - both keep the flag columns
+        entarchy writes instead - so the counting has to come out the same."""
+        self._fill(ent)
+        here, there = self._row(ent, 'score'), self._row(sqlite_twin, 'score')
+
+        assert here['min'] == there['min'] == 1.5
+        assert here['max'] == there['max'] == float('inf')
+        # 1.5, 2.5, the NaN and the infinity
+        assert here['distinct'] == there['distinct'] == 4
+
+    def test_the_nan_note_is_raised_on_both(self, ent, sqlite_twin):
+        self._fill(ent)
+
+        for entarchy in (ent, sqlite_twin):
+            notes = entarchy.get(Session).describe(distribution=True).notes
+            assert any('NaN' in note and 'score' in note for note in notes)
+
+    def test_a_text_range_is_the_servers_own(self, ent, sqlite_twin):
+        """MySQL 8 defaults to utf8mb4_0900_ai_ci and SQLite compares bytes, so
+        'abc' and 'ABC' are one value on one and two on the other. Nothing here
+        reads text values into Python, which is what a range that agreed
+        everywhere would cost, so the two are allowed to differ - and this
+        pins that they differ in the way the collations say rather than in
+        some other way."""
+        self._fill(ent)
+
+        assert self._row(sqlite_twin, 'label')['distinct'] == 4
+        assert self._row(ent, 'label')['distinct'] == 3
+
+        # Byte order puts every capital first; the case-insensitive collation
+        #  interleaves them and 'abc' sorts below 'alpha'
+        assert self._row(sqlite_twin, 'label')['min'] == 'ABC'
+        # Which of the two MySQL returns for MIN is arbitrary - under its
+        #  collation they are the same value - so only the case is not asserted
+        assert self._row(ent, 'label')['min'].lower() == 'abc'
+
+    def test_the_entity_census_agrees(self, ent, sqlite_twin):
+        self._fill(ent)
+        assert (ent.backend.count_entities_by_type()
+                == sqlite_twin.backend.count_entities_by_type())
+
+    def test_the_stored_sizes_agree(self, ent, sqlite_twin):
+        self._fill(ent)
+        assert (ent.backend.get_attribute_storage()
+                == sqlite_twin.backend.get_attribute_storage())
+
+    def test_the_entarchy_description_agrees(self, ent, sqlite_twin):
+        self._fill(ent)
+        here, there = ent.describe().headline, sqlite_twin.describe().headline
+
+        assert here['entities'] == there['entities']
+        assert here['links'] == there['links']
+        assert here['stored'] == there['stored']
+
+    def test_link_totals_agree(self, ent, sqlite_twin):
+        self._fill(ent)
+
+        for entarchy in (ent, sqlite_twin):
+            entarchy.define_link_type('follows', linker='Session',
+                                      linked='Session', symmetric=False)
+            sessions = sorted(entarchy.get(Session), key=lambda s: s['index'])
+            with entarchy:
+                entarchy.link(sessions[0], sessions[1], 'follows', gap=1.0)
+
+        assert (ent.backend.get_link_type_totals()
+                == sqlite_twin.backend.get_link_type_totals())

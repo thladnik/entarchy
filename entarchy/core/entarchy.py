@@ -13,6 +13,7 @@ import alive_progress
 import yaml
 
 from . import console
+from . import describe
 from . import links
 from . import query
 from .entity import (AnalysisEntity, Collection, EntarchyEntity, Entity, LinkCollection,
@@ -474,6 +475,92 @@ class Entarchy(object):
         rmdir(path, 0)
 
         print(f'\nSuccessfully deleted analysis {path}')
+
+    def describe(self, largest: int = describe.STORAGE_ROWS) -> describe.Description:
+        """What is in this entarchy at all.
+
+            ent.describe()                  # renders whole
+            ent.describe().entities         # a DataFrame
+
+        The question a stranger to an entarchy asks first, and the one nothing
+        else here answers: which entity types are in it and how many of each,
+        which link kinds join them, and where the bytes have gone. Every other
+        `describe()` needs you to know what to ask about before you can ask.
+
+        The counts ride indexes. Totalling bytes cannot - there is no adding up
+        what has not been looked at - so the storage section scans the
+        attributes table once, grouped down to a row per attribute name per
+        entity type. That is the cost of the whole call; it does not grow with
+        how much data those attributes hold, only with how many rows there are.
+
+        A value is counted where it actually is, so a media file weighs what
+        it weighs on disk rather than what its pointer row weighs. `stored` is
+        therefore the size of the entarchy rather than the size of its
+        database.
+
+        Args:
+            largest: how many rows of the storage section to show, largest
+                first. None for all of them.
+
+        Returns:
+            Description: sections that are DataFrames, rendering together.
+        """
+        notes = []
+
+        try:
+            counts = self.backend.count_entities_by_type()
+        except Exception as exc:
+            counts = {}
+            notes.append(f'entity counts could not be read: {exc}')
+
+        try:
+            link_totals = self.backend.get_link_type_totals()
+        except Exception as exc:
+            link_totals = {}
+            notes.append(f'link counts could not be read: {exc}')
+
+        try:
+            specs = self.link_types()
+        except Exception as exc:
+            specs = []
+            notes.append(f'link kinds could not be read: {exc}')
+
+        try:
+            storage = self.backend.get_attribute_storage()
+        except Exception as exc:
+            storage = []
+            notes.append(f'stored sizes could not be read: {exc}')
+
+        sizes = {}
+        for type_name, _, _, _, total in storage:
+            sizes[type_name] = sizes.get(type_name, 0) + total
+
+        storage_frame, cut = describe.storage_rows(storage, limit=largest)
+        if cut > 0:
+            notes.append(f'{cut} smaller attribute(s) not shown. '
+                         f'Pass largest= for more, or None for all of them.')
+
+        # The entity count leaves out link carriers and the link count picks
+        #  them up, so that the two sections below between them account for
+        #  every byte in `stored` exactly once
+        headline = {
+            'path': self.path,
+            'backend': type(self.backend).__name__,
+            'entities': sum(count for name, count in counts.items()
+                            if name != describe.LINK_ENTITY_TYPE),
+            'links': sum(total['links'] for total in link_totals.values()),
+            'stored': describe.human_bytes(sum(sizes.values())),
+        }
+
+        sections = {
+            'entities': describe.entity_type_rows(counts, sizes, self.hierarchy),
+            'links': describe.link_type_rows(specs, link_totals),
+            'storage': storage_frame,
+        }
+
+        return describe.Description(
+            subject=os.path.basename(str(self.path).rstrip('/\\')) or str(self.path),
+            headline=headline, sections=sections, notes=notes)
 
     def get(self, entity_type: Type[Entity] | str, *_string_expressions: str, **_equalities) -> Collection:
         """Get a collection of entities of a given type.

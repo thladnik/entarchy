@@ -116,6 +116,47 @@ resolved in this order:
 2. the `ENTARCHY_DB_PASSWORD` environment variable,
 3. an interactive prompt.
 
+### Seeing what is there
+
+`describe()` answers "what is in this" at three levels, and none of them reads a
+value it does not have to:
+
+```python
+ent.describe()                       # the whole entarchy
+recording.describe()                 # one entity
+ent.get(Roi).describe()              # a collection
+```
+
+Each returns a `Description`, which renders whole in a terminal and as tables in
+a notebook, and whose sections are DataFrames:
+
+```python
+ent.describe().entities              # types, counts, bytes
+ent.describe().storage               # the largest attributes, largest first
+roi.describe().links                 # kind, count, what each carries
+ent.get(Roi).describe().attributes   # names, types, coverage, bytes
+```
+
+A collection's attributes section carries the column a single entity cannot:
+how many members actually have each name. Attributes are per entity rather than
+per type, so `ants/x` on 33,468 of 42,521 ROIs is a fact about the data worth
+meeting without going looking for it.
+
+`Entarchy.describe()` is the one to reach for first in an unfamiliar entarchy.
+It is also the only one that scans rather than seeking: bytes cannot be totalled
+without looking at every attribute row. On a 13.1 GB entarchy with 1.5 million
+of them that is about 9 s, and it does not grow with how much data those rows
+hold. Everything else costs a handful of indexed queries however large the
+entity.
+
+Add `distribution=True` to a collection to get the lowest and highest value each
+scalar attribute holds and how many different ones there are. It is off by
+default because it is a query per stored type, and because for text it takes the
+database's collation — SQLite compares bytes where MySQL 8 defaults to
+case-insensitive, so `['abc', 'ABC']` counts as two values on one and one on the
+other. Numbers, booleans and times agree everywhere. NaN counts as a value and
+stays out of the range; infinity is an end of it.
+
 ### How values are stored
 
 Scalars — `str`, `int`, `float`, `bool`, `date`, `datetime` — go into a typed
@@ -249,8 +290,10 @@ Runnable examples live in [`examples/`](examples):
 
 Collections and entities render as tables in a notebook. Both representations are
 deliberately cheap: they show identity and attribute *names* without loading
-values, since a single entity can hold hundreds of megabytes of arrays. Use
+values, since a single entity can hold hundreds of megabytes of arrays.
+`describe()` gives the fuller picture at the same price; use
 `collection.preview()` or `collection.dataframe_of([...])` to read values.
+`preview()` leaves blobs out unless asked for, and says which it left.
 
 An entity that has links also lists its link kinds and how many of each, counted
 in the database rather than by loading them. The line is left out entirely when

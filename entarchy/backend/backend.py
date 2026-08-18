@@ -133,6 +133,28 @@ class Backend(object):
         """How many children an entity has, by entity type name."""
         raise NotImplementedError('')
 
+    def count_collection_child_entities(self, _collection: Collection) -> dict[str, int]:
+        """How many children the entities of a collection have, by type name."""
+        raise NotImplementedError('')
+
+    def get_collection_attribute_distribution(
+            self, _collection: Collection,
+            data_types: list[str] = None) -> dict[tuple[str, str], dict[str, Any]]:
+        """min, max, distinct and the special float counts per (name, type)."""
+        raise NotImplementedError('')
+
+    def count_entities_by_type(self) -> dict[str, int]:
+        """How many entities of each type the whole entarchy holds."""
+        raise NotImplementedError('')
+
+    def get_link_type_totals(self) -> dict[str, dict[str, int]]:
+        """Per link kind, how many links there are and what they cost in bytes."""
+        raise NotImplementedError('')
+
+    def get_attribute_storage(self) -> list[tuple[str, str, str, int, int]]:
+        """(entity_type, name, data_type, entity_count, total_bytes), entarchy-wide."""
+        raise NotImplementedError('')
+
     # Collection related methods
 
     def get_collection_count(self, _collection: Collection) -> int:

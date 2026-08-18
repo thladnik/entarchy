@@ -340,7 +340,7 @@ class Entity(object):
         # A link's carrier entity is parented to its linker, which keeps the
         #  entity tree valid - but they are links, they have their own section,
         #  and counting them here would tell a ROI it has 20 000 children
-        children.pop('LinkEntity', None)
+        children.pop(describe_mod.LINK_ENTITY_TYPE, None)
 
         headline = {'type': type(self).__name__, 'id': self.id, 'uuid': self.uuid}
         try:
@@ -1148,7 +1148,8 @@ class Collection(object):
             # A repr must never break a notebook session
             return _fallback_html(self)
 
-    def describe(self, links: bool = True) -> 'describe_mod.Description':
+    def describe(self, links: bool = True,
+                 distribution: bool = False) -> 'describe_mod.Description':
         """What this collection holds, asked of the set rather than of one entity.
 
             rois.describe()                 # renders whole
@@ -1162,6 +1163,11 @@ class Collection(object):
         Args:
             links: count the link kinds touching this collection. One query, but
                 over every member, so it can be turned off for a large one.
+            distribution: also report the lowest and highest value each scalar
+                attribute holds and how many different ones there are. Off by
+                default because it is a query per stored type on top of the one
+                the section already costs, and because a range is a question
+                about the data rather than about what is in there.
 
         Returns:
             Description: sections that are DataFrames, rendering together.
@@ -1177,6 +1183,27 @@ class Collection(object):
         except Exception as exc:
             metadata = []
             notes.append(f'attributes could not be read: {exc}')
+
+        ranges = None
+        if distribution and len(metadata) > 0:
+            # Only the types this collection actually stores. Each is its own
+            #  query and the entity subquery is the expensive part of every one
+            present = sorted({data_type for _, data_type, _, _ in metadata
+                              if data_type in describe_mod.SCALAR_TYPES})
+            try:
+                ranges = backend.get_collection_attribute_distribution(
+                    self, data_types=present)
+            except Exception as exc:
+                notes.append(f'ranges could not be read: {exc}')
+
+        if ranges:
+            with_nan = sorted({name for (name, _), entry in ranges.items()
+                               if entry['nan']})
+            if len(with_nan) > 0:
+                notes.append(
+                    f'NaN is stored on {", ".join(with_nan)}. It counts as one '
+                    f'more distinct value and is left out of the range, having '
+                    f'no place in an ordering.')
 
         link_counts = {}
         if links and count > 0:
@@ -1194,10 +1221,11 @@ class Collection(object):
 
             # Link carriers are parented to their linker; they are links, and
             #  the links section is where they belong
-            children.pop('LinkEntity', None)
+            children.pop(describe_mod.LINK_ENTITY_TYPE, None)
 
         sections = {
-            'attributes': describe_mod.collection_attribute_rows(metadata, count),
+            'attributes': describe_mod.collection_attribute_rows(
+                metadata, count, distribution=ranges),
             'links': describe_mod.link_rows(link_counts),
             'children': describe_mod.count_rows(children, 'type', 'count'),
         }
