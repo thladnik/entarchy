@@ -9,7 +9,8 @@ import sys
 import time
 import traceback
 import uuid
-from typing import Any, Generator, Type, Union, TYPE_CHECKING, Callable
+from typing import (Any, Callable, Generator, Generic, Type, TypeVar,
+                    TYPE_CHECKING, Union, overload)
 
 import alive_progress
 import numpy as np
@@ -21,6 +22,13 @@ from .links import LinkTypeError
 
 if TYPE_CHECKING:
     from .entarchy import Entarchy
+
+# What sort of entity a collection holds. Bound to Entity so a collection
+#  can only ever be of entities, and carried through get(), indexing and
+#  iteration so that ent.get(Roi)[0] is a Roi to a type checker rather
+#  than the base class - which is what makes a schema's own properties and
+#  methods complete in an editor.
+EntityT = TypeVar('EntityT', bound='Entity')
 
 
 class Entity(object):
@@ -36,10 +44,10 @@ class Entity(object):
 
     def __init__(self,
                  _entarchy: Entarchy,
-                 _uuid: str = None,
-                 _id: str = None,
-                 _parent: Entity = None,
-                 _init_cache: dict[str, Any] = None):
+                 _uuid: str | None = None,
+                 _id: str | None = None,
+                 _parent: Entity | None = None,
+                 _init_cache: dict[str, Any] | None = None):
 
         # __new__ may have returned an already-registered instance (identity map).
         #  In that case, __init__ runs again on that instance and must NOT reset its
@@ -81,7 +89,22 @@ class Entity(object):
 
         self._entity_initialized = True
 
+    @overload
+    def __new__(cls: Type[EntityT], _expression: str, /,
+                *args, **kwargs) -> DeferredEntityCollection[EntityT]: ...
+
+    @overload
+    def __new__(cls: Type[EntityT], _entarchy: Entarchy = ...,
+                _uuid: str | None = ..., _id: str | None = ...,
+                _parent: Entity | None = ...,
+                _init_cache: dict[str, Any] | None = ...) -> EntityT: ...
+
     def __new__(cls, *args, **kwargs):
+        # Two constructions wearing one name. Given a string this builds a
+        #  deferred collection rather than an entity - Roi('index > 3') - and
+        #  Python then skips __init__ because what came back is not a Roi. The
+        #  overloads say so; without them a type checker reads the expression
+        #  form as a Roi and refuses every method the collection has.
 
         # _entarchy = args[0] if len(args) > 0 else kwargs.get('_entarchy', None)
         arg0 = args[0] if len(args) > 0 else None
@@ -639,6 +662,26 @@ class Entity(object):
         """
         return self.entarchy.backend.get_entity_attribute_names(self)
 
+    def _ipython_key_completions_(self) -> list[str]:
+        """The stored names, for tab completion inside the brackets.
+
+        IPython asks an object for this when the cursor is inside a subscript.
+        Nothing here defined it, so there was nothing entarchy-specific to
+        offer and the completer fell back to the global namespace: tabbing
+        inside an entity's brackets suggested 335 builtins and magics and not
+        one of the names actually stored.
+
+        They cannot be reached any other way. `s2p/npix` is a row in the
+        attributes table rather than a Python attribute, so `dir()` cannot see
+        it and no static tool can know it - but one indexed query can.
+        """
+        try:
+            return self.keys()
+        except Exception:
+            # This runs on a keystroke. An entity whose backend has gone away
+            #  should still be typeable, so a completer must never raise
+            return []
+
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary of all dynamic attributes for this entity.
         """
@@ -723,20 +766,20 @@ class LinkEntity(Entity):
                 f'{row["linked_uuid"][:8]})')
 
 
-class Collection(object):
+class Collection(Generic[EntityT]):
     """Base class for collection of entities
     """
 
     # TODO: implement .apply method along column axis similar to pandas DataFrame.apply() ?
 
-    _as_tree: dict[str, ...]
+    _as_tree: dict[str, Any]
     _length: int = None
     _name = None
 
     def __init__(self,
                  _entarchy: Entarchy,
-                 _entity_type: Type[Entity],
-                 _as_tree: dict[str, ...]):
+                 _entity_type: Type[EntityT],
+                 _as_tree: dict[str, Any]):
         self._entity_type = _entity_type
         self._entarchy = _entarchy
         self._as_tree = _as_tree
@@ -756,7 +799,7 @@ class Collection(object):
         #  dataframe_of, which asks for the order. Set while that is in flight.
         self._sort_resolving: bool = False
 
-    def _derive(self, _as_tree) -> 'Collection':
+    def _derive(self, _as_tree) -> Collection[EntityT]:
         """A collection like this one, with a different filter tree.
 
         Set operations and where() build new collections, and a subclass that
@@ -767,7 +810,7 @@ class Collection(object):
         return collection_type(self.entarchy, self.entity_type, _as_tree)
 
     def sort(self, *keys: str, natural: bool = True,
-             missing: str = 'last') -> 'Collection':
+             missing: str = 'last') -> Collection[EntityT]:
         """A collection like this one, read in the order of the given keys.
 
             rois.sort('index')                      # ascending
@@ -841,7 +884,7 @@ class Collection(object):
         return sorted_collection
 
     def sort_by_hierarchy(self, natural: bool = True,
-                          missing: str = 'last') -> 'Collection':
+                          missing: str = 'last') -> Collection[EntityT]:
         """A collection read down the tree: each ancestor's id, then its own.
 
             rois.sort_by_hierarchy()
@@ -906,7 +949,7 @@ class Collection(object):
                 f'encoded container rather than a value with an order. Sort by '
                 f'something derived from it instead.')
 
-    def _ordered_rows(self) -> list[tuple[str, str]]:
+    def _ordered_rows(self) -> list[tuple[str, str]] | None:
         """The (uuid, id) rows of this collection in its sort order, or None.
 
         None means unsorted, which every caller reads as "ask the backend".
@@ -1292,7 +1335,23 @@ class Collection(object):
 
     # Access methods
 
+    @overload
+    def __getitem__(self, item: int | np.integer) -> EntityT: ...
+
+    @overload
+    def __getitem__(self, item: slice) -> list[EntityT]: ...
+
+    @overload
+    def __getitem__(self, item: str) -> pd.Series: ...
+
+    @overload
+    def __getitem__(self, item: list[str]) -> pd.DataFrame: ...
+
     def __getitem__(self, item):
+        # An index gives one entity and a slice a list of them; a name or a
+        #  list of names gives values instead, as a Series or as a frame. The
+        #  overloads above are how a reader of the signature - or an editor -
+        #  gets told which of the four they asked for
 
         # Return single entity
         if isinstance(item, (int, np.integer)):
@@ -1335,7 +1394,7 @@ class Collection(object):
 
         raise KeyError(f'Invalid key {item}')
 
-    def __iter__(self):
+    def __iter__(self) -> CollectionIterator[EntityT]:
         return CollectionIterator(self)
 
     def __setitem__(self, key, value):
@@ -1359,7 +1418,7 @@ class Collection(object):
 
     # Set operations
 
-    def __or__(self, other: Collection | str):
+    def __or__(self, other: Collection | str) -> Collection[EntityT]:
         """Create a new collection that is the union between this collection and another.
 
         Args:
@@ -1389,7 +1448,7 @@ class Collection(object):
         new_tree = query.combine_trees('UNION', self.as_tree, other.as_tree)
         return self._derive(new_tree)
 
-    def __and__(self, other: Collection | str):
+    def __and__(self, other: Collection | str) -> Collection[EntityT]:
         """Create a new collection that is the intersection between this collection and another.
 
         Args:
@@ -1419,7 +1478,7 @@ class Collection(object):
         new_tree = query.combine_trees('INTERSECTION', self.as_tree, other.as_tree)
         return self._derive(new_tree)
 
-    def __invert__(self):
+    def __invert__(self) -> Collection[EntityT]:
         """Create a new collection that is the complement of this collection.
 
         Example:
@@ -1435,7 +1494,7 @@ class Collection(object):
         new_tree = query.combine_trees('COMPLEMENT', self.as_tree)
         return self._derive(new_tree)
 
-    def __sub__(self, other: Collection | str):
+    def __sub__(self, other: Collection | str) -> Collection[EntityT]:
         """Create a new collection that is the difference between this collection and another.
 
         Args:
@@ -1464,7 +1523,7 @@ class Collection(object):
         new_tree = query.combine_trees('DIFFERENCE', self.as_tree, other.as_tree)
         return self._derive(new_tree)
 
-    def __xor__(self, other: Collection | str):
+    def __xor__(self, other: Collection | str) -> Collection[EntityT]:
         """Create a new collection that is the symmetric difference between this collection and another.
 
         Args:
@@ -1496,7 +1555,7 @@ class Collection(object):
     # Properties
 
     @property
-    def as_tree(self) -> dict[str, ...]:
+    def as_tree(self) -> dict[str, Any]:
         """Return the abstract syntax tree dictionary
         """
         return self._as_tree.copy()
@@ -1510,7 +1569,7 @@ class Collection(object):
         return self._entarchy
 
     @property
-    def entity_type(self):
+    def entity_type(self) -> Type[EntityT]:
         return self._entity_type
 
     @property
@@ -1672,7 +1731,7 @@ class Collection(object):
 
         return df.reindex([_uuid for _uuid, _ in ordered])
 
-    def get_entity(self, _uuid: str, _id: str) -> Entity:
+    def get_entity(self, _uuid: str, _id: str) -> EntityT:
 
         _init_cache = None
         if _uuid in self._cache.index:
@@ -1682,6 +1741,26 @@ class Collection(object):
 
     def keys(self) -> list[str]:
         return self.columns
+
+    def _ipython_key_completions_(self) -> list[str]:
+        """The stored names, for tab completion inside the brackets.
+
+        IPython asks an object for this when the cursor is inside a subscript.
+        Nothing here defined it, so there was nothing entarchy-specific to
+        offer and the completer fell back to the global namespace: tabbing
+        inside an entity's brackets suggested 335 builtins and magics and not
+        one of the names actually stored.
+
+        They cannot be reached any other way. `s2p/npix` is a row in the
+        attributes table rather than a Python attribute, so `dir()` cannot see
+        it and no static tool can know it - but one indexed query can.
+        """
+        try:
+            return self.keys()
+        except Exception:
+            # This runs on a keystroke. An entity whose backend has gone away
+            #  should still be typeable, so a completer must never raise
+            return []
 
     def map(self, fun: Callable, **kwargs) -> list:
         """Sequentially apply a function to each Entity of the collection (kwargs are passed onto the function)
@@ -1981,7 +2060,7 @@ class Collection(object):
 
         return archive.export(self.entarchy, destination, collection=self, **kwargs)
 
-    def to_dict(self) -> Generator[dict[str, Any]]:
+    def to_dict(self) -> Generator[dict[str, Any], None, None]:
         """
         Return a generator of dictionaries of all dynamic attributes for each entity in the collection.
         """
@@ -2011,7 +2090,7 @@ class Collection(object):
         # Update cache
         self._cache.update(df)
 
-    def where(self, *_string_expressions: str, **_equalities):
+    def where(self, *_string_expressions: str, **_equalities) -> Collection[EntityT]:
         _collection = self.entarchy.get(self.entity_type, *_string_expressions, **_equalities)
         if self.as_tree == {}:
             new_tree = _collection.as_tree
@@ -2021,7 +2100,7 @@ class Collection(object):
         return self._derive(new_tree)
 
 
-class LinkCollection(Collection):
+class LinkCollection(Collection[LinkEntity]):
     """A queryable set of links of one kind, optionally with its ends pinned.
 
     Everything Collection does works here - slicing, dataframe_of, update,
@@ -2065,7 +2144,7 @@ class LinkCollection(Collection):
 
         return spec
 
-    def _derive(self, _as_tree) -> 'LinkCollection':
+    def _derive(self, _as_tree) -> LinkCollection:
         return LinkCollection(self.entarchy, self._link_type, _as_tree,
                               self._endpoint_constraints)
 
@@ -2361,14 +2440,20 @@ def shutdown_worker_pool() -> None:
 atexit.register(shutdown_worker_pool)
 
 
-class CollectionIterator(object):
+class CollectionIterator(Generic[EntityT]):
 
-    def __init__(self, _collection: Collection):
+    def __init__(self, _collection: Collection[EntityT]):
         self._collection = _collection
         self._current_index = 0
         self._results = self._collection._rows()
 
-    def __next__(self):
+    def __iter__(self) -> CollectionIterator[EntityT]:
+        # The iterator protocol wants both halves on the iterator itself. Only
+        #  __next__ was here, which is enough for a for-loop and not enough for
+        #  iter(iter(collection)) or for a type checker to call this iterable
+        return self
+
+    def __next__(self) -> EntityT:
         # No more results: reset iteration counter and offset and stop iteration
         if self._current_index >= len(self._results):
             raise StopIteration
@@ -2422,10 +2507,10 @@ def get_ancestor_distance_from_nested(hierarchy: dict[str, Any],
     return None
 
 
-class DeferredEntityCollection(object):
+class DeferredEntityCollection(Generic[EntityT]):
     _expression: str
 
-    def __init__(self, _entity_type: type[Entity], _expression: str = ''):
+    def __init__(self, _entity_type: type[EntityT], _expression: str = ''):
         self._entity_type = _entity_type
         self._expression = _expression
 
@@ -2452,7 +2537,7 @@ class DeferredEntityCollection(object):
         return query.parse_boolean_expression(self._expression)
 
     @property
-    def entity_type(self):
+    def entity_type(self) -> type[EntityT]:
         return self._entity_type
 
     @property
@@ -2470,5 +2555,5 @@ class DeferredEntityCollection(object):
 
         return other
 
-    def get_from(self, _entarchy: Entarchy) -> Collection:
+    def get_from(self, _entarchy: Entarchy) -> Collection[EntityT]:
         return self._entity_type.get_collection_type()(_entarchy, self._entity_type, _as_tree=self.as_tree)

@@ -39,6 +39,11 @@ requires-python = ">=3.10"
 where = ['.']
 include = ['entarchy*']
 
+# PEP 561: without this marker a type checker treats an installed entarchy as
+#  untyped and offers nothing from it, however well annotated the source is
+[tool.setuptools.package-data]
+entarchy = ['py.typed']
+
 [project.optional-dependencies]
 mysql = [
     'SQLAlchemy',
@@ -50,7 +55,10 @@ notebook = ['cloudpickle']
 # Needed to write and read ASDF archives (entarchy.tools.archive)
 asdf = ['asdf']
 dev = ['pip-tools', 'pytest', 'build', 'twine',
-       'cloudpickle', 'nbformat', 'nbclient', 'ipykernel', 'asdf']
+       'cloudpickle', 'nbformat', 'nbclient', 'ipykernel', 'asdf',
+       # tests/test_typing.py asks it what an editor would infer; the suite
+       #  skips those tests where it is not installed
+       'pyright']
 
 [project.urls]
 Homepage = 'https://github.com/thladnik/entarchy'

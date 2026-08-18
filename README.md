@@ -157,6 +157,39 @@ case-insensitive, so `['abc', 'ABC']` counts as two values on one and one on the
 other. Numbers, booleans and times agree everywhere. NaN counts as a value and
 stays out of the range; infinity is an end of it.
 
+### In an editor, and in a notebook
+
+Collections are generic over what they hold. `ent.get(Roi)` is a
+`Collection[Roi]` and `ent.get(Roi)[0]` is a `Roi`, so your schema's own
+properties and methods complete rather than only `Entity`'s. Indexing is typed
+four ways, because it does four things:
+
+```python
+rois[0]                      # Roi
+rois[0:3]                    # list[Roi]
+rois['index']                # Series
+rois[['index', 'is_unit']]   # DataFrame
+```
+
+Everything that hands back another collection keeps the type — `sort()`,
+`where()`, the set operators — as does iteration, and `Roi('index > 3')`. Naming
+a type as a string cannot say which one, so `ent.get('Roi')` is a
+`Collection[Entity]`; pass the class where you want the type. The package ships
+a `py.typed` marker, without which a type checker ignores all of this and treats
+an installed entarchy as untyped.
+
+In a notebook, tab inside the brackets to complete the names actually stored:
+
+```python
+roi['s2p/<TAB>']
+rois['ants/<TAB>']
+roi.describe()['<TAB>']
+```
+
+Those are rows in the attributes table rather than Python attributes, so `dir()`
+cannot see them and no static tool can know them. The completion asks the
+database, which costs one indexed query.
+
 ### How values are stored
 
 Scalars — `str`, `int`, `float`, `bool`, `date`, `datetime` — go into a typed

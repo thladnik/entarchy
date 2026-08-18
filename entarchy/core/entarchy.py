@@ -7,7 +7,7 @@ import pathlib
 import pprint
 import sys
 import uuid
-from typing import Any, Callable, Type, TYPE_CHECKING, Union
+from typing import Any, Callable, Type, TYPE_CHECKING, Union, cast, overload
 
 import alive_progress
 import yaml
@@ -16,8 +16,8 @@ from . import console
 from . import describe
 from . import links
 from . import query
-from .entity import (AnalysisEntity, Collection, EntarchyEntity, Entity, LinkCollection,
-                     LinkEntity)
+from .entity import (AnalysisEntity, Collection, EntarchyEntity, Entity, EntityT,
+                     LinkCollection, LinkEntity)
 
 if TYPE_CHECKING:
     from ..backend.backend import Backend
@@ -562,6 +562,14 @@ class Entarchy(object):
             subject=os.path.basename(str(self.path).rstrip('/\\')) or str(self.path),
             headline=headline, sections=sections, notes=notes)
 
+    @overload
+    def get(self, entity_type: Type[EntityT], *_string_expressions: str,
+            **_equalities) -> Collection[EntityT]: ...
+
+    @overload
+    def get(self, entity_type: str, *_string_expressions: str,
+            **_equalities) -> Collection[Entity]: ...
+
     def get(self, entity_type: Type[Entity] | str, *_string_expressions: str, **_equalities) -> Collection:
         """Get a collection of entities of a given type.
 
@@ -625,6 +633,16 @@ class Entarchy(object):
             _entity = self.backend.get_entity_by_uuid(self, _uuid)
 
             return _entity
+
+    def _link_entity(self, _uuid: str) -> LinkEntity:
+        """The carrier entity of a link, by uuid.
+
+        get_entity() is given a type *name*, so nothing about the call says
+        what comes back. Asking for 'LinkEntity' and saying so is knowledge
+        that exists nowhere else; it lives here rather than at each of the
+        three call sites that need it.
+        """
+        return cast(LinkEntity, self.get_entity('LinkEntity', _uuid, None))
 
     def get_entity_type(self, entity_type_name: str) -> Type[Entity]:
         """Get the entity type class for a given entity type name.
@@ -800,7 +818,7 @@ class Entarchy(object):
 
         existing = self._existing_link_uuid(spec.name, linker_uuid, linked_uuid)
         if existing is not None:
-            link_entity = self.get_entity('LinkEntity', existing, None)
+            link_entity = self._link_entity(existing)
             if attributes:
                 link_entity.update(attributes)
             return link_entity
@@ -864,7 +882,7 @@ class Entarchy(object):
         if found is None:
             return None
 
-        return self.get_entity('LinkEntity', found, None)
+        return self._link_entity(found)
 
     def get_links_for(self, entity: Entity, link_type: str = None,
                       direction: str = 'both') -> list[LinkEntity]:
@@ -872,7 +890,7 @@ class Entarchy(object):
         rows = self.backend.get_links_for_entity(entity.uuid, link_type=link_type,
                                                  direction=direction)
 
-        return [self.get_entity('LinkEntity', row['link_uuid'], None) for row in rows]
+        return [self._link_entity(row['link_uuid']) for row in rows]
 
     def links(self, link_type: str, *_string_expressions: str,
               **_equalities) -> LinkCollection:

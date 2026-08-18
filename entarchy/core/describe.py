@@ -166,6 +166,15 @@ class Description:
     def __contains__(self, name: str) -> bool:
         return name in self._sections
 
+    def _ipython_key_completions_(self) -> list[str]:
+        """The section names, for tab completion inside the brackets.
+
+        Which sections a description has depends on what the thing being
+        described turned out to hold, so this is the only way to find out
+        without printing it first.
+        """
+        return list(self._sections)
+
     def _ordered_sections(self):
         known = [n for n in _SECTION_ORDER if n in self._sections]
         rest = [n for n in self._sections if n not in _SECTION_ORDER]
