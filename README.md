@@ -80,6 +80,27 @@ and gives up at roughly sixteen thousand.
 `ent.links(...)` returns a `LinkCollection`, so `map_async`, `dataframe_of`,
 `update`, set operations and `to_asdf` all work on links.
 
+Pairwise values come back as a matrix, which is the counterpart to
+`link_from_matrix`:
+
+```python
+r = ent.matrix_from_links(day1_rois, day2_rois, 'same_cell', 'overlap')
+r = rois.matrix_from_links(rois, 'correlated', 'r')     # the same, said shorter
+r = rois.matrix_from_links(rois, 'correlated', 'r', 'r > 0.8')
+```
+
+Rows are the first collection in its own order, columns are the second in
+theirs, and a pair with no link — or one a filter excludes — is NaN rather than
+zero. Two queries however large the result: a link's ends are in the links
+table and its values in the attributes table, which is why it takes two and why
+`dataframe_of` alone cannot answer it.
+
+Orientation is handled rather than left to the caller. A symmetric kind stores
+its ends in uuid order, so each link stands at both of its positions and a
+collection against itself comes back symmetric rather than triangular; a
+directed kind stores them as its declaration says, so asking for the rows the
+other way round transposes the matrix instead of scrambling it.
+
 **Links are for sparse relationships.** A link costs roughly 1.5 kB against 4
 bytes for a `float32`, so an all-to-all matrix belongs on the nearest common
 ancestor as an array, not as links. Bulk writes refuse to be enormous or to be

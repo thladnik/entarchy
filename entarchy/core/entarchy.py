@@ -20,6 +20,8 @@ from .entity import (AnalysisEntity, Collection, EntarchyEntity, Entity, EntityT
                      LinkCollection, LinkEntity)
 
 if TYPE_CHECKING:
+    import pandas as pd
+
     from ..backend.backend import Backend
     from ..backend.mysql import MySQLBackend
     from ..backend.sqlite import SQLiteBackend
@@ -1137,6 +1139,103 @@ class Entarchy(object):
 
         return self.link_from_frame(frame, link_type, confirm_count=confirm_count,
                                     dry_run=dry_run)
+
+    def matrix_from_links(self, linkers: Collection, linkeds: Collection,
+                          link_type: str, value_name: str,
+                          *_string_expressions: str, **_equalities) -> 'pd.DataFrame':
+        """The links between two collections, as a matrix in their own order.
+
+            r = ent.matrix_from_links(day1_rois, day2_rois, 'same_cell', 'overlap')
+            r = ent.matrix_from_links(rois, rois, 'correlation', 'r')
+            r = ent.matrix_from_links(rois, rois, 'correlation', 'r', 'r > 0.5')
+
+        The counterpart to `link_from_matrix`: rows are `linkers` in their own
+        order, columns are `linkeds` in theirs, and a pair with no link - or one
+        the filter expressions exclude - is NaN. `rois.matrix_from_links(...)`
+        is the same thing said from the collection.
+
+        Two queries however large the result: the ends of every link at once,
+        rather than one lookup per entity, and the values through the same
+        pivot `dataframe_of` uses. A link's ends are in the links table and its
+        values in the attributes table, which is why it takes two.
+
+        For a symmetric kind each link stands at both of its positions, since
+        which end is stored as the linker is an artifact of uuid ordering
+        there. So `matrix_from_links(rois, rois, ...)` comes back symmetric
+        rather than triangular, and two disjoint collections come back the way
+        they were asked for either way.
+
+        Args:
+            linkers: the collection the rows are.
+            linkeds: the collection the columns are.
+            link_type: the kind of link to read.
+            value_name: which attribute of the link fills the cells.
+            *_string_expressions: filters on the links, as `links()` takes them.
+            **_equalities: the same, as equalities.
+
+        Returns:
+            pandas.DataFrame: indexed by the uuids of `linkers`, with the uuids
+            of `linkeds` as columns.
+        """
+        import numpy as np
+        import pandas as pd
+
+        from .links import orientation
+
+        pairs = linkers.links_to(linkeds, link_type,
+                                 *_string_expressions, **_equalities)
+        spec = pairs.link_type_spec
+
+        row_uuids = [_uuid for _uuid, _ in linkers._rows()]
+        column_uuids = [_uuid for _uuid, _ in linkeds._rows()]
+
+        endpoints = self.backend.get_link_endpoints(pairs)
+
+        if len(endpoints) == 0:
+            matrix = pd.DataFrame(np.nan, index=row_uuids, columns=column_uuids)
+        else:
+            # links_to() stores the pair the way the kind's endpoint types say,
+            #  which for a kind running the other way is not the way it was
+            #  asked for here. Naming the two columns accordingly is the whole
+            #  of putting the matrix back the right way round.
+            swapped = orientation(spec, linkers._as_endpoint(),
+                                  linkeds._as_endpoint()) == 'swapped'
+            names = (['link_uuid', 'column_uuid', 'row_uuid'] if swapped
+                     else ['link_uuid', 'row_uuid', 'column_uuid'])
+
+            frame = pd.DataFrame(endpoints, columns=names)
+
+            if spec.symmetric:
+                flipped = frame.rename(columns={'row_uuid': 'column_uuid',
+                                                'column_uuid': 'row_uuid'})
+                frame = pd.concat([frame, flipped], ignore_index=True)
+                # A link from an entity to itself lands on one cell twice
+                frame = frame.drop_duplicates(
+                    subset=['link_uuid', 'row_uuid', 'column_uuid'])
+
+            frame = frame.join(pairs.dataframe_of([value_name]), on='link_uuid')
+
+            try:
+                matrix = frame.pivot(index='row_uuid', columns='column_uuid',
+                                     values=value_name)
+            except ValueError as exc:
+                raise ValueError(
+                    f'More than one "{link_type}" link falls on the same pair, so '
+                    f'there is no single {value_name} to put in that cell.') from exc
+
+            matrix = matrix.reindex(index=row_uuids, columns=column_uuids)
+
+        try:
+            matrix = matrix.astype(float)
+        except (TypeError, ValueError):
+            # A link may carry a string or a date as well as a number, and those
+            #  are left as they are rather than refused
+            pass
+
+        matrix.index.name = linkers.entity_type.__name__
+        matrix.columns.name = linkeds.entity_type.__name__
+
+        return matrix
 
     def redefine_link_type(self, name: str, *args, delete_existing: bool = False,
                            **kwargs) -> links.LinkTypeSpec:

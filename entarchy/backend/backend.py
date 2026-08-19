@@ -155,6 +155,10 @@ class Backend(object):
         """(entity_type, name, data_type, entity_count, total_bytes), entarchy-wide."""
         raise NotImplementedError('')
 
+    def get_link_endpoints(self, _collection: Collection) -> list[tuple[str, str, str]]:
+        """(link_uuid, linker_uuid, linked_uuid) for every link in a collection."""
+        raise NotImplementedError('')
+
     # Collection related methods
 
     def get_collection_count(self, _collection: Collection) -> int:

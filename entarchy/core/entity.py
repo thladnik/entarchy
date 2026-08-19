@@ -21,7 +21,9 @@ from . import query
 from .links import LinkTypeError
 
 if TYPE_CHECKING:
+    from . import describe as describe_mod
     from .entarchy import Entarchy
+    from ..backend.blob_store import MediaFile
 
 # What sort of entity a collection holds. Bound to Entity so a collection
 #  can only ever be of entities, and carried through get(), indexing and
@@ -1128,6 +1130,21 @@ class Collection(Generic[EntityT]):
         as_tree = self.entarchy._build_filter_tree(_string_expressions, _equalities)
 
         return LinkCollection(self.entarchy, spec.name, as_tree, constraints)
+
+    def matrix_from_links(self, other: Collection, link_type: str, value_name: str,
+                          *_string_expressions: str, **_equalities) -> pd.DataFrame:
+        """The links between this collection and another, as a matrix.
+
+            r = day1_rois.matrix_from_links(day2_rois, 'same_cell', 'overlap')
+            r = rois.matrix_from_links(rois, 'correlation', 'r')
+
+        Rows are this collection in its own order, columns are `other` in
+        theirs, and a pair with no link is NaN. The same as
+        `ent.matrix_from_links(self, other, ...)`, which is where it is
+        documented.
+        """
+        return self.entarchy.matrix_from_links(
+            self, other, link_type, value_name, *_string_expressions, **_equalities)
 
     def __len__(self):
         if self._length is None:

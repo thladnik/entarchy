@@ -482,7 +482,7 @@ def _split_endpoint_traversal(_session, rest: str, endpoint: Endpoint,
 
 def _generate_attribute_filters(context: _QueryContext,
                                 _session: sqlalchemy.orm.Session,
-                                as_tree: dict[str, ...]) -> Any:
+                                as_tree: dict[str, Any]) -> Any:
 
     entity_type_name = context.entity_type_name
 
@@ -1127,10 +1127,10 @@ class SQLBackend(Backend):
         return True
 
     @_retry_on_operational_failure
-    def create_type_hierarchy(self, _hierarchy: dict[str, ...]) -> bool:
+    def create_type_hierarchy(self, _hierarchy: dict[str, Any]) -> bool:
 
         with self.sql_session as session:
-            def _create_entity_type(_hierarchy: dict[str, ...], parent_row: Union[EntityTypeTable, None]):
+            def _create_entity_type(_hierarchy: dict[str, Any], parent_row: Union[EntityTypeTable, None]):
                 for name, children in _hierarchy.items():
                     row = EntityTypeTable(name=name, parent=parent_row)
                     session.add(row)
@@ -1665,6 +1665,37 @@ class SQLBackend(Backend):
             return [{'link_uuid': row.link_uuid, 'link_type': row.link_type,
                      'linker_uuid': row.linker_uuid, 'linked_uuid': row.linked_uuid}
                     for row in query.order_by(Link.link_uuid).all()]
+
+    @_retry_on_operational_failure
+    def get_link_endpoints(self, _collection: Collection) -> list[tuple[str, str, str]]:
+        """(link_uuid, linker_uuid, linked_uuid) for every link in a collection.
+
+        A link's values live in the attributes table and its ends live in the
+        links table, so the attribute pivot cannot reach the ends - which is
+        what made reading a whole matrix back cost a query per entity instead
+        of one for the lot.
+
+        Rides the collection's own query, so whatever filter and endpoint
+        constraint it carries applies here too.
+        """
+        if getattr(_collection, 'link_type', None) is None:
+            raise TypeError(f'{_collection} is a collection of entities rather '
+                            f'than of links, so its members have no endpoints. '
+                            f'links() or links_to() give one that does.')
+
+        with self.sql_session as session:
+            # The collection's own query already joins the links table for a
+            #  link collection, so the columns are there to be selected. Asking
+            #  for them off it directly rather than through an IN over its uuids
+            #  halves the work: 3.7 s against 1.8 s at 90 000 links
+            entity_query = _build_query_from_collection(_collection, session)
+
+            rows = (entity_query
+                    .with_entities(Link.link_uuid, Link.linker_uuid, Link.linked_uuid)
+                    .order_by(Link.link_uuid).all())
+
+        return [(link_uuid, linker_uuid, linked_uuid)
+                for link_uuid, linker_uuid, linked_uuid in rows]
 
     @_retry_on_operational_failure
     def count_links_by_type(self, entity_uuid: str) -> dict[str, int]:

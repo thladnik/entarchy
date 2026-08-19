@@ -963,3 +963,67 @@ class TestDescribeAgreesAcrossBackends:
 
         assert (ent.backend.get_link_type_totals()
                 == sqlite_twin.backend.get_link_type_totals())
+
+
+class TestMatrixAgreesAcrossBackends:
+    """matrix_from_links selects the link columns off the collection's own
+    query, which is a different statement on each dialect. It has to come back
+    as the same matrix."""
+
+    SIZE = 5
+
+    def _fill(self, entarchy, values):
+        with entarchy:
+            subject = Subject(entarchy, _id='subject_a', _parent=entarchy.root)
+            entarchy.add_new_entity(subject)
+
+            for index in range(2 * self.SIZE):
+                session = Session(entarchy, _id=f'sess_{index}', _parent=subject)
+                entarchy.add_new_entity(session)
+                session['index'] = index
+                session['side'] = 'left' if index < self.SIZE else 'right'
+
+        entarchy.define_link_type('corr', 'Session', 'Session', symmetric=True)
+
+        a = entarchy.get(Session, 'side == "left"').sort('index')
+        b = entarchy.get(Session, 'side == "right"').sort('index')
+        entarchy.link_from_matrix(a, b, values, 'corr', where=lambda m: m > 0.3,
+                                  value_name='r')
+
+        return a, b
+
+    @pytest.fixture()
+    def values(self):
+        import numpy as np
+
+        return np.random.default_rng(0).random((self.SIZE, self.SIZE))
+
+    @pytest.fixture()
+    def sqlite_twin(self, tmp_path, values):
+        from entarchy.backend import SQLiteBackend
+
+        path = (tmp_path / 'twin').as_posix()
+        twin = LabArchy.create(path, SQLiteBackend(path, dbname='twin.db'))
+        yield twin, self._fill(twin, values)
+        twin.backend.close()
+
+    def test_the_matrix_is_the_same_on_both(self, ent, sqlite_twin, values):
+        import numpy as np
+
+        here_a, here_b = self._fill(ent, values)
+        twin, (there_a, there_b) = sqlite_twin
+
+        here = ent.matrix_from_links(here_a, here_b, 'corr', 'r')
+        there = twin.matrix_from_links(there_a, there_b, 'corr', 'r')
+
+        assert here.shape == there.shape == (self.SIZE, self.SIZE)
+        assert np.allclose(here.to_numpy(), there.to_numpy(), equal_nan=True)
+        assert np.allclose(here.to_numpy()[values > 0.3], values[values > 0.3])
+        assert np.isnan(here.to_numpy()[values <= 0.3]).all()
+
+    def test_the_endpoint_query_runs_on_mysql(self, ent, values):
+        here_a, here_b = self._fill(ent, values)
+        pairs = here_a.links_to(here_b, 'corr')
+
+        endpoints = ent.backend.get_link_endpoints(pairs)
+        assert len(endpoints) == len(pairs) == int((values > 0.3).sum())

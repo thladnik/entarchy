@@ -880,6 +880,36 @@ class TestLinksInArchives:
             ent.backend.close()
             asdf_store.close_asdf_files()
 
+    def test_a_matrix_reads_the_same_from_an_archive(self, source, tmp_path):
+        """A link's ends live in the index and its values in the blocks, so
+        reading a matrix is the one read that has to bring both halves back
+        together across the export."""
+        source.define_link_type('corr', Roi, Roi, symmetric=True)
+        rois = source.get(Roi).sort('id')
+
+        values = np.random.default_rng(0).random((len(rois), len(rois)))
+        values = (values + values.T) / 2
+        source.link_from_matrix(rois, rois, values, 'corr',
+                                where=lambda m: m > 0.4, value_name='r')
+
+        here = source.matrix_from_links(rois, rois, 'corr', 'r')
+
+        destination = (tmp_path / 'matrix_archive').as_posix()
+        archive_tool.export(source, destination, verbose=False)
+
+        ent = DeepArchy(destination)
+        try:
+            theirs = ent.get(Roi).sort('id')
+            there = ent.matrix_from_links(theirs, theirs, 'corr', 'r')
+
+            assert list(there.index) == list(here.index)
+            assert np.allclose(there.to_numpy(), here.to_numpy(), equal_nan=True)
+            # A thresholded write leaves gaps, and they have to survive as gaps
+            assert np.isnan(there.to_numpy()).any()
+        finally:
+            ent.backend.close()
+            asdf_store.close_asdf_files()
+
     def test_links_survive_export(self, with_links, tmp_path):
         destination = (tmp_path / 'linked_archive_rows').as_posix()
         archive_tool.export(with_links, destination, verbose=False)
