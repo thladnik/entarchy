@@ -60,7 +60,7 @@ _LINK_COLUMNS = ['link_uuid', 'link_type', 'linker_uuid', 'linked_uuid', 'create
 _LINK_TYPE_COLUMNS = ['name', 'linker_type_pk', 'linker_link_type', 'linked_type_pk',
                       'linked_link_type', 'symmetric', 'cardinality', 'description',
                       'created']
-_ATTRIBUTE_COLUMNS = ['entity_uuid', 'analysis_uuid', 'name', 'value_str', 'value_int',
+_ATTRIBUTE_COLUMNS = ['entity_uuid', 'name', 'value_str', 'value_int',
                       'value_float', 'value_bool', 'value_date', 'value_datetime',
                       'data_type', 'data_size', 'float_is_nan', 'float_is_inf', 'mutable',
                       'created', 'modified']
@@ -69,7 +69,7 @@ _ATTRIBUTE_COLUMNS = ['entity_uuid', 'analysis_uuid', 'name', 'value_str', 'valu
 #  null mask, because None and a legitimate zero/empty string/NaN must survive
 #  the round trip distinctly.
 _COLUMN_KINDS = {
-    'uuid': 'str', 'parent_uuid': 'str', 'entity_uuid': 'str', 'analysis_uuid': 'str',
+    'uuid': 'str', 'parent_uuid': 'str', 'entity_uuid': 'str',
     'linker_uuid': 'str', 'linked_uuid': 'str', 'id': 'str', 'name': 'str',
     'value_str': 'str', 'data_type': 'str',
     'link_uuid': 'str', 'link_type': 'str', 'linker_link_type': 'str',

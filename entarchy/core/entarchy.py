@@ -1330,8 +1330,8 @@ class Entarchy(object):
                 self.commit()
             else:
                 # Reuse the persisted UUID. Creating a fresh entity object here would
-                #  generate a new random UUID each session and attribute analysis_uuid
-                #  values would no longer match the stored analysis entity.
+                #  generate a new random UUID each session, and attributes written on
+                #  the analysis in an earlier session would no longer be reachable.
                 _analysis_entity = AnalysisEntity(self, _uuid=existing_data[0][0], _id=_analysis)
         elif isinstance(_analysis, AnalysisEntity):
             _analysis_entity = _analysis

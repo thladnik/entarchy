@@ -35,7 +35,6 @@ ATTRIBUTE_ROW = {
     'value_float': 1.5,
     'data_type': 'float',
     'data_size': 8,
-    'analysis_uuid': None,
     'float_is_nan': False,
     'float_is_inf': False,
     'modified': datetime.datetime(2026, 1, 1),

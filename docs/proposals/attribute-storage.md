@@ -80,10 +80,9 @@ them is a "which entities have this attribute" lookup.
 
 ### The document's win is mostly an artifact of dropping metadata
 
-`mutable` (immutability, enforced in `set_entity_attributes`), `analysis_uuid`
-(which analysis wrote the value), `created`, `modified` and `data_size` are
-per-attribute columns today. A flat `{name: value}` document holds none of them.
-Nesting them as `{name: {v: …, m: …, a: …}}`:
+`mutable` (immutability, enforced in `set_entity_attributes`), `created`,
+`modified` and `data_size` are per-attribute columns. A flat `{name: value}`
+document holds none of them. Nesting them as `{name: {v: …, m: …, a: …}}`:
 
 | | size | document | filter | pivot |
 |---|---|---|---|---|
@@ -93,6 +92,10 @@ Nesting them as `{name: {v: …, m: …, a: …}}`:
 
 Carrying what entarchy already carries, the document is **larger and slower on
 filters than EAV**. Only the pivot still favours it.
+
+These numbers were measured when an `analysis_uuid` column was still on the
+table; it has since been dropped. One fewer nullable string moves the sizes a
+little and the conclusion not at all.
 
 ### Type fidelity
 

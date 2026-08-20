@@ -706,7 +706,19 @@ class EntarchyEntity(Entity):
 
 
 class AnalysisEntity(Entity):
-    """Analysis entity for data segregation
+    """A named analysis, parentless, holding whatever that analysis derived.
+
+    `set_current_analysis(name)` creates or reuses one by id, so a name is
+    the same entity - and the same uuid - in every session. It is also a
+    context manager: `with analysis:` makes it current and restores the
+    previous one on exit.
+
+    Segregation is by entity, not by stamp. Two analyses that each write
+    `analysis['dff']` write two rows, because the attributes primary key is
+    `(entity_uuid, name)`. Writing a derived value onto the entity it was
+    derived from has no such protection - the second analysis overwrites the
+    first - so a name several analyses share belongs on the analysis, or in
+    a namespace of its own (`cmn_rf/dff`).
     """
 
 

@@ -189,7 +189,6 @@ class AttributeTable(Base):
 
     entity_uuid: Mapped[str] = mapped_column(String(36), ForeignKey('entities.uuid'), primary_key=True)
     entity: Mapped['EntityTable'] = relationship('EntityTable', foreign_keys=[entity_uuid], back_populates='attributes')
-    analysis_uuid: Mapped[str] = mapped_column(String(36), nullable=True)
 
     name: Mapped[str] = mapped_column(String(500), primary_key=True, index=True)
 
@@ -1379,12 +1378,7 @@ class SQLBackend(Backend):
     @_retry_on_operational_failure
     def set_entity_attributes(self, _entity: Entity, names: list[str], values: list[Any]) -> tuple[bool, str]:
 
-        _entarchy = _entity.entarchy
         entity_uuid = _entity.uuid
-
-        _analysis_uuid = None
-        if _entarchy.current_analysis is not None:
-            _analysis_uuid = _entarchy.current_analysis.uuid
 
         with self._write_session() as session:
 
@@ -1421,7 +1415,6 @@ class SQLBackend(Backend):
                 # Create new attribute row
                 new_row = AttributeTable(entity_uuid=entity_uuid,
                                          name=n,
-                                         analysis_uuid=_analysis_uuid,
                                          mutable=not _entity.entarchy.is_in_digest_mode)
                 session.add(new_row)
 
@@ -2364,10 +2357,6 @@ class SQLBackend(Backend):
 
         _dtypes = ['str', 'float', 'int', 'date', 'datetime', 'bool', 'blob']
 
-        _analysis_uuid = None
-        if ent.current_analysis is not None:
-            _analysis_uuid = ent.current_analysis.uuid
-
         # Do an upsert for each attribute to be updated
         for attr_name in df.columns:
 
@@ -2412,7 +2401,6 @@ class SQLBackend(Backend):
             df_insert['entity_uuid'] = df_insert.index
             df_insert['name'] = attr_name
             df_insert['data_type'] = data_type_str
-            df_insert['analysis_uuid'] = _analysis_uuid
 
             # Handle special float values: nan/inf are stored as NULL plus marker flags
             #  (value_int carries the sign of inf), mirroring _write_attribute_data
@@ -2494,7 +2482,6 @@ class SQLBackend(Backend):
                         **{f'value_{dt}': None for dt in list(set(_dtypes) - {data_type_str})},
                         'data_type': data_type_str,
                         'data_size': proposed.data_size,
-                        'analysis_uuid': proposed.analysis_uuid,
                         'modified': proposed.modified,
                         'float_is_nan': proposed.float_is_nan,
                         'float_is_inf': proposed.float_is_inf,

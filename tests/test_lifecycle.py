@@ -75,16 +75,56 @@ class TestAnalysis:
         assert reopened.current_analysis.uuid == first_uuid
         reopened.backend.close()
 
-    def test_attributes_reference_persisted_analysis(self, populated):
+    def test_attributes_written_on_an_analysis_survive_reopening(self, populated):
         populated.set_current_analysis('my_analysis')
-        analysis_uuid = populated.current_analysis.uuid
+        with populated:
+            populated.current_analysis['analyzed_value'] = 1.0
 
+        # The analysis is addressed by a persisted uuid, so a later session
+        #  reaches the same entity and therefore the same attributes
+        reopened = LabArchy(populated.path)
+        reopened.set_current_analysis('my_analysis')
+        assert reopened.current_analysis['analyzed_value'] == 1.0
+        reopened.backend.close()
+
+    def test_two_analyses_hold_the_same_name_separately(self, populated):
+        """What segregates analyses is the entity, not a column.
+
+        An `analysis_uuid` column on every attribute row once claimed to do
+        this. It could not: the primary key is `(entity_uuid, name)`, so two
+        analyses writing one name on one entity produced a single row carrying
+        the second value under the first analysis's uuid. Holding the value on
+        the analysis itself makes the primary key do the work.
+        """
+        populated.set_current_analysis('first')
+        with populated.current_analysis as first:
+            first['dff'] = 1.0
+
+        populated.set_current_analysis('second')
+        with populated.current_analysis as second:
+            second['dff'] = 2.0
+
+        assert first.uuid != second.uuid
+        assert first['dff'] == 1.0
+        assert second['dff'] == 2.0
+
+    def test_writing_a_name_on_a_shared_entity_does_not_segregate(self, populated):
+        """The other half of the same fact, so nobody rediscovers it in data."""
         subject = populated.get(Subject)[0]
-        subject['analyzed_value'] = 1.0
 
+        populated.set_current_analysis('first')
+        with populated.current_analysis:
+            subject['dff'] = 1.0
+
+        populated.set_current_analysis('second')
+        with populated.current_analysis:
+            subject['dff'] = 2.0
+
+        # One row, last write wins - the analysis is not part of the identity
         import sqlite3
         con = sqlite3.connect(os.path.join(populated.path, 'test.db'))
-        stored = con.execute(
-            "SELECT analysis_uuid FROM attributes WHERE name = 'analyzed_value'").fetchone()[0]
+        rows = con.execute("SELECT value_float FROM attributes "
+                           "WHERE entity_uuid = ? AND name = 'dff'",
+                           (subject.uuid,)).fetchall()
         con.close()
-        assert stored == analysis_uuid
+        assert rows == [(2.0,)]
