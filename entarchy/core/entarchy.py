@@ -232,6 +232,30 @@ class Entarchy(object):
         return hierarchy, entity_map
 
     @classmethod
+    def open_or_create(cls,
+                       path: str,
+                       _backend: Backend | str,
+                       _backend_config: dict[str, Any] = None,
+                       **kwargs) -> Entarchy:
+        """Open the entarchy at `path`, or create one there if there is none.
+
+        An ingest that may be run twice needs this: create() refuses a path that
+        exists and the constructor refuses one that does not, so every caller
+        who wanted "continue where it stopped" had to test for entarchy.yaml
+        itself.
+
+            ent = LabArchy.open_or_create(path, 'SQLiteBackend',
+                                          {'dbname': 'lab.db'})
+
+        The backend arguments are only used when creating; opening reads them
+        back from the configuration that was written then.
+        """
+        if os.path.exists(os.path.join(path, 'entarchy.yaml')):
+            return cls(path, **kwargs)
+
+        return cls.create(path, _backend, _backend_config, **kwargs)
+
+    @classmethod
     def create(cls,
                path: str,
                _backend: Backend | str,
@@ -261,10 +285,15 @@ class Entarchy(object):
         # Resolve hierarchy and add Analysis entity
         hierarchy, entity_map = cls._resolve_hierarchy()
 
-        # Check if path exists, otherwise create
+        # An existing path is refused because creating into it would write over
+        #  whatever is there. An empty directory holds nothing to write over, and
+        #  having made the destination first - by hand, or as a mount point - is
+        #  ordinary enough that refusing it only invites a rmdir.
         if os.path.exists(path):
-            raise FileExistsError(f'Path {path} already exists.')
-        os.makedirs(path, exist_ok=False)
+            if not os.path.isdir(path) or len(os.listdir(path)) > 0:
+                raise FileExistsError(f'Path {path} already exists.')
+        else:
+            os.makedirs(path, exist_ok=False)
 
         print('---')
         print('Create entity type hierarchy:')

@@ -27,6 +27,32 @@ class TestCreate:
         assert reopened.root.uuid == ent.root.uuid
         reopened.backend.close()
 
+    def test_open_or_create_creates_when_there_is_nothing(self, tmp_path):
+        base = (tmp_path / 'fresh').as_posix()
+        ent = LabArchy.open_or_create(base, SQLiteBackend(base, dbname='test.db'))
+
+        assert os.path.exists(os.path.join(base, 'entarchy.yaml'))
+        assert ent.root is not None
+        ent.backend.close()
+
+    def test_open_or_create_opens_what_is_already_there(self, ent):
+        """An ingest that may be run twice needs exactly this."""
+        reopened = LabArchy.open_or_create(ent.path, SQLiteBackend(ent.path,
+                                                                   dbname='test.db'))
+
+        assert reopened.root.uuid == ent.root.uuid
+        reopened.backend.close()
+
+    def test_open_or_create_does_not_mind_an_empty_directory(self, tmp_path):
+        """create() refuses a path that exists, which an empty one does."""
+        base = (tmp_path / 'made_by_hand')
+        os.makedirs(base)
+
+        ent = LabArchy.open_or_create(base.as_posix(),
+                                      SQLiteBackend(base.as_posix(), dbname='test.db'))
+        assert ent.root is not None
+        ent.backend.close()
+
     def test_create_refuses_existing_path(self, ent):
         with pytest.raises(FileExistsError):
             LabArchy.create(ent.path, SQLiteBackend(ent.path, dbname='other.db'))
