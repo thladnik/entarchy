@@ -30,8 +30,13 @@ dependencies = [
     'numpy',
     'pandas',
     'pyyaml',
-    'SQLAlchemy',  # for now, but will be moved to optional dependencies in the future
-    'PyMySQL',     # for now, but will be moved to optional dependencies in the future
+    # Both backends are built on SQLAlchemy, and the MySQL one needs a driver.
+    #  Neither belongs behind an extra: an entarchy names its backend class in
+    #  entarchy.yaml and instantiates it on open, so a store written against a
+    #  server has to be openable by whoever is handed it, whatever they chose
+    #  for their own
+    'SQLAlchemy',
+    'PyMySQL',
 ]
 requires-python = ">=3.10"
 
@@ -45,10 +50,6 @@ include = ['entarchy*']
 entarchy = ['py.typed']
 
 [project.optional-dependencies]
-mysql = [
-    'SQLAlchemy',
-    'PyMySQL',
-]
 # Needed to run map_async on functions defined in a notebook cell, which worker
 #  processes cannot import
 notebook = ['cloudpickle']
