@@ -391,3 +391,65 @@ class TestErrorCollection:
         many.get(Session).map_async(_mp_worker.double_score, _worker_num=2,
                                     _calibrate=False)
         assert len(many.get(Session)['doubled']) == 12
+
+
+class TestWorkerThreadBudget:
+    """Each worker gets its share of the cores, not all of them."""
+
+    def test_cores_are_divided_among_workers(self, many):
+        import os
+
+        from entarchy.core.entity import _worker_thread_budget
+
+        worker_num = 2
+        many.get(Session).map_async(_mp_worker.record_thread_budget,
+                                    _worker_num=worker_num, _calibrate=False)
+
+        expected = str(_worker_thread_budget(worker_num))
+        state = many.get(Session)[['env_OMP_NUM_THREADS', 'env_OPENBLAS_NUM_THREADS',
+                                   'env_MKL_NUM_THREADS']]
+        for column in state:
+            assert set(state[column]) == {expected}, column
+        assert int(expected) == max(1, os.cpu_count() // worker_num)
+
+    def test_blas_actually_runs_with_the_budget(self, many):
+        pytest.importorskip('threadpoolctl')
+
+        from entarchy.core.entity import _worker_thread_budget
+
+        many.get(Session).map_async(_mp_worker.record_thread_budget,
+                                    _worker_num=2, _calibrate=False)
+
+        threads = many.get(Session)['blas_threads'].astype(int)
+        assert (threads <= _worker_thread_budget(2)).all()
+        assert (threads >= 1).all()
+
+    def test_a_thread_count_the_user_set_wins(self, many, monkeypatch):
+        """An explicit choice is never second-guessed."""
+        monkeypatch.setenv('OMP_NUM_THREADS', '3')
+
+        many.get(Session).map_async(_mp_worker.record_thread_budget,
+                                    _worker_num=2, _calibrate=False)
+
+        assert set(many.get(Session)['env_OMP_NUM_THREADS']) == {'3'}
+        # The others were not set by the user, so they still get the budget
+        assert set(many.get(Session)['env_OPENBLAS_NUM_THREADS']) != {'unset'}
+
+    def test_the_parent_environment_is_left_as_it_was(self, many):
+        import os
+
+        names = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')
+        before = {name: os.environ.get(name) for name in names}
+
+        many.get(Session).map_async(_mp_worker.record_thread_budget,
+                                    _worker_num=2, _calibrate=False)
+
+        assert {name: os.environ.get(name) for name in names} == before
+
+    def test_the_pool_says_what_it_gave_each_worker(self, many, capsys):
+        from entarchy.core.entity import _worker_thread_budget
+
+        many.get(Session).map_async(_mp_worker.record_thread_budget,
+                                    _worker_num=2, _calibrate=False)
+
+        assert f'{_worker_thread_budget(2)} BLAS threads each' in capsys.readouterr().out

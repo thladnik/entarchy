@@ -57,6 +57,9 @@ notebook = ['cloudpickle']
 asdf = ['asdf']
 dev = ['pip-tools', 'pytest', 'build', 'twine',
        'cloudpickle', 'nbformat', 'nbclient', 'ipykernel', 'asdf',
+       # map_async caps each worker's BLAS threads through the environment; with
+       #  this installed it also caps a BLAS the worker had already loaded
+       'threadpoolctl',
        # tests/test_typing.py asks it what an editor would infer; the suite
        #  skips those tests where it is not installed
        'pyright']

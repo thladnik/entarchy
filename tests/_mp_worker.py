@@ -91,3 +91,20 @@ def record_order(entity):
     import time
 
     entity['processed_at'] = time.perf_counter_ns()
+
+
+def record_thread_budget(session):
+    """Record the thread count this worker was handed, as the environment and
+    as what the BLAS actually runs with."""
+    import os
+
+    for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+        session[f'env_{name}'] = os.environ.get(name, 'unset')
+    session['pid'] = os.getpid()
+
+    try:
+        from threadpoolctl import threadpool_info
+        counts = [pool['num_threads'] for pool in threadpool_info()]
+        session['blas_threads'] = max(counts) if counts else -1
+    except ImportError:
+        session['blas_threads'] = -1

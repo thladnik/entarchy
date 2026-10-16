@@ -1863,7 +1863,12 @@ class Collection(Generic[EntityT]):
                 argument, followed by **kwargs. It must be importable by name, because
                 workers are started with the 'spawn' method.
             _worker_num (int): Number of worker processes (default: CPU count - 2,
-                at least 1, never more than the number of entities).
+                at least 1, never more than the number of entities). The cores
+                are divided among them: each worker's BLAS and OpenMP thread
+                count is set to cpu_count // _worker_num, unless OMP_NUM_THREADS
+                or its OpenBLAS/MKL equivalents are already set, which always
+                wins. Without this every worker starts one thread per core and
+                they trample each other.
             _chunk_size (int): Number of tasks handed to a worker at a time.
             _use_gpu (bool): Pass a '_use_gpu_device' keyword to the function, pinning
                 one CUDA device per worker.
@@ -2038,7 +2043,8 @@ class Collection(Generic[EntityT]):
             if remaining:
                 pool, was_running = _get_worker_pool(self.entarchy, _worker_num, by_value)
                 print(f'{"Reuse" if was_running else "Start"} worker pool '
-                      f'({_worker_num} workers, spawn, chunk size {_chunk_size}'
+                      f'({_worker_num} workers, spawn, chunk size {_chunk_size}, '
+                      f'{_POOL_CACHE.get("thread_budget")} BLAS threads each'
                       f'{", by value" if by_value else ""})')
 
                 # The function and its arguments are identical for every task, so
@@ -2297,6 +2303,35 @@ POOL_CALIBRATION_SAMPLE = 3
 #  entities that share a parent together in one worker.
 POOL_CHUNKS_PER_WORKER = 8
 
+# Where OpenBLAS, MKL and OpenMP read their thread count from. They read it when
+#  the library loads, so it has to be in the environment before a worker is
+#  spawned; a worker started with it unset starts one thread per core.
+THREAD_COUNT_VARIABLES = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')
+
+
+def _worker_thread_budget(worker_num: int) -> int:
+    """How many BLAS threads each of `worker_num` workers may start.
+
+    Left alone, every worker believes it owns the machine. Twenty workers on a
+    128-core node each started 128 OpenBLAS threads - 2560 threads spin-waiting
+    on 128 cores - and map_async over a GEMM-heavy function came out slower
+    than map, whose single process had the whole machine to itself. Measured
+    on the CMN receptive field fit: 0.8 s per ROI against 0.4 s serially.
+    Dividing the cores among the workers is what a serial run already had.
+    """
+    import os
+
+    return max(1, (os.cpu_count() or 1) // max(1, worker_num))
+
+
+def _thread_environment(budget: int) -> dict[str, str]:
+    """Thread-count variables to set for spawned workers: only the ones the
+    caller has not set themselves, so an explicit choice always wins."""
+    import os
+
+    return {name: str(budget) for name in THREAD_COUNT_VARIABLES
+            if name not in os.environ}
+
 
 def _defined_interactively(obj: Any) -> bool:
     """Was this object defined in an interactive session (a notebook cell or REPL)?
@@ -2352,13 +2387,25 @@ def _for_workers(payload: Any, by_value: bool) -> Any:
     return _ByValue(payload) if by_value else payload
 
 
-def _init_map_worker(_entarchy: Entarchy, _worker_counter) -> None:
+def _init_map_worker(_entarchy: Entarchy, _worker_counter, thread_budget: int = None) -> None:
     """Pool initializer: set up one Entarchy per worker process.
 
     Only state that stays valid across map_async calls is bound here, so the pool
     can be reused. The function, its arguments and the entity type travel with
     each task.
     """
+    # The environment variables set before spawning cover libraries loaded
+    #  afterwards; this covers any BLAS a worker had already loaded, and is the
+    #  only lever where the variables are not honoured. The limiter object has
+    #  to stay alive for the limit to hold.
+    thread_limits = None
+    if thread_budget is not None:
+        try:
+            from threadpoolctl import threadpool_limits
+            thread_limits = threadpool_limits(limits=thread_budget)
+        except ImportError:
+            pass
+
     worker_index = 0
     if _worker_counter is not None:
         with _worker_counter.get_lock():
@@ -2370,6 +2417,7 @@ def _init_map_worker(_entarchy: Entarchy, _worker_counter) -> None:
         'entarchy': _entarchy,
         'worker_index': worker_index,
         'last_parent_uuid': None,
+        'thread_limits': thread_limits,
     })
 
     atexit.register(_close_map_worker)
@@ -2458,13 +2506,25 @@ def _get_worker_pool(_entarchy: Entarchy, worker_num: int, by_value: bool = Fals
     # Only one pool is kept alive at a time
     shutdown_worker_pool()
 
+    import os
+
     ctx = mp.get_context('spawn')
     counter = ctx.Value('i', 0)
-    pool = ctx.Pool(processes=worker_num,
-                    initializer=_init_map_worker,
-                    initargs=(_for_workers(_entarchy, by_value), counter))
+    budget = _worker_thread_budget(worker_num)
 
-    _POOL_CACHE.update({'key': key, 'pool': pool})
+    # Children inherit the environment at spawn, which is the only moment the
+    #  BLAS thread count can still be set. The parent's own is put back after.
+    added = _thread_environment(budget)
+    os.environ.update(added)
+    try:
+        pool = ctx.Pool(processes=worker_num,
+                        initializer=_init_map_worker,
+                        initargs=(_for_workers(_entarchy, by_value), counter, budget))
+    finally:
+        for name in added:
+            os.environ.pop(name, None)
+
+    _POOL_CACHE.update({'key': key, 'pool': pool, 'thread_budget': budget})
     return pool, False
 
 
