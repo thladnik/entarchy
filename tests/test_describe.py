@@ -300,7 +300,8 @@ class TestEntityDescribe:
         assert 'Roi_0' in text and 'attributes' in text and 'mean_response' in text
 
         markup = description._repr_html_()
-        assert '<table' in markup and 'mean_response' in markup
+        assert 'mean_response' in markup
+        assert '<table' not in markup
 
 
 class TestCollectionDescribe:
@@ -716,7 +717,8 @@ class TestEntarchyDescribe:
         assert 'Roi' in text and 'mean_response' in text and 'storage' in text
 
         markup = description._repr_html_()
-        assert '<table' in markup and 'mean_response' in markup
+        assert 'mean_response' in markup
+        assert '<table' not in markup
 
 
 class TestEntarchyStorageQueries:

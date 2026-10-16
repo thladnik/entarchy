@@ -307,3 +307,60 @@ class TestCollectionPreview:
 
     def test_empty_collection(self, many):
         assert many.get(Session, 'index > 99').preview().empty
+
+
+class TestNoTableMarkup:
+    """Every rich repr lays itself out in CSS rather than as a <table>.
+
+    PyCharm's notebook viewer selects the bare `table` element out of a cell's
+    HTML, concludes the output is a pandas DataFrame, and asks the kernel for
+    the .shape of whatever produced it. Nothing here has one, so a cell that
+    should have shown a collection printed
+
+        _jb_get_info_command got exception:  'RoiCollection' object has no
+        attribute 'shape'
+
+    instead. There is no halfway house - after shape it wants head(), dtypes,
+    to_html() and to_csv() - so the fix is to not look like a table. These
+    guard the property that matters rather than the markup that implements it.
+    """
+
+    MARKUP = ('<table', '<tr', '<td', '<th')
+
+    def _assert_no_table(self, rendered):
+        found = [tag for tag in self.MARKUP if tag in rendered]
+        assert not found, f'table markup back in a repr: {found}'
+
+    def test_an_entity(self, many):
+        self._assert_no_table(many.get(Session)[0]._repr_html_())
+
+    def test_a_collection(self, many):
+        self._assert_no_table(many.get(Session)._repr_html_())
+
+    def test_an_empty_collection(self, many):
+        self._assert_no_table(many.get(Session, 'index > 99')._repr_html_())
+
+    def test_an_entity_describe(self, many):
+        self._assert_no_table(many.get(Session)[0].describe()._repr_html_())
+
+    def test_a_collection_describe(self, many):
+        self._assert_no_table(many.get(Session).describe()._repr_html_())
+
+    def test_an_entarchy_describe(self, many):
+        self._assert_no_table(many.describe()._repr_html_())
+
+    def test_the_fallback(self, many, monkeypatch):
+        """Even the last resort, which is the one path that cannot be styled."""
+        collection = many.get(Session)
+        monkeypatch.setattr(type(collection), '__len__',
+                            lambda self: (_ for _ in ()).throw(RuntimeError('boom')))
+
+        self._assert_no_table(collection._repr_html_())
+
+    def test_the_layout_is_still_a_table_in_css(self, many):
+        """Not looking like one must not mean not lining up like one."""
+        rendered = many.get(Session)._repr_html_()
+
+        assert 'display:table' in rendered
+        assert 'display:table-row' in rendered
+        assert 'display:table-cell' in rendered

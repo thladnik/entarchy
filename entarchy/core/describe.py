@@ -59,15 +59,20 @@ _SECTION_ORDER = ('entities', 'attributes', 'links', 'media',
                   'children', 'storage', 'ancestry')
 
 
-def human_bytes(count: int) -> str:
+def human_bytes(count: int, force_unit: str = None) -> str:
     """A byte count as something a reader takes in at a glance."""
     if count is None:
         return ''
 
     size = float(count)
     for unit in ('B', 'kB', 'MB', 'GB'):
+
+        if force_unit == unit:
+            return f'{size:.3f} {unit}'
+        
         if abs(size) < 1024 or unit == 'GB':
             return f'{size:.0f} {unit}' if unit == 'B' else f'{size:.1f} {unit}'
+
         size /= 1024
 
 
@@ -83,6 +88,26 @@ def short_value(value: Any) -> str:
         return f'{text[:_VALUE_WIDTH - 3]}...'
 
     return text
+
+
+
+# Rows of a section shown in a notebook before it is truncated. to_html() used
+#  to elide the middle of anything longer; showing the front and saying how much
+#  was left is easier to read, and these sections are sorted.
+HTML_SECTION_ROWS = 40
+
+
+def _frame_grid_rows(frame: pd.DataFrame) -> list:
+    """A DataFrame as grid rows: a header, then the values, all escaped."""
+    header = [('text-align:left;color:#888;padding-right:12px', html.escape(str(name)))
+              for name in frame.columns]
+
+    rows = [header]
+    for values in frame.head(HTML_SECTION_ROWS).itertuples(index=False):
+        rows.append([('padding-right:12px;font-family:monospace', html.escape(str(value)))
+                     for value in values])
+
+    return rows
 
 
 class Description:
@@ -208,22 +233,29 @@ class Description:
 
     def _repr_html_(self) -> str:
         try:
-            head = ''.join(
-                f'<tr><td style="text-align:right;color:#888;padding-right:8px">'
-                f'{html.escape(str(key))}</td>'
-                f'<td style="font-family:monospace">{html.escape(str(value))}</td></tr>'
-                for key, value in self._headline.items())
+            # Laid out with CSS rather than as a <table>, for the reason given
+            #  in entity.py: PyCharm's notebook viewer takes any table in a
+            #  cell's HTML for a DataFrame and asks the kernel for its shape
+            from .entity import LABEL_CELL, VALUE_CELL, _grid_html
+
+            head = [[(LABEL_CELL, html.escape(str(key))),
+                     (VALUE_CELL, html.escape(str(value)))]
+                    for key, value in self._headline.items()]
 
             parts = [f'<div><b>{html.escape(self._subject)}</b>'
-                     f'<table style="border:none">{head}</table>']
+                     f'{_grid_html(head)}']
 
             for name in self._ordered_sections():
                 frame = self._sections[name]
                 parts.append(
                     f'<div style="margin-top:8px;color:#888;font-size:90%">'
                     f'{html.escape(name)} &middot; {len(frame)}</div>')
-                parts.append(frame.to_html(index=False, escape=True,
-                                           max_rows=40, border=0))
+                parts.append(_grid_html(_frame_grid_rows(frame)))
+
+                if len(frame) > HTML_SECTION_ROWS:
+                    parts.append(
+                        f'<div style="color:#888;font-size:90%">showing '
+                        f'{HTML_SECTION_ROWS} of {len(frame)}</div>')
 
             if len(self._sections) == 0:
                 parts.append('<div style="color:#888;font-size:90%">'
@@ -269,7 +301,7 @@ def attribute_rows(metadata, values: dict = None,
         rows.append({
             'name': name,
             'type': 'media' if name in media else (data_type or ''),
-            'bytes': human_bytes(data_size),
+            'bytes': human_bytes(data_size, force_unit='MB'), # force unit to keep result sortable
             'value': (short_value(values[name]) if name in values else ''),
         })
 

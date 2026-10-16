@@ -33,6 +33,33 @@ if TYPE_CHECKING:
 EntityT = TypeVar('EntityT', bound='Entity')
 
 
+
+# A table drawn in CSS rather than in markup. PyCharm's notebook viewer takes
+#  any <table> in a cell's HTML for a pandas DataFrame and asks the kernel for
+#  the .shape of whatever produced it - so an entity or a collection printed
+#  "no attribute 'shape'" where its repr should have been. These three
+#  declarations lay out identically and are not mistaken for one.
+GRID = 'display:table'
+GRID_ROW = 'display:table-row'
+GRID_CELL = 'display:table-cell'
+
+# Column styles used by more than one repr
+LABEL_CELL = 'text-align:right;color:#888;padding-right:8px'
+VALUE_CELL = 'font-family:monospace'
+
+
+def _grid_html(rows: list) -> str:
+    """Rows of (style, html) cells, laid out as a table without being one.
+
+    The cell contents are inserted as they are: every caller escapes before it
+    gets here, because some of them deliberately pass markup.
+    """
+    return f'<div style="{GRID}">' + ''.join(
+        f'<div style="{GRID_ROW}">' + ''.join(
+            f'<div style="{GRID_CELL};{style}">{cell}</div>' for style, cell in row)
+        + '</div>' for row in rows) + '</div>'
+
+
 class Entity(object):
     """Base class for all entities in the Entarchy system.
     This class can be extended to create specific types of entities.
@@ -459,17 +486,15 @@ class Entity(object):
                 # A backend without links, or one that cannot be reached
                 counts = {}
 
-            body = ''.join(
-                f'<tr><td style="text-align:right;color:#888;padding-right:8px">{html.escape(str(k))}</td>'
-                f'<td style="font-family:monospace">{html.escape(str(v))}</td></tr>'
-                for k, v in rows)
+            grid = [[(LABEL_CELL, html.escape(str(k))),
+                     (VALUE_CELL, html.escape(str(v)))]
+                    for k, v in rows]
+            grid.append([(f'{LABEL_CELL};vertical-align:top',
+                          f'{len(names)} attributes'), ('', listing)])
+            grid.extend(_links_grid_rows(counts))
 
             return (f'<div>'
-                    f'<table style="border:none">{body}'
-                    f'<tr><td style="text-align:right;color:#888;padding-right:8px;vertical-align:top">'
-                    f'{len(names)} attributes</td><td>{listing}</td></tr>'
-                    f'{_links_row_html(counts)}'
-                    f'</table>'
+                    f'{_grid_html(grid)}'
                     f'<div style="color:#888;font-size:90%">read values with '
                     f'<code>entity[&#39;name&#39;]</code>'
                     f'{", links with <code>entity.links(&#39;kind&#39;)</code>" if counts else ""}'
@@ -1187,9 +1212,11 @@ class Collection(Generic[EntityT]):
             if count == 0:
                 body = ('<div style="color:#888;font-size:90%">no matching entities</div>')
             else:
-                cells = ''.join(
-                    f'<tr><td style="font-family:monospace;padding-right:12px">{html.escape(str(_id))}</td>'
-                    f'<td style="font-family:monospace;color:#888">{html.escape(str(_uuid))}</td></tr>'
+                grid = [[('text-align:left;color:#888;padding-right:12px', 'id'),
+                         ('text-align:left;color:#888', 'uuid')]]
+                grid.extend(
+                    [('font-family:monospace;padding-right:12px', html.escape(str(_id))),
+                     ('font-family:monospace;color:#888', html.escape(str(_uuid)))]
                     for _uuid, _id in rows)
                 # Which rows these are depends entirely on the order, and an
                 #  unsorted collection is in uuid order rather than in no order
@@ -1201,10 +1228,7 @@ class Collection(Generic[EntityT]):
                         if count > len(rows) else
                         f'<div style="color:#888;font-size:90%">ordered by '
                         f'<code>{html.escape(self.order)}</code></div>')
-                body = (f'<table style="border:none">'
-                        f'<tr><th style="text-align:left;color:#888">id</th>'
-                        f'<th style="text-align:left;color:#888">uuid</th></tr>'
-                        f'{cells}</table>{more}')
+                body = f'{_grid_html(grid)}{more}'
 
             return (f'<div>'
                     f'<b>{html.escape(str(title))}</b> '
@@ -2232,10 +2256,10 @@ def _attribute_name_of(key: str) -> str:
     return key
 
 
-def _links_row_html(counts: dict[str, int]) -> str:
+def _links_grid_rows(counts: dict[str, int]) -> list:
     """The link kinds row of the entity repr, or nothing when there are none."""
     if not counts:
-        return ''
+        return []
 
     shown = list(counts)[:_HTML_MAX_LINK_TYPES]
     listing = ', '.join(f'{html.escape(str(name))} '
@@ -2247,8 +2271,7 @@ def _links_row_html(counts: dict[str, int]) -> str:
 
     label = f'{len(counts)} link {"kind" if len(counts) == 1 else "kinds"}'
 
-    return (f'<tr><td style="text-align:right;color:#888;padding-right:8px;'
-            f'vertical-align:top">{label}</td><td>{listing}</td></tr>')
+    return [[(f'{LABEL_CELL};vertical-align:top', label), ('', listing)]]
 
 
 def _fallback_html(obj: Any) -> str:
