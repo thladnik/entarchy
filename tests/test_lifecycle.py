@@ -20,7 +20,9 @@ class TestCreate:
     def test_yaml_is_valid_and_complete(self, ent):
         config = yaml.safe_load(open(os.path.join(ent.path, 'entarchy.yaml')))
         assert config['entarchy_uuid'] == ent.root.uuid
-        assert config['hierarchy'] == ent.hierarchy
+        # The hierarchy lives in the store, not in the file
+        assert 'hierarchy' not in config
+        assert ent.hierarchy['Subject'] == {'Session': {}}
 
     def test_reopen(self, ent):
         reopened = LabArchy(ent.path)

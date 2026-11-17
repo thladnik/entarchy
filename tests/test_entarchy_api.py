@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 import yaml
 
+import entarchy
+
 from conftest import LabArchy, Session, Subject
 
 
@@ -46,10 +48,23 @@ class TestConfigValidation:
         with pytest.raises(RuntimeError, match='Implementation version'):
             LabArchy(ent.path)
 
-    def test_hierarchy_mismatch_raises(self, ent):
-        rewrite_config(ent.path, hierarchy={'Subject': {}})
-        with pytest.raises(RuntimeError, match='hierarchy'):
-            LabArchy(ent.path)
+    def test_a_declared_type_the_store_lacks_raises(self, ent):
+        """The hierarchy lives in the store; a class the store has no type for
+        is refused with the call that would add it."""
+        class Trial(entarchy.Entity):
+            pass
+
+        with pytest.raises(RuntimeError, match=r'Trial that .* does not have.*add_entity_type\(Trial\)'):
+            LabArchy(ent.path, entity_types=[Trial])
+
+    def test_a_declared_parent_that_differs_from_the_store_raises(self, ent):
+        ent.add_entity_type('Trial', parent=Subject)
+
+        class Trial(entarchy.Entity):   # declared as a root, stored under Subject
+            pass
+
+        with pytest.raises(RuntimeError, match='declares Trial under the root, but .* under Subject'):
+            LabArchy(ent.path, entity_types=[Trial])
 
     def test_missing_config_raises(self, tmp_path):
         empty = tmp_path / 'empty'
@@ -98,10 +113,10 @@ class TestEntityTypes:
         class BadArchy(entarchy.Entarchy):
             _implementation_version = '0.1'
             _implementation_compat_version_list = ['0.1']
-            _hierarchy_root_type = Dup
+            _entity_types = (Dup,)
 
         with pytest.raises(ValueError, match='already in the hierarchy'):
-            BadArchy._resolve_hierarchy()
+            BadArchy._declared_hierarchy()
 
 
 class TestRegistry:

@@ -23,7 +23,9 @@ If parallelization is required for some analysis steps `MySQL` is the better fit
 
 ### Structure
 
-An entarchy is defined entirely in Python:
+The entity types and which may sit under which - the hierarchy - live in the
+entarchy itself. There are two ways to say what they are. A schema package
+declares them as classes, which is also where entities get their methods:
 
 ```python
 import entarchy 
@@ -43,17 +45,17 @@ class Stimulus(entarchy.Entity):
 class Response(entarchy.Entity):
     pass
 
-# Define entarchy and set Experiment to be first level
-class MyEntarchy(entarchy.Entarchy):
-    _hierarchy_root_type = Experiment
-
 Experiment.add_child_entity_type(Participant)
 Participant.add_child_entity_type(Session)
 Session.add_child_entity_type(Stimulus)
 Session.add_child_entity_type(Response)
+
+# The entarchy names its root types; the children declared on them follow
+class MyEntarchy(entarchy.Entarchy):
+    _entity_types = (Experiment,)
 ```
 
-This establishes an simple entarchy with a hierarchy that looks like this:
+This establishes a simple entarchy with a hierarchy that looks like this:
 
 ```
 Experiment
@@ -65,7 +67,7 @@ Experiment
 
 The entarchy can now be built by adding entity data to it. Every entity is
 added under its parent with `add_child`, starting from `ent.root`, which takes
-the `_hierarchy_root_type`:
+the root types:
 
 ```python
 ent = MyEntarchy.create('path/to/analysis/folder/', 'SQLiteBackend',
@@ -93,6 +95,37 @@ with ent:
 
 An entity constructed beforehand, `Session(ent, _id='01')`, can be passed to
 `add_child` in place of the class and id.
+
+#### Growing the hierarchy
+
+The other way needs no class at all. A plain entarchy starts empty and takes
+types as the work needs them, each as a root or under a type already there:
+
+```python
+ent = entarchy.Entarchy.create('path/to/folder/', 'SQLiteBackend', {'dbname': 'entarchy.db'})
+
+Subject = ent.add_entity_type('Subject')
+Session = ent.add_entity_type('Session', parent=Subject)
+Stimulus = ent.add_entity_type('Stimulus')              # a second root
+
+ent.root.add_child(Subject, 'A').add_child(Session, '01')
+```
+
+A type added by name gets a plain `Entity` subclass of that name, which is what
+`add_entity_type` returns and what `ent.get('Session')` produces. Types are only
+ever added: there is no renaming, moving or removing a type once entities of it
+exist, and `add_entity_type` refuses to put an existing type under a different
+parent.
+
+The two ways meet in the store. `MyEntarchy.create(...)` writes the declared
+classes' types into it; opening an entarchy binds each declared class to the
+stored type of its name, and a stored type with no class bound to it - because
+it was added by name, or because the schema package that defined it is not
+imported - gets a generated class and stays usable. Opening with a class the
+store has no type for is an error, with the call that adds it; a schema package
+whose hierarchy grew a level calls `ent.add_entity_type(Experiment)` once on an
+older store, and the declared children follow. Classes can also be bound
+without a subclass: `entarchy.Entarchy(path, entity_types=[Subject, Stimulus])`.
 
 ### Filter expressions
 

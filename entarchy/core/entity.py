@@ -584,13 +584,14 @@ class Entity(object):
     def child_entity_types(self) -> tuple[Type[Entity], ...]:
         """The entity types that may be added under this entity.
 
-        What `add_child_entity_type` registered on this entity's class. For the
-        root entity it is the entarchy's `_hierarchy_root_type`, which is where
-        the hierarchy hangs off the root rather than being registered on it.
+        Read from the entarchy's stored hierarchy, not from the class: what a
+        class declares with `add_child_entity_type` is how a schema is written
+        down, but what this entarchy accepts is what is in its store. For the
+        root entity these are the root types.
         """
-        if isinstance(self, EntarchyEntity):
-            return (type(self.entarchy)._hierarchy_root_type,)
-        return tuple(type(self).get_child_entity_types() or ())
+        parent = None if isinstance(self, EntarchyEntity) else type(self).__name__
+        return tuple(self.entarchy.get_entity_type(name)
+                     for name in self.entarchy.child_type_names(parent))
 
     @overload
     def add_child(self, child: Type[EntityT], _id: str, /, **attributes: Any) -> EntityT: ...
@@ -608,12 +609,12 @@ class Entity(object):
         can be passed in place of the class; its parent must be this entity or
         not set yet.
 
-        The child's type must be one this entity's class registered with
-        `add_child_entity_type`; for the root entity, the entarchy's
-        `_hierarchy_root_type`. This is the only place the hierarchy is checked
-        when an entity is written: `Entarchy.add_new_entity` stores whatever
-        parent the entity was constructed with, and a wrong one is found only by
-        the queries that then fail to see the entity.
+        The child's type must be one the entarchy's stored hierarchy puts under
+        this entity's type; under the root entity, a root type. This is the only
+        place the hierarchy is checked when an entity is written:
+        `Entarchy.add_new_entity` stores whatever parent the entity was
+        constructed with, and a wrong one is found only by the queries that then
+        fail to see the entity.
 
         Outside a `with ent:` block the child is committed at once and its
         attributes right after, in a second commit. Inside, both go out at the
@@ -658,12 +659,12 @@ class Entity(object):
         if not (isinstance(child_type, type) and issubclass(child_type, Entity)):
             raise TypeError(f'{child_type!r} is not an Entity subclass.')
 
-        # Exact membership, not issubclass: the backend stores an entity's type by
-        #  class name and knows only the names in the resolved hierarchy, so a
-        #  subclass of a registered type cannot be stored at all - it would fail
-        #  deep in the write with a KeyError on its name
+        # By name, and exactly: the store knows types by class name alone, so a
+        #  class of the right name is that type whether or not it is the class
+        #  bound to it, and a subclass of a registered type is not stored at all -
+        #  it would fail deep in the write with a KeyError on its name
         allowed = self.child_entity_types()
-        if child_type not in allowed:
+        if child_type.__name__ not in {a.__name__ for a in allowed}:
             parent_name = type(self).__name__
             if not allowed:
                 raise TypeError(f'{child_type.__name__} cannot be a child of {parent_name}: '

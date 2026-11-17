@@ -1142,6 +1142,27 @@ class SQLBackend(Backend):
         return True
 
     @_retry_on_operational_failure
+    def get_type_hierarchy(self) -> list[tuple[str, str | None]]:
+        with self.sql_session as session:
+            rows = session.query(EntityTypeTable).order_by(EntityTypeTable.pk).all()
+            names = {row.pk: row.name for row in rows}
+            return [(row.name, names.get(row.parent_pk)) for row in rows]
+
+    @_retry_on_operational_failure
+    def add_entity_type(self, name: str, parent_name: str | None) -> None:
+        with self.sql_session as session:
+            if session.query(EntityTypeTable).filter(EntityTypeTable.name == name).count():
+                raise ValueError(f'Entity type {name} already exists.')
+            parent_row = None
+            if parent_name is not None:
+                parent_row = session.query(EntityTypeTable).filter(
+                    EntityTypeTable.name == parent_name).one_or_none()
+                if parent_row is None:
+                    raise ValueError(f'Parent entity type {parent_name} does not exist.')
+            session.add(EntityTypeTable(name=name, parent=parent_row))
+            session.commit()
+
+    @_retry_on_operational_failure
     def delete(self, confirm: bool = False):
 
         if not confirm:

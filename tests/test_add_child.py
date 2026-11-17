@@ -23,7 +23,7 @@ class TestCreatesTheChild:
         assert fetched['strain'] == 'wt'
         assert fetched['age'] == 12
 
-    def test_the_root_takes_the_hierarchy_root_type(self, ent):
+    def test_the_root_takes_the_root_types(self, ent):
         subject = ent.root.add_child(Subject, 'subj_1')
 
         assert subject.parent.uuid == ent.root.uuid
@@ -83,7 +83,7 @@ class TestTheTypeCheck:
         with pytest.raises(TypeError, match='Session has no child entity types'):
             session.add_child(Session, 'sess_2')
 
-    def test_only_the_hierarchy_root_type_goes_under_the_root(self, ent):
+    def test_only_a_root_type_goes_under_the_root(self, ent):
         with pytest.raises(TypeError, match='Session cannot be a child of EntarchyEntity'):
             ent.root.add_child(Session, 'sess_1')
 

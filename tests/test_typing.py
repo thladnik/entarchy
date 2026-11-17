@@ -38,7 +38,7 @@ Layer.add_child_entity_type(Roi)
 
 class Archy(entarchy.Entarchy):
     _implementation_version = '0.1'
-    _hierarchy_root_type = Layer
+    _entity_types = (Layer,)
 
 
 def probe(ent: Archy) -> None:

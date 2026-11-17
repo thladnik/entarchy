@@ -124,6 +124,9 @@ class ArchiveBackend(SQLiteBackend):
     def create_type_hierarchy(self, _hierarchy: dict[str, Any]) -> bool:
         self._refuse('create the type hierarchy')
 
+    def add_entity_type(self, name: str, parent_name) -> None:
+        self._refuse(f'add the entity type "{name}"')
+
     def delete(self, confirm: bool = False):
         self._refuse('delete storage')
 

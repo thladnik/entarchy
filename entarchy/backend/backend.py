@@ -61,6 +61,14 @@ class Backend(object):
     def create_type_hierarchy(self, _hierarchy: dict[str, ...]) -> bool:
         raise NotImplementedError('')
 
+    def get_type_hierarchy(self) -> list[tuple[str, str | None]]:
+        """Every stored entity type with its parent's name (None for a root), in
+        the order they were added."""
+        raise NotImplementedError('')
+
+    def add_entity_type(self, name: str, parent_name: str | None) -> None:
+        raise NotImplementedError('')
+
     def delete(self, confirm: bool = False):
         return NotImplementedError('')
 

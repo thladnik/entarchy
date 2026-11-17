@@ -805,9 +805,9 @@ def main(argv=None):
             entarchy_cls = getattr(importlib.import_module('.'.join(parts[:-1])), parts[-1])
 
             source_ent = entarchy_cls(args.source)
-            entity_type = source_ent._entity_map.get(args.type)
+            entity_type = source_ent._type_map().get(args.type)
             if entity_type is None:
-                available = ', '.join(sorted(source_ent._entity_map))
+                available = ', '.join(sorted(source_ent._type_map()))
                 raise SystemExit(f'Unknown entity type "{args.type}". Available: {available}')
 
             collection = source_ent.get(entity_type, args.query) if args.query \

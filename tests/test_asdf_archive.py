@@ -626,10 +626,10 @@ class TestRebuildIndex:
         ent.backend.close()
         os.remove(os.path.join(destination, INDEX_NAME))
 
-        broken = DeepArchy(destination)
+        # Opening reads the type hierarchy from the index, so the missing file
+        #  is met right there rather than at the first query
         with pytest.raises(FileNotFoundError, match='rebuild'):
-            # Collections are lazy, so the index is only opened on evaluation
-            len(broken.get(Roi))
+            DeepArchy(destination)
 
 
 class TestMediaFiles:

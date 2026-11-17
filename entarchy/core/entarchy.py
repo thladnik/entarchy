@@ -7,7 +7,7 @@ import pathlib
 import pprint
 import sys
 import uuid
-from typing import Any, Callable, Type, TYPE_CHECKING, Union, cast, overload
+from typing import Any, Callable, Iterable, Type, TYPE_CHECKING, Union, cast, overload
 
 import alive_progress
 import yaml
@@ -27,6 +27,53 @@ if TYPE_CHECKING:
     from ..backend.sqlite import SQLiteBackend
 
 
+BUILTIN_TYPE_MAP: dict[str, Type[Entity]] = {'EntarchyEntity': EntarchyEntity,
+                                             'AnalysisEntity': AnalysisEntity,
+                                             'LinkEntity': LinkEntity}
+BUILTIN_TYPES = tuple(BUILTIN_TYPE_MAP)
+
+
+def _builtin_base(entity_type: type) -> type:
+    for base in (EntarchyEntity, AnalysisEntity, LinkEntity):
+        if issubclass(entity_type, base):
+            return base
+    return Entity
+
+
+def _declared_tree(entity_types: Iterable[Type[Entity]]
+                   ) -> tuple[dict[str, str | None], dict[str, Type[Entity]]]:
+    """Walk classes and the children they declare: name -> parent name (None for
+    a root), and name -> class. Two classes of one name are an error, since
+    the store knows types by name alone."""
+    parents: dict[str, str | None] = {}
+    classes: dict[str, Type[Entity]] = {}
+
+    def walk(entity_type: Type[Entity], parent: str | None):
+        name = entity_type.__name__
+        if name in classes:
+            if classes[name] is entity_type and parents[name] == parent:
+                return
+            raise ValueError(f'Entity type {name} is already in the hierarchy. '
+                             f'Circular reference or duplicate name? Entity names must be unique.')
+        if name in BUILTIN_TYPES:
+            raise ValueError(f'{name} is a built-in type and cannot be declared.')
+        classes[name] = entity_type
+        parents[name] = parent
+        for child in entity_type.get_child_entity_types() or ():
+            walk(child, name)
+
+    for root in entity_types:
+        walk(root, None)
+
+    return parents, classes
+
+
+def _generated_type(name: str) -> Type[Entity]:
+    """A plain Entity subclass for a stored type no class was bound to."""
+    return type(name, (Entity,), {'__module__': __name__, '_generated': True,
+                                  '__doc__': f'Stored entity type {name}; no class was bound to it.'})
+
+
 class Entarchy(object):
     """Entarchy is a class that represents a system of hierarchically organized entities.
     """
@@ -36,9 +83,15 @@ class Entarchy(object):
     #  inside a value read.
     _base_version: str = '0.2'
     _base_compat_version_list: list[str] = ['0.2']
-    _implementation_version: str
-    _implementation_compat_version_list: list[str]
-    _hierarchy_root_type: Type[Entity]
+    # A subclass stamps its own schema version; a plain Entarchy, whose schema is
+    #  whatever was added to it, has none to speak of
+    _implementation_version: str = '0.0'
+    _implementation_compat_version_list: list[str] = ['0.0']
+    # The entity classes this entarchy binds to the stored type hierarchy, by
+    #  name. Children declared on them with add_child_entity_type are followed,
+    #  so naming the roots is enough. The hierarchy itself lives in the store:
+    #  these only say which Python class an entity of a stored type becomes.
+    _entity_types: tuple[Type[Entity], ...] = ()
     max_blob_size: int = 10 * 1024 * 1024  # bytes (10MB)
 
     # TODO: Make this more generic, currently only MySQLBackend is supported:
@@ -49,14 +102,21 @@ class Entarchy(object):
     _current_analysis: Union[AnalysisEntity, None] = None
     _entarchy_entity: EntarchyEntity = None
 
-    def __init__(self, path: str, debug: bool = False):
+    def __init__(self, path: str, entity_types: Iterable[Type[Entity]] = (),
+                 debug: bool = False, _defer_types: bool = False):
+        """Open the entarchy at `path`.
+
+        `entity_types` binds further classes to stored types, beyond the ones
+        the class declares in `_entity_types`. A stored type with no class bound
+        to it is still usable: it gets a plain Entity subclass of that name.
+        """
         self._path = pathlib.Path(path).absolute().as_posix()
         self._debug = debug
 
-        # Resolve hierarchy
-        self._hierarchy = {}
-        self._entity_map = {}
-        self._hierarchy, self._entity_map = self._resolve_hierarchy()
+        self._bound_types: tuple[Type[Entity], ...] = tuple(self._entity_types) + tuple(entity_types)
+        # Read from the store on first use (or right below), never from the classes
+        self._type_parents: dict[str, str | None] | None = None
+        self._entity_map: dict[str, Type[Entity]] | None = None
 
         # Load configuration from path
         self._config = yaml.safe_load(open(os.path.join(path, 'entarchy.yaml'), 'r'))
@@ -74,10 +134,6 @@ class Entarchy(object):
                                f'is not compatible with current implementation version '
                                f'("{self._implementation_version}"). ')
 
-        if self._config['hierarchy'] != self._hierarchy:
-            raise RuntimeError('Entity type hierarchy in configuration does not match the implementation. '
-                               'This may be due to a corrupted configuration.')
-
         # Set up entities objects
         self._entities: dict[str, Entity] = {}
         self._entities_to_add: list[str] = []
@@ -89,6 +145,9 @@ class Entarchy(object):
         self._links_to_add: list[dict] = []
         self._pending_link_index: dict[tuple, str] = {}
 
+        # create() opens the store before its tables exist and loads afterwards
+        if not _defer_types:
+            self._load_types()
 
     def __contains__(self, item):
         if isinstance(item, Entity):
@@ -121,6 +180,11 @@ class Entarchy(object):
         state['_entities_to_update'] = []
         state['_links_to_add'] = []
         state['_pending_link_index'] = {}
+        # The type map may hold classes generated for stored types nobody bound,
+        #  which pickle cannot name. The bound classes travel, and a worker reads
+        #  the hierarchy again from its own connection on first use
+        state['_type_parents'] = None
+        state['_entity_map'] = None
         return state
 
     def __hash__(self):
@@ -164,8 +228,144 @@ class Entarchy(object):
         self._backend.debug = value
 
     @property
-    def hierarchy(self):
-        return self._hierarchy.copy()
+    def hierarchy(self) -> dict[str, Any]:
+        """The stored entity type hierarchy as nested dicts, roots at the top.
+
+        The three built-in types come first, each a root of its own; the
+        user's types follow in the order they were added.
+        """
+        parents = self._parents()
+        nested: dict[str, Any] = {}
+        branches = {None: nested}
+        for name, parent in parents.items():
+            branches[name] = branches[parent][name] = {}
+        return nested
+
+    @property
+    def entity_types(self) -> tuple[Type[Entity], ...]:
+        """The classes of the stored types, bound or generated, roots first."""
+        return tuple(self._type_map()[name] for name in self._parents()
+                     if name not in BUILTIN_TYPES)
+
+    def child_type_names(self, parent: str | None) -> list[str]:
+        """Names of the stored types directly under `parent`; the user's root
+        types for None."""
+        return [name for name, parent_name in self._parents().items()
+                if parent_name == parent and name not in BUILTIN_TYPES]
+
+    def add_entity_type(self, entity_type: Type[Entity] | str,
+                        parent: Type[Entity] | str | None = None) -> Type[Entity]:
+        """Add an entity type to the store, under `parent` or as a root, and return
+        its class.
+
+            Subject = ent.add_entity_type('Subject')
+            Session = ent.add_entity_type('Session', parent=Subject)
+            ent.add_entity_type(Experiment)      # a class, with the children
+                                                 #  declared on it
+
+        A class is bound to the type of its name; a string gets a generated
+        plain Entity subclass. Given a class, the child types it declares with
+        add_child_entity_type go in under it as well, recursively, so one call
+        adds a whole declared schema to a store that grew up without it.
+
+        Adding a type that is already there, under the same parent, changes
+        nothing and returns its class. Under a different parent it is an error:
+        types are only ever added, never moved, renamed or removed.
+        """
+        parents = self._parents()
+        type_map = self._type_map()
+
+        if isinstance(entity_type, str):
+            name, declared = entity_type, None
+        elif isinstance(entity_type, type) and issubclass(entity_type, Entity):
+            if issubclass(entity_type, (EntarchyEntity, AnalysisEntity, LinkEntity)):
+                raise TypeError(f'{entity_type.__name__} cannot be an entity type of the '
+                                f'hierarchy; it is {_builtin_base(entity_type).__name__}.')
+            name, declared = entity_type.__name__, entity_type
+        else:
+            raise TypeError(f'entity_type must be an Entity subclass or a name, '
+                            f'not {type(entity_type).__name__}.')
+
+        if name in BUILTIN_TYPES:
+            raise ValueError(f'{name} is a built-in type.')
+
+        if parent is None:
+            parent_name = None
+        else:
+            parent_name = parent if isinstance(parent, str) else parent.__name__
+            if parent_name not in parents or parent_name in BUILTIN_TYPES:
+                raise ValueError(f'Parent type {parent_name} is not in the hierarchy; '
+                                 f'add it first.')
+
+        if name in parents:
+            if parents[name] != parent_name:
+                raise ValueError(
+                    f'{name} is already in the hierarchy under '
+                    f'{parents[name] or "the root"}, not {parent_name or "the root"}. '
+                    f'Types are added, never moved.')
+            if declared is not None and type_map[name] is not declared \
+                    and not getattr(type_map[name], '_generated', False):
+                raise ValueError(f'{name} is already bound to {type_map[name]!r}.')
+        else:
+            self.backend.add_entity_type(name, parent_name)
+            parents[name] = parent_name
+
+        if declared is not None:
+            type_map[name] = declared
+        elif name not in type_map:
+            type_map[name] = _generated_type(name)
+
+        # The children a class declares come with it
+        for child in (declared.get_child_entity_types() or ()) if declared else ():
+            self.add_entity_type(child, parent=declared)
+
+        return type_map[name]
+
+    def _parents(self) -> dict[str, str | None]:
+        if self._type_parents is None:
+            self._load_types()
+        return self._type_parents
+
+    def _type_map(self) -> dict[str, Type[Entity]]:
+        if self._entity_map is None:
+            self._load_types()
+        return self._entity_map
+
+    def _load_types(self) -> None:
+        """Read the hierarchy from the store and bind the declared classes to it.
+
+        A class declared here but missing from the store is an error, with the
+        call that adds it. A stored type with no class gets a generated one.
+        """
+        stored = self.backend.get_type_hierarchy()
+        parents: dict[str, str | None] = {name: None for name in BUILTIN_TYPES}
+        parents.update({name: parent for name, parent in stored if name not in BUILTIN_TYPES})
+
+        declared_parents, declared_map = _declared_tree(self._bound_types)
+
+        for name, declared_parent in declared_parents.items():
+            if name not in parents:
+                where = f'parent={declared_parent}' if declared_parent else 'as a root'
+                raise RuntimeError(
+                    f'{type(self).__name__} declares an entity type {name} that '
+                    f'"{self._path}" does not have. Add it with '
+                    f'ent.add_entity_type({name}) ({where}), or open the entarchy '
+                    f'without that class.')
+            if parents[name] != declared_parent:
+                raise RuntimeError(
+                    f'{type(self).__name__} declares {name} under '
+                    f'{declared_parent or "the root"}, but in "{self._path}" it is '
+                    f'under {parents[name] or "the root"}. Types are never moved; '
+                    f'this entarchy was built with a different schema.')
+
+        type_map: dict[str, Type[Entity]] = dict(BUILTIN_TYPE_MAP)
+        for name in parents:
+            if name in type_map:
+                continue
+            type_map[name] = declared_map.get(name) or _generated_type(name)
+
+        self._type_parents = parents
+        self._entity_map = type_map
 
     @property
     def implementation_version(self):
@@ -203,31 +403,18 @@ class Entarchy(object):
         return self._entarchy_entity
 
     @classmethod
-    def _resolve_hierarchy(cls):
+    def _declared_hierarchy(cls, entity_types: Iterable[Type[Entity]] = ()):
+        """The hierarchy the classes declare, as create() will store it: the
+        nested dict and the name -> class map, built-in types included."""
+        parents, declared_map = _declared_tree(tuple(cls._entity_types) + tuple(entity_types))
 
-        def _resolve_hierarchy(entity_type, parent_dict, _entity_map):
+        hierarchy: dict[str, Any] = {name: {} for name in BUILTIN_TYPES}
+        branches = {None: hierarchy}
+        for name, parent in parents.items():
+            branches[name] = branches[parent][name] = {}
 
-            entity_name = entity_type.__name__
-
-            if entity_name in _entity_map:
-                raise ValueError(f'Entity type {entity_name} is already in the hierarchy. '
-                                 f'Circular reference or duplicate name? Entity names must be unique.')
-
-            _entity_map[entity_name] = entity_type
-
-            # Go through children
-            children = entity_type.get_child_entity_types()
-            if entity_name not in parent_dict:
-                parent_dict[entity_name] = {}
-            if children is None:
-                return
-            for child_type in children:
-                _resolve_hierarchy(child_type, parent_dict[entity_name], _entity_map)
-
-        # Run and return result
-        hierarchy = {'EntarchyEntity': {}, 'AnalysisEntity': {}, 'LinkEntity': {}}
-        entity_map = {'EntarchyEntity': EntarchyEntity,'AnalysisEntity': AnalysisEntity, 'LinkEntity': LinkEntity}
-        _resolve_hierarchy(cls._hierarchy_root_type, hierarchy, entity_map)
+        entity_map = dict(BUILTIN_TYPE_MAP)
+        entity_map.update(declared_map)
 
         return hierarchy, entity_map
 
@@ -260,18 +447,25 @@ class Entarchy(object):
                path: str,
                _backend: Backend | str,
                _backend_config: dict[str, Any] = None,
+               entity_types: Iterable[Type[Entity]] = (),
                **kwargs) -> Entarchy:
-        """Factory function to create an Entarchy instance from a given path.
+        """Create an entarchy at `path` and return it.
+
+        The store starts with the types the class declares in `_entity_types`,
+        plus `entity_types`, each with the children declared on it. A plain
+        `Entarchy.create(...)` starts with none; types are then added with
+        `add_entity_type` as the entarchy grows.
 
         Args:
             path (str): The path to the entarchy configuration directory.
             _backend (Backend): an entarchy.backend.Backend object or its string representation
             _backend_config (dict): dictionary for initialization of backend if _backend is str or type
+            entity_types: classes to bind and store, beyond `_entity_types`
         Returns:
             Entarchy:
         """
 
-        # Instantiate backend of necessary
+        # Instantiate backend if necessary
         if isinstance(_backend, str):
             if '.' in _backend:
                 _backend_path_parts = _backend.split('.')
@@ -282,8 +476,8 @@ class Entarchy(object):
 
             _backend = _backend_cls(path, **(_backend_config or {}), debug=False)
 
-        # Resolve hierarchy and add Analysis entity
-        hierarchy, entity_map = cls._resolve_hierarchy()
+        # What the classes declare is what the store starts with
+        hierarchy, entity_map = cls._declared_hierarchy(entity_types)
 
         # An existing path is refused because creating into it would write over
         #  whatever is there. An empty directory holds nothing to write over, and
@@ -306,14 +500,14 @@ class Entarchy(object):
             'implementation_version': cls._implementation_version,
             'backend': f'{_backend.__module__}.{_backend.__class__.__name__}',
             'backend_config': _backend.get_config(),
-            'hierarchy': hierarchy
         }
 
         with open(os.path.join(path, 'entarchy.yaml'), 'w') as f:
             yaml.safe_dump(_config, f)
 
-        # Create instance
-        ent = cls(path, **kwargs)
+        # Create instance. The type hierarchy is read from the store, which does
+        #  not exist yet, so that read is deferred until it has been written
+        ent = cls(path, entity_types=entity_types, _defer_types=True, **kwargs)
 
         # Reuse the backend instance that was already configured above,
         #  so credentials are not requested a second time
@@ -331,6 +525,7 @@ class Entarchy(object):
         res = ent.backend.create_type_hierarchy(hierarchy)
         if not res:
             raise RuntimeError('Failed to create entity type hierarchy in backend.')
+        ent._load_types()
 
         # Create entarchy entity
         with ent:
@@ -686,7 +881,7 @@ class Entarchy(object):
         """
 
         # Get type from map
-        entity_type = self._entity_map.get(entity_type_name, None)
+        entity_type = self._type_map().get(entity_type_name, None)
 
         if entity_type is None:
             raise ValueError(f'Entity type {entity_type_name} not found in hierarchy.')
@@ -769,7 +964,7 @@ class Entarchy(object):
         Returns:
             links.LinkTypeSpec: the registered kind.
         """
-        entity_type_names = set(self._entity_map)
+        entity_type_names = set(self._type_map())
         link_type_names = {spec.name for spec in self.backend.get_link_types()}
 
         linker_endpoint = links.resolve_endpoint(linker, entity_type_names, link_type_names)
