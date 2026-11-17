@@ -136,6 +136,20 @@ rois = ent.get(Roi, 'index IN (1, 2, 3)')
 rois = ent.get(Roi, 'NOT(EXIST(dff)) OR quality != "bad"')
 ```
 
+The same filters, as positional expressions or keyword equalities, go into
+every place that filters, and `where` is the verb for all of them:
+
+```python
+ent.where(Roi, 'index > 3', quality='good')      # the same as ent.get(Roi, ...)
+rois.where('index > 3')                           # narrow a collection
+Roi.where('index > 3') & Layer.where('depth == 0.0')   # a deferred query, not yet
+                                                       #  bound: .get_from(ent)
+```
+
+`ent.get(Roi)` stays for fetching a type whole. The deferred form combines
+expressions on several types with `&`, `|`, `~` and `-` before any entarchy is
+involved, and prefixes the other type's expression with `[Layer]` by itself.
+
 Operator precedence follows SQL/Python conventions
 (comparisons > `NOT` > `AND` > `XOR` > `OR`); use parentheses to group.
 Supported comparisons: `==`, `!=`, `<`, `<=`, `>`, `>=`, `IN (...)`, `EXIST(attr)`.
@@ -315,7 +329,7 @@ rois[['index', 'is_unit']]   # DataFrame
 ```
 
 Everything that hands back another collection keeps the type — `sort()`,
-`where()`, the set operators — as does iteration, and `Roi('index > 3')`. Naming
+`where()`, the set operators — as does iteration, and `Roi.where('index > 3')`. Naming
 a type as a string cannot say which one, so `ent.get('Roi')` is a
 `Collection[Entity]`; pass the class where you want the type. The package ships
 a `py.typed` marker, without which a type checker ignores all of this and treats

@@ -11,50 +11,50 @@ def indices_of(collection):
 
 class TestConstruction:
 
-    def test_entity_constructor_with_string_returns_deferred(self):
-        obj = Session('index > 2')
+    def test_where_on_a_class_returns_deferred(self):
+        obj = Session.where('index > 2')
         assert isinstance(obj, DeferredEntityCollection)
         assert obj.entity_type is Session
         assert obj.expression == 'index > 2'
 
     def test_repr(self):
-        assert 'Session' in repr(Session('index > 2'))
+        assert 'Session' in repr(Session.where('index > 2'))
 
     def test_as_tree_matches_direct_parse(self):
         from entarchy.core.query import parse_boolean_expression
-        assert Session('index > 2').as_tree == parse_boolean_expression('index > 2')
+        assert Session.where('index > 2').as_tree == parse_boolean_expression('index > 2')
 
 
 class TestAlgebra:
 
     def test_and(self, populated):
-        deferred = Session('index > 1') & 'flag == True'
+        deferred = Session.where('index > 1') & 'flag == True'
         assert indices_of(deferred.get_from(populated)) == [2, 4]
 
     def test_or(self, populated):
-        deferred = Session('index == 0') | 'index == 5'
+        deferred = Session.where('index == 0') | 'index == 5'
         assert indices_of(deferred.get_from(populated)) == [0, 5]
 
     def test_invert(self, populated):
-        deferred = ~Session('index > 1')
+        deferred = ~Session.where('index > 1')
         assert indices_of(deferred.get_from(populated)) == [0, 1]
 
     def test_sub(self, populated):
-        deferred = Session('index > 1') - 'flag == True'
+        deferred = Session.where('index > 1') - 'flag == True'
         assert indices_of(deferred.get_from(populated)) == [3, 5]
 
     def test_chained(self, populated):
-        deferred = (Session('index > 0') & 'index < 5') - 'flag == True'
+        deferred = (Session.where('index > 0') & 'index < 5') - 'flag == True'
         assert indices_of(deferred.get_from(populated)) == [1, 3]
 
     def test_precedence_is_preserved_when_combining(self, populated):
         """Sub-expressions must stay grouped when combined."""
-        deferred = Session('index == 0 OR index == 5') & 'flag == True'
+        deferred = Session.where('index == 0 OR index == 5') & 'flag == True'
         # (0 or 5) and even -> {0}, not 0 or (5 and even) -> {0}
         assert indices_of(deferred.get_from(populated)) == [0]
 
     def test_get_from_returns_custom_collection_type(self, populated):
-        result = Session('index > 1').get_from(populated)
+        result = Session.where('index > 1').get_from(populated)
         assert isinstance(result, Collection)
         assert result.entity_type is Session
 
@@ -62,15 +62,15 @@ class TestAlgebra:
 class TestCrossTypeExpressions:
 
     def test_other_entity_type_is_prefixed(self):
-        combined = Roi('index == 0') & Layer('depth == 0.0')
+        combined = Roi.where('index == 0') & Layer.where('depth == 0.0')
         assert '[Layer]depth == 0.0' in combined.expression
 
     def test_same_entity_type_is_not_prefixed(self):
-        combined = Roi('index == 0') & Roi('index == 1')
+        combined = Roi.where('index == 0') & Roi.where('index == 1')
         assert '[Roi]' not in combined.expression
 
     def test_cross_type_query_runs(self, deep):
-        combined = Roi('index == 0') & Layer('depth == 0.0')
+        combined = Roi.where('index == 0') & Layer.where('depth == 0.0')
         result = combined.get_from(deep)
         assert len(result) == 2  # one per recording
 

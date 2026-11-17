@@ -273,15 +273,37 @@ class TestAddChildByName:
         ent.backend.close()
 
 
-class TestTheQueryFormMistake:
+class TestTheIdForTheEntarchyMistake:
 
-    def test_add_new_entity_names_the_mistake(self, bare):
-        """Experiment('Exp_01') is a deferred query, since a string is a filter
-        expression; handing it to add_new_entity used to die on .uuid."""
+    def test_a_string_where_the_entarchy_goes_is_named(self, bare):
+        """Experiment('Exp_01') used to build a deferred query; now the
+        constructor says what the first argument is and where to go."""
         Experiment = bare.add_entity_type('Experiment')
 
-        with pytest.raises(TypeError, match=r"deferred query.*add_child\(Experiment, 'Exp_01'\)"):
-            bare.add_new_entity(Experiment('Exp_01'))
+        with pytest.raises(TypeError, match=r"add_child\(Experiment, 'Exp_01'\).*Experiment.where\('Exp_01'\)"):
+            Experiment('Exp_01')
+
+    def test_a_deferred_query_handed_to_add_new_entity(self, bare):
+        Experiment = bare.add_entity_type('Experiment')
+
+        with pytest.raises(TypeError, match='deferred query.*get_from'):
+            bare.add_new_entity(Experiment.where('id == "Exp_01"'))
 
         with pytest.raises(TypeError, match='takes an Entity, not str'):
             bare.add_new_entity('Exp_01')
+
+
+class TestWhereEverywhere:
+
+    def test_the_three_entry_points_agree(self, bare):
+        Subject_ = bare.add_entity_type('Subject')
+        with bare:
+            for i in range(4):
+                bare.root.add_child(Subject_, f's{i}', index=i, strain=['wt', 'mut'][i % 2])
+
+        by_class = Subject_.where('index > 0', strain='mut').get_from(bare)
+        by_entarchy = bare.where(Subject_, 'index > 0', strain='mut')
+        by_collection = bare.get(Subject_).where('index > 0', strain='mut')
+
+        ids = lambda c: sorted(s.id for s in c)
+        assert ids(by_class) == ids(by_entarchy) == ids(by_collection) == ['s1', 's3']

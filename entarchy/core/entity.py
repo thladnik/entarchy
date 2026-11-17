@@ -90,6 +90,13 @@ class Entity(object):
                     self._attribute_cache.setdefault(k, v)
             return
 
+        if isinstance(_entarchy, str):
+            raise TypeError(
+                f'{type(self).__name__}({_entarchy!r}): the first argument is the entarchy, '
+                f'not an id or a query. Create an entity under its parent, '
+                f'parent.add_child({type(self).__name__}, {_entarchy!r}); query with '
+                f'{type(self).__name__}.where({_entarchy!r}).')
+
         self._entarchy = _entarchy
         self._uuid = _uuid
         self._id = _id
@@ -118,31 +125,25 @@ class Entity(object):
 
         self._entity_initialized = True
 
-    @overload
-    def __new__(cls: Type[EntityT], _expression: str, /,
-                *args, **kwargs) -> DeferredEntityCollection[EntityT]: ...
+    @classmethod
+    def where(cls: Type[EntityT], *_string_expressions: str,
+              **_equalities) -> DeferredEntityCollection[EntityT]:
+        """A query on this type, not yet bound to an entarchy.
 
-    @overload
-    def __new__(cls: Type[EntityT], _entarchy: Entarchy = ...,
-                _uuid: str | None = ..., _id: str | None = ...,
-                _parent: Entity | None = ...,
-                _init_cache: dict[str, Any] | None = ...) -> EntityT: ...
+            Roi.where('index > 3')
+            Roi.where('index > 3', quality='good')
+
+        takes the same filter expressions and keyword equalities as
+        `Entarchy.get` and `Collection.where`, and gives a deferred collection:
+        expressions on this and other types combine with `&`, `|`, `~` and `-`
+        before `.get_from(ent)` evaluates the result, and
+        `Roi.where('index == 0') & Layer.where('depth == 0.0')` reaches across
+        the hierarchy by itself.
+        """
+        return DeferredEntityCollection(cls, compose_expression(_string_expressions, _equalities))
 
     def __new__(cls, *args, **kwargs):
-        # Two constructions wearing one name. Given a string this builds a
-        #  deferred collection rather than an entity - Roi('index > 3') - and
-        #  Python then skips __init__ because what came back is not a Roi. The
-        #  overloads say so; without them a type checker reads the expression
-        #  form as a Roi and refuses every method the collection has.
-
-        # _entarchy = args[0] if len(args) > 0 else kwargs.get('_entarchy', None)
-        arg0 = args[0] if len(args) > 0 else None
-
-        if isinstance(arg0, str):
-            obj = DeferredEntityCollection(cls, arg0)
-            return obj
-
-        _entarchy = arg0 if arg0 is not None else kwargs.get('_entarchy', None)
+        _entarchy = args[0] if len(args) > 0 else kwargs.get('_entarchy', None)
         if _entarchy is None:
             # Pickle reconstruction calls __new__ without constructor args.
             # In that case, create a blank instance and let pickle restore state.
@@ -2684,6 +2685,18 @@ def _find_path(hierarchy: dict[str, Any], target: str) -> list[str] | None:
             if subpath is not None:
                 return [name] + subpath
     return None
+
+
+def compose_expression(string_expressions, equalities: dict[str, Any]) -> str:
+    """One filter expression from several and from keyword equalities, each
+    parenthesized so a top-level OR inside one cannot regroup with its
+    neighbours. What Entarchy.get, Collection.where and Entity.where share."""
+    parts = [str(e) for e in string_expressions if e is not None and str(e).strip() != '']
+    for name, value in equalities.items():
+        parts.append(f'{name} == "{value}"' if isinstance(value, str) else f'{name} == {value}')
+    if len(parts) == 1:
+        return parts[0]
+    return ' AND '.join(f'({part})' for part in parts)
 
 
 def get_ancestor_distance_from_nested(hierarchy: dict[str, Any],

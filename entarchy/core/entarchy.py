@@ -17,7 +17,7 @@ from . import describe
 from . import links
 from . import query
 from .entity import (AnalysisEntity, Collection, DeferredEntityCollection,
-                     EntarchyEntity, Entity, EntityT,
+                     EntarchyEntity, Entity, EntityT, compose_expression,
                      LinkCollection, LinkEntity)
 
 if TYPE_CHECKING:
@@ -578,12 +578,9 @@ class Entarchy(object):
         if not isinstance(entity, Entity):
             hint = ''
             if isinstance(entity, DeferredEntityCollection):
-                # Roi('roi_0') is the query form - a string is a filter expression,
-                #  not an id - and the mistake is easy to make
-                hint = (f' {entity._entity_type.__name__}({entity._expression!r}) is a '
-                        f'deferred query, not an entity: a string is a filter expression. '
-                        f'Create the entity under its parent instead, '
-                        f'parent.add_child({entity._entity_type.__name__}, {entity._expression!r}).')
+                hint = (f' {entity!r} is a deferred query; .get_from(ent) evaluates it, '
+                        f'and parent.add_child({entity._entity_type.__name__}, "id") '
+                        f'creates an entity.')
             raise TypeError(f'add_new_entity takes an Entity, not '
                             f'{type(entity).__name__}.{hint}')
 
@@ -844,24 +841,20 @@ class Entarchy(object):
         # Fallback to generic collection
         return Collection(self, entity_type, as_tree)
 
+    def where(self, entity_type: Type[EntityT] | str, *_string_expressions: str,
+              **_equalities) -> Collection[EntityT]:
+        """The same as `get`: the entities of a type that match the filters.
+
+        `where` is the one verb for filtering everywhere - `Roi.where(...)`,
+        `collection.where(...)`, `ent.where(Roi, ...)` - and `get` stays for
+        fetching a type whole, `ent.get(Roi)`, where nothing is filtered.
+        """
+        return self.get(entity_type, *_string_expressions, **_equalities)
+
     def _build_filter_tree(self, _string_expressions, _equalities) -> dict[str, Any]:
         """Turn filter expressions and keyword equalities into one AST."""
-
-        # Add equality filters to filter expressions
-        for k, v in _equalities.items():
-
-            # Add quotes to string
-            if isinstance(v, str):
-                v = f'"{v}"'
-
-            _string_expressions = tuple(_string_expressions) + (f'{k} == {v}',)
-
-        # Concat expressions. Each one is parenthesized so a top-level OR inside
-        #  one expression cannot regroup with the neighboring expressions.
-        _expression = ' AND '.join(f'({e})' for e in _string_expressions
-                                   if e is not None and str(e).strip() != '')
-
-        as_tree = query.parse_boolean_expression(_expression)
+        as_tree = query.parse_boolean_expression(
+            compose_expression(_string_expressions, _equalities))
 
         return {} if as_tree is None else as_tree
 

@@ -56,8 +56,8 @@ def probe(ent: Archy) -> None:
     reveal_type(~rois)
     reveal_type(rois.entity_type)
     reveal_type(rois.get_entity('u', 'i'))
-    reveal_type(Roi('index > 1'))
-    reveal_type(Roi('index > 1').get_from(ent))
+    reveal_type(Roi.where('index > 1'))
+    reveal_type(Roi.where('index > 1').get_from(ent))
     reveal_type(ent.get('Roi'))
     reveal_type(ent.get('Roi')[0])
 
