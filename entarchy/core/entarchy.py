@@ -421,7 +421,7 @@ class Entarchy(object):
     @classmethod
     def open_or_create(cls,
                        path: str,
-                       _backend: Backend | str,
+                       _backend: Backend | str = 'SQLiteBackend',
                        _backend_config: dict[str, Any] = None,
                        **kwargs) -> Entarchy:
         """Open the entarchy at `path`, or create one there if there is none.
@@ -431,11 +431,11 @@ class Entarchy(object):
         who wanted "continue where it stopped" had to test for entarchy.yaml
         itself.
 
-            ent = LabArchy.open_or_create(path, 'SQLiteBackend',
-                                          {'dbname': 'lab.db'})
+            ent = LabArchy.open_or_create(path)
 
-        The backend arguments are only used when creating; opening reads them
-        back from the configuration that was written then.
+        The backend arguments are only used when creating, and default as in
+        create(); opening reads them back from the configuration that was
+        written then.
         """
         if os.path.exists(os.path.join(path, 'entarchy.yaml')):
             return cls(path, **kwargs)
@@ -445,11 +445,17 @@ class Entarchy(object):
     @classmethod
     def create(cls,
                path: str,
-               _backend: Backend | str,
+               _backend: Backend | str = 'SQLiteBackend',
                _backend_config: dict[str, Any] = None,
                entity_types: Iterable[Type[Entity]] = (),
                **kwargs) -> Entarchy:
         """Create an entarchy at `path` and return it.
+
+            ent = Entarchy.create('path/to/folder')
+
+        is a complete call: without a backend it is an SQLite database,
+        `entarchy.db`, in that folder. `'MySQLBackend'` with its config
+        dictionary, or a Backend instance, puts it elsewhere.
 
         The store starts with the types the class declares in `_entity_types`,
         plus `entity_types`, each with the children declared on it. A plain
@@ -458,8 +464,10 @@ class Entarchy(object):
 
         Args:
             path (str): The path to the entarchy configuration directory.
-            _backend (Backend): an entarchy.backend.Backend object or its string representation
-            _backend_config (dict): dictionary for initialization of backend if _backend is str or type
+            _backend (Backend): an entarchy.backend.Backend object or its class name;
+                SQLiteBackend if not given
+            _backend_config (dict): dictionary for initialization of backend if _backend is str or type;
+                for SQLite, {'dbname': ...} with 'entarchy.db' the default
             entity_types: classes to bind and store, beyond `_entity_types`
         Returns:
             Entarchy:

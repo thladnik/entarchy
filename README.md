@@ -70,8 +70,7 @@ added under its parent with `add_child`, starting from `ent.root`, which takes
 the root types:
 
 ```python
-ent = MyEntarchy.create('path/to/analysis/folder/', 'SQLiteBackend',
-                        {'dbname': 'entarchy.db'})
+ent = MyEntarchy.create('path/to/analysis/folder/')   # an SQLite entarchy.db in it
 
 exp = ent.root.add_child(Experiment, 'Non-fourier motion discrimination')
 
@@ -102,7 +101,7 @@ The other way needs no class at all. A plain entarchy starts empty and takes
 types as the work needs them, each as a root or under a type already there:
 
 ```python
-ent = entarchy.Entarchy.create('path/to/folder/', 'SQLiteBackend', {'dbname': 'entarchy.db'})
+ent = entarchy.Entarchy.create('path/to/folder/')
 
 Subject = ent.add_entity_type('Subject')
 Session = ent.add_entity_type('Session', parent=Subject)

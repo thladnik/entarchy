@@ -5,6 +5,8 @@ import random
 import pytest
 import yaml
 
+import entarchy
+
 from conftest import LabArchy, Session, Subject
 from entarchy.backend import SQLiteBackend
 
@@ -156,3 +158,28 @@ class TestAnalysis:
                            (subject.uuid,)).fetchall()
         con.close()
         assert rows == [(2.0,)]
+
+
+class TestDefaultBackend:
+
+    def test_create_needs_only_a_path(self, tmp_path):
+        """SQLite, entarchy.db, in the folder: the complete default."""
+        base = (tmp_path / 'plain').as_posix()
+        ent = entarchy.Entarchy.create(base)
+
+        assert os.path.exists(os.path.join(base, 'entarchy.db'))
+        assert type(ent.backend).__name__ == 'SQLiteBackend'
+        ent.backend.close()
+
+        reopened = entarchy.Entarchy(base)
+        assert reopened.root is not None
+        reopened.backend.close()
+
+    def test_open_or_create_needs_only_a_path(self, tmp_path):
+        base = (tmp_path / 'lab').as_posix()
+        ent = LabArchy.open_or_create(base)
+        ent.backend.close()
+
+        again = LabArchy.open_or_create(base)
+        assert again.hierarchy['Subject'] == {'Session': {}}
+        again.backend.close()
