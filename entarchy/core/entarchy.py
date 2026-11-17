@@ -16,7 +16,8 @@ from . import console
 from . import describe
 from . import links
 from . import query
-from .entity import (AnalysisEntity, Collection, EntarchyEntity, Entity, EntityT,
+from .entity import (AnalysisEntity, Collection, DeferredEntityCollection,
+                     EntarchyEntity, Entity, EntityT,
                      LinkCollection, LinkEntity)
 
 if TYPE_CHECKING:
@@ -573,6 +574,18 @@ class Entarchy(object):
         Returns:
             None
         """
+
+        if not isinstance(entity, Entity):
+            hint = ''
+            if isinstance(entity, DeferredEntityCollection):
+                # Roi('roi_0') is the query form - a string is a filter expression,
+                #  not an id - and the mistake is easy to make
+                hint = (f' {entity._entity_type.__name__}({entity._expression!r}) is a '
+                        f'deferred query, not an entity: a string is a filter expression. '
+                        f'Create the entity under its parent instead, '
+                        f'parent.add_child({entity._entity_type.__name__}, {entity._expression!r}).')
+            raise TypeError(f'add_new_entity takes an Entity, not '
+                            f'{type(entity).__name__}.{hint}')
 
         # Queue the entity first, so attribute writes below are deferred and
         #  the entity row is guaranteed to exist before its attribute rows

@@ -271,3 +271,17 @@ class TestAddChildByName:
         assert isinstance(subject, Subject) and isinstance(session, Session)
         assert ent.get('Session')[0].parent.id == 'subj_1'
         ent.backend.close()
+
+
+class TestTheQueryFormMistake:
+
+    def test_add_new_entity_names_the_mistake(self, bare):
+        """Experiment('Exp_01') is a deferred query, since a string is a filter
+        expression; handing it to add_new_entity used to die on .uuid."""
+        Experiment = bare.add_entity_type('Experiment')
+
+        with pytest.raises(TypeError, match=r"deferred query.*add_child\(Experiment, 'Exp_01'\)"):
+            bare.add_new_entity(Experiment('Exp_01'))
+
+        with pytest.raises(TypeError, match='takes an Entity, not str'):
+            bare.add_new_entity('Exp_01')
