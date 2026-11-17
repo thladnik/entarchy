@@ -580,6 +580,98 @@ class Entity(object):
         # return [globals()[c] if isinstance(c, str) else c for c in cls._child_entity_types] Does not work yet for str
         return cls._child_entity_types
 
+
+    def child_entity_types(self) -> tuple[Type[Entity], ...]:
+        """The entity types that may be added under this entity.
+
+        What `add_child_entity_type` registered on this entity's class. For the
+        root entity it is the entarchy's `_hierarchy_root_type`, which is where
+        the hierarchy hangs off the root rather than being registered on it.
+        """
+        if isinstance(self, EntarchyEntity):
+            return (type(self.entarchy)._hierarchy_root_type,)
+        return tuple(type(self).get_child_entity_types() or ())
+
+    @overload
+    def add_child(self, child: Type[EntityT], _id: str, /, **attributes: Any) -> EntityT: ...
+
+    @overload
+    def add_child(self, child: EntityT, /, **attributes: Any) -> EntityT: ...
+
+    def add_child(self, child, _id=None, /, **attributes):
+        """Add a child entity under this one, and return it.
+
+            roi = layer.add_child(Roi, 'roi_0', index=0)
+
+        constructs the Roi with this entity as its parent, persists it and writes
+        the attributes. An instance built beforehand with `Roi(ent, _id='roi_0')`
+        can be passed in place of the class; its parent must be this entity or
+        not set yet.
+
+        The child's type must be one this entity's class registered with
+        `add_child_entity_type`; for the root entity, the entarchy's
+        `_hierarchy_root_type`. This is the only place the hierarchy is checked
+        when an entity is written: `Entarchy.add_new_entity` stores whatever
+        parent the entity was constructed with, and a wrong one is found only by
+        the queries that then fail to see the entity.
+
+        Outside a `with ent:` block the child is committed at once and its
+        attributes right after, in a second commit. Inside, both go out at the
+        end of the block with everything else.
+        """
+        if isinstance(child, type):
+            if _id is None:
+                raise ValueError('An id is needed to create the child entity: '
+                                 'add_child(EntityType, "id").')
+            child_type, instance = child, None
+        elif isinstance(child, Entity):
+            if _id is not None:
+                raise ValueError(f'{child} has its id already; none can be given with it.')
+            child_type, instance = type(child), child
+        else:
+            raise TypeError(f'child must be an Entity subclass or an Entity instance, '
+                            f'not {type(child).__name__}.')
+
+        self._check_child_type(child_type)
+
+        if instance is None:
+            instance = child_type(self.entarchy, _id=_id, _parent=self)
+        else:
+            if instance.entarchy is not self.entarchy:
+                raise ValueError(f'{instance} belongs to a different entarchy than {self}.')
+            # _parent is None until it is known; False once the backend said there is none
+            if instance._parent is not None and instance._parent is not self:
+                raise ValueError(f'{instance} is a child of {instance._parent or "nothing"}, '
+                                 f'not of {self}.')
+            if self.entarchy.is_pending_add(instance):
+                raise ValueError(f'{instance} has already been added.')
+            instance._parent = self
+
+        self.entarchy.add_new_entity(instance)
+
+        if attributes:
+            instance[list(attributes)] = list(attributes.values())
+
+        return instance
+
+    def _check_child_type(self, child_type: type) -> None:
+        if not (isinstance(child_type, type) and issubclass(child_type, Entity)):
+            raise TypeError(f'{child_type!r} is not an Entity subclass.')
+
+        # Exact membership, not issubclass: the backend stores an entity's type by
+        #  class name and knows only the names in the resolved hierarchy, so a
+        #  subclass of a registered type cannot be stored at all - it would fail
+        #  deep in the write with a KeyError on its name
+        allowed = self.child_entity_types()
+        if child_type not in allowed:
+            parent_name = type(self).__name__
+            if not allowed:
+                raise TypeError(f'{child_type.__name__} cannot be a child of {parent_name}: '
+                                f'{parent_name} has no child entity types.')
+            names = ', '.join(a.__name__ for a in allowed)
+            raise TypeError(f'{child_type.__name__} cannot be a child of {parent_name}, '
+                            f'whose child entity types are {names}.')
+
     @classmethod
     def get_collection_type(cls) -> type[Collection]:
         if cls.collection_type is None:

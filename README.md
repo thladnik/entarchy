@@ -1,10 +1,8 @@
 ## Entarchy - Hierarchical entity data manager for analysis prototyping
 
-Entarchy stores hierarchically organized entities (e.g. Animal > Recording > Roi)
-with arbitrary, dynamically added attributes on top of a SQL backend (SQLite or
-MySQL). Scalar attributes are stored as typed columns and are queryable with
-string filter expressions; arrays and other objects are stored as blobs, with
-large payloads transparently written to sharded files on disk.
+Entarchy is a Python data management tool for storing hierarchically organized dataset entities 
+and their attributes in a freely configurable storage backend. 
+It's meant to simplify data storage and retrieval during data analysis *prototyping*. 
 
 ### Installation
 
@@ -12,11 +10,93 @@ large payloads transparently written to sharded files on disk.
 pip install entarchy
 ```
 
-Both backends come with it. `pip install "entarchy[asdf]"` adds the ASDF
-archive format, `pip install "entarchy[notebook]"` adds `cloudpickle` for
-`map_async` on functions defined in a notebook cell.
+Currently, entarchy supports three backend formats: `SQLite`, `MySQL` and `ASDF`
+
+Entarchy can be used in static analysis scripts, interactive console 
+or IPython console sessions or Jupyter notebooks. Note that for notebook support 
+entarchy should be installed with `pip install entarchy[notebook]`
+
+The recommended storage backend is `SQLite` for most analyses. 
+If parallelization is required for some analysis steps `MySQL` is the better fit. 
+`ASDF` is mostly intended as an archival format since partial writes 
+(i.e. when attributes change/are recomputed) are impractical.
+
+### Structure
+
+An entarchy is defined entirely in Python:
+
+```python
+import entarchy 
+
+class Experiment(entarchy.Entity):
+    pass
+
+class Participant(entarchy.Entity):
+    pass
+
+class Session(entarchy.Entity):
+    pass
+
+class Stimulus(entarchy.Entity):
+    pass
+
+class Response(entarchy.Entity):
+    pass
+
+# Define entarchy and set Experiment to be first level
+class MyEntarchy(entarchy.Entarchy):
+    _hierarchy_root_type = Experiment
+
+Experiment.add_child_entity_type(Participant)
+Participant.add_child_entity_type(Session)
+Session.add_child_entity_type(Stimulus)
+Session.add_child_entity_type(Response)
+```
+
+This establishes an simple entarchy with a hierarchy that looks like this:
+
+```
+Experiment
++-- Participant
+  +-- Session
+    +-- Stimulus
+    +-- Response
+```
+
+The entarchy can now be built by adding entity data to it. Every entity is
+added under its parent with `add_child`, starting from `ent.root`, which takes
+the `_hierarchy_root_type`:
+
+```python
+ent = MyEntarchy.create('path/to/analysis/folder/', 'SQLiteBackend',
+                        {'dbname': 'entarchy.db'})
+
+exp = ent.root.add_child(Experiment, 'Non-fourier motion discrimination')
+
+participant_a = exp.add_child(Participant, 'A', age=27)
+session_a_01 = participant_a.add_child(Session, '01')
+
+participant_b = exp.add_child(Participant, 'B')
+```
+
+`add_child` checks the child's type against what its parent's class registered
+with `add_child_entity_type`, and raises `TypeError` otherwise; `child_entity_types()`
+lists what an entity accepts. Keyword arguments become attributes of the new
+entity. Inside a `with ent:` block everything is written in one transaction at
+the end of the block, which is what to use when adding many entities:
+
+```python
+with ent:
+    for i in range(1000):
+        session_a_01.add_child(Response, f'resp_{i}', reaction_time=times[i])
+```
+
+An entity constructed beforehand, `Session(ent, _id='01')`, can be passed to
+`add_child` in place of the class and id.
 
 ### Filter expressions
+
+One of entarchy's major features is the ability to use abstract filter expressions on scalar entity attributes
 
 ```python
 rois = ent.get(Roi, 'has_receptive_field == True AND [Animal]strain == "wt"')
