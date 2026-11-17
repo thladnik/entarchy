@@ -1,30 +1,33 @@
 [build-system]
-requires      = ["setuptools>=65.0.0", "wheel"]
+# 77 is the first setuptools that reads the SPDX `license` string below
+requires      = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "entarchy"
-version = "0.2"
-description = ""
+version = "0.2.0"
+description = "Hierarchical entity data manager for analysis prototyping, on SQLite or MySQL"
 readme = "README.md"
 authors = [{ name = 'Tim Hladnik', email = "contact@vxpy.org" }]
-license = { file = 'LICENSE' }
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 classifiers = [
         'Development Status :: 3 - Alpha',
         'Intended Audience :: Science/Research',
-        'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
         'Operating System :: POSIX :: Linux',
         'Operating System :: Microsoft :: Windows',
-        'Operating System :: Microsoft :: Windows :: Windows 11',
         'Programming Language :: Python',
+        'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
         'Programming Language :: Python :: 3.12',
         'Programming Language :: Python :: 3.13',
         'Topic :: Scientific/Engineering',
-        'Topic :: Data Analysis'
+        'Topic :: Scientific/Engineering :: Information Analysis',
+        'Topic :: Database',
+        'Typing :: Typed',
 ]
-keywords = ['neuroscience', 'data analysis']
+keywords = ['neuroscience', 'data analysis', 'entity-attribute-value', 'sqlite', 'mysql']
 dependencies = [
     'alive-progress',
     'numpy',
@@ -66,6 +69,8 @@ dev = ['pip-tools', 'pytest', 'build', 'twine',
 
 [project.urls]
 Homepage = 'https://github.com/thladnik/entarchy'
+Repository = 'https://github.com/thladnik/entarchy'
+Issues = 'https://github.com/thladnik/entarchy/issues'
 
 [tool.pytest.ini_options]
 testpaths = ['tests']

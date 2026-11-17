@@ -1,10 +1,20 @@
-## Entarchy - Hierarchical entity data manger for analysis prototyping
+## Entarchy - Hierarchical entity data manager for analysis prototyping
 
 Entarchy stores hierarchically organized entities (e.g. Animal > Recording > Roi)
 with arbitrary, dynamically added attributes on top of a SQL backend (SQLite or
 MySQL). Scalar attributes are stored as typed columns and are queryable with
 string filter expressions; arrays and other objects are stored as blobs, with
 large payloads transparently written to sharded files on disk.
+
+### Installation
+
+```sh
+pip install entarchy
+```
+
+Both backends come with it. `pip install "entarchy[asdf]"` adds the ASDF
+archive format, `pip install "entarchy[notebook]"` adds `cloudpickle` for
+`map_async` on functions defined in a notebook cell.
 
 ### Filter expressions
 
@@ -105,13 +115,13 @@ other way round transposes the matrix instead of scrambling it.
 bytes for a `float32`, so an all-to-all matrix belongs on the nearest common
 ancestor as an array, not as links. Bulk writes refuse to be enormous or to be
 most of every possible pair unless told otherwise — see
-[the proposal](docs/proposals/link-entities.md) for the reasoning and the
+[the proposal](https://github.com/thladnik/entarchy/blob/main/docs/proposals/link-entities.md) for the reasoning and the
 measurements.
 
 ### Query planner statistics (SQLite)
 
 Attributes are stored one row per attribute, with a typed value column per kind.
-[The proposal](docs/proposals/attribute-storage.md) benchmarks that against
+[The proposal](https://github.com/thladnik/entarchy/blob/main/docs/proposals/attribute-storage.md) benchmarks that against
 JSON-column alternatives and explains why it stays.
 
 SQLite plans entarchy's filters badly without statistics — driving a query from
@@ -337,7 +347,7 @@ Requires `asdf` (`pip install entarchy[asdf]`); everything else works without it
 
 ### Notebooks
 
-Runnable examples live in [`examples/`](examples):
+Runnable examples live in [`examples/`](https://github.com/thladnik/entarchy/tree/main/examples):
 
 - `01_getting_started.ipynb` — schema, entities, queries, DataFrames
 - `02_parallel_analysis.ipynb` — `map_async`, worker pools, failure handling

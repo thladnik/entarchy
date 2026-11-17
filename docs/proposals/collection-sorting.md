@@ -19,7 +19,7 @@ order. Every place in the analysis code that needs a real order sorts in Python
 after the fact:
 
 ```python
-sorted(layer.rois, key=lambda r: r['index'])            # entarchy_vxpy_suite2p
+sorted(layer.rois, key=lambda r: r['index'])            # vxentarchy
 sorted(names, key=lambda n: int(n.replace('plane','')))  # Suite2pSource.layer_names
 ```
 
