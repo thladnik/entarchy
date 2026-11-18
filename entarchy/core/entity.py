@@ -82,7 +82,7 @@ class Entity(object):
 
             subject = Subject('subject01')
             subject['strain'] = 'wt'
-            ent.add_entity(subject)        # or parent.add_child(subject)
+            ent.add_child(subject)         # or parent.add_child(subject)
 
         It is built without an entarchy and bound to one when it is added;
         attributes written before that are kept and go in with it. The keyword
@@ -104,7 +104,7 @@ class Entity(object):
         if _id is not None and not isinstance(_id, str):
             raise TypeError(
                 f'{type(self).__name__}({_id!r}): the first argument is the id, a string. '
-                f'The entarchy is bound by ent.add_entity(entity) or '
+                f'The entarchy is bound by ent.add_child(entity) or '
                 f'parent.add_child(entity), or passed as _entarchy=.')
 
         self._entarchy = _entarchy
@@ -160,7 +160,7 @@ class Entity(object):
         if len(args) > 0 and not isinstance(args[0], str):
             raise TypeError(
                 f'{cls.__name__}({args[0]!r}, ...): the first argument is the id, a string. '
-                f'The entarchy is bound by ent.add_entity(entity) or '
+                f'The entarchy is bound by ent.add_child(entity) or '
                 f'parent.add_child(entity), or passed as _entarchy=.')
 
         # Identity map: a stored entity materialized twice in one entarchy is
@@ -630,11 +630,8 @@ class Entity(object):
         yet, and attributes already written on it go in with it.
 
         The child's type must be one the entarchy's stored hierarchy puts under
-        this entity's type; under the root entity, a root type. This is the only
-        place the hierarchy is checked when an entity is written:
-        `Entarchy.add_entity` stores whatever parent the entity was
-        constructed with, and a wrong one is found only by the queries that then
-        fail to see the entity.
+        this entity's type; under the root entity, a root type, which is what
+        `ent.add_child(...)` stands for.
 
         Outside a `with ent:` block the child is committed at once and its
         attributes right after, in a second commit. Inside, both go out at the
@@ -650,8 +647,12 @@ class Entity(object):
                 raise ValueError(f'{child} has its id already; none can be given with it.')
             child_type, instance = type(child), child
         else:
+            hint = ''
+            if isinstance(child, DeferredEntityCollection):
+                hint = (f' {child!r} is a deferred query; .get_from(ent) evaluates it, and '
+                        f'add_child({child._entity_type.__name__}, "id") creates an entity.')
             raise TypeError(f'child must be an Entity subclass or an Entity instance, '
-                            f'not {type(child).__name__}.')
+                            f'not {type(child).__name__}.{hint}')
 
         self._check_child_type(child_type)
 
@@ -668,7 +669,7 @@ class Entity(object):
                 raise ValueError(f'{instance} has already been added.')
             instance._parent = self
 
-        self.entarchy.add_entity(instance)
+        self.entarchy._add_entity(instance)
 
         if attributes:
             instance[list(attributes)] = list(attributes.values())
@@ -703,7 +704,7 @@ class Entity(object):
     def entarchy(self) -> Entarchy:
         if self._entarchy is None:
             raise RuntimeError(f'{self} is not bound to an entarchy yet: add it with '
-                               f'ent.add_entity(entity) or parent.add_child(entity).')
+                               f'ent.add_child(entity) or parent.add_child(entity).')
         return self._entarchy
 
     @property
@@ -766,7 +767,7 @@ class Entity(object):
 
         if not self.is_bound:
             raise RuntimeError(f'{self} is not bound to an entarchy; nothing to commit to. '
-                               f'ent.add_entity(entity) stores it with its attributes.')
+                               f'ent.add_child(entity) stores it with its attributes.')
 
         # Attributes cannot be written before the entity row exists. Entities that
         #  are still queued for insertion stay on the update list; Entarchy.commit()

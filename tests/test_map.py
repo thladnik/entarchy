@@ -18,11 +18,9 @@ def _release_pool():
 def many(ent):
     """A collection large enough to spread over several workers."""
     with ent:
-        subject = Subject(_entarchy=ent, _id='subject', _parent=ent.root)
-        ent.add_entity(subject)
+        subject = ent.add_child(Subject, 'subject')
         for i in range(12):
-            session = Session(_entarchy=ent, _id=f'sess_{i}', _parent=subject)
-            ent.add_entity(session)
+            session = subject.add_child(Session, f'sess_{i}')
             session['index'] = i
             session['score'] = float(i)
     return ent
@@ -33,13 +31,11 @@ def grouped(ent):
     """Sessions spread over three parents, to exercise locality grouping."""
     with ent:
         for s in range(3):
-            subject = Subject(_entarchy=ent, _id=f'subject_{s}', _parent=ent.root)
-            ent.add_entity(subject)
+            subject = ent.add_child(Subject, f'subject_{s}')
             subject['label'] = f'label_{s}'
 
             for i in range(6):
-                session = Session(_entarchy=ent, _id=f'sess_{s}_{i}', _parent=subject)
-                ent.add_entity(session)
+                session = subject.add_child(Session, f'sess_{s}_{i}')
                 session['index'] = i
                 session['score'] = float(i)
     return ent
@@ -343,12 +339,10 @@ class TestLocality:
     def test_chunk_size_is_capped_for_load_balance(self, ent, capsys):
         """A single huge group must still spread over the workers."""
         with ent:
-            subject = Subject(_entarchy=ent, _id='only', _parent=ent.root)
-            ent.add_entity(subject)
+            subject = ent.add_child(Subject, 'only')
             subject['label'] = 'x'
             for i in range(20):
-                session = Session(_entarchy=ent, _id=f's{i}', _parent=subject)
-                ent.add_entity(session)
+                session = subject.add_child(Session, f's{i}')
                 session['index'] = i
 
         ent.get(Session).map_async(_mp_worker.record_locality, _worker_num=2,

@@ -110,8 +110,7 @@ class TestPlannerStatistics:
         ent = DeepArchy.create(base, SQLiteBackend(base, dbname='stats.db'))
         with ent:
             from conftest import Animal
-            animal = Animal(_entarchy=ent, _id='a', _parent=ent.root)
-            ent.add_entity(animal)
+            animal = ent.add_child(Animal, 'a')
             animal['strain'] = 'wildtype'
 
         # Touch the tables, since PRAGMA optimize only analyses what a session used

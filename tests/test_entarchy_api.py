@@ -192,8 +192,7 @@ class TestClearRegistry:
 
     def test_keeps_entities_queued_for_insertion(self, ent):
         with ent:
-            subject = Subject(_entarchy=ent, _id='new', _parent=ent.root)
-            ent.add_entity(subject)
+            subject = ent.add_child(Subject, 'new')
 
             ent.clear_registry()
             assert subject.uuid in ent._entities
@@ -240,8 +239,7 @@ class TestCommitBatching:
 
     def test_context_defers_writes(self, ent):
         with ent:
-            subject = Subject(_entarchy=ent, _id='batched', _parent=ent.root)
-            ent.add_entity(subject)
+            subject = ent.add_child(Subject, 'batched')
             subject['a'] = 1
             assert subject.uuid in ent._entities_to_update
 
@@ -256,8 +254,7 @@ class TestCommitBatching:
 
     def test_remove_entity_from_update(self, ent):
         with ent:
-            subject = Subject(_entarchy=ent, _id='x', _parent=ent.root)
-            ent.add_entity(subject)
+            subject = ent.add_child(Subject, 'x')
             subject['a'] = 1
             ent._remove_entity_from_update(subject)
             assert subject.uuid not in ent._entities_to_update
@@ -266,8 +263,7 @@ class TestCommitBatching:
         """Regression: the inner entity context used to flush attributes before the
         entity row existed, raising NoResultFound."""
         with ent:
-            subject = Subject(_entarchy=ent, _id='nested', _parent=ent.root)
-            ent.add_entity(subject)
+            subject = ent.add_child(Subject, 'nested')
             with subject:
                 subject['a'] = 1
             # Still deferred - the entity row is only inserted on the outer exit

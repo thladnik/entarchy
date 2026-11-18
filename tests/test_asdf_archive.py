@@ -44,8 +44,7 @@ def source(tmp_path):
     rng = np.random.default_rng(0)
 
     with ent:
-        animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
-        ent.add_entity(animal)
+        animal = ent.add_child(Animal, 'animal_1')
         animal['strain'] = 'wildtype'
         animal['age'] = 12
         animal['weight'] = 4.25
@@ -53,20 +52,17 @@ def source(tmp_path):
         animal['note'] = None
 
         for r in range(2):
-            recording = Recording(_entarchy=ent, _id=f'rec_{r}', _parent=animal)
-            ent.add_entity(recording)
+            recording = animal.add_child(Recording, f'rec_{r}')
             recording['rate'] = 10.0 + r
             recording['times'] = np.linspace(0, 1, 50)
 
             for l in range(2):
-                layer = Layer(_entarchy=ent, _id=f'plane{l}', _parent=recording)
-                ent.add_entity(layer)
+                layer = recording.add_child(Layer, f'plane{l}')
                 layer['depth'] = float(l * 15)
                 layer['motion'] = rng.normal(size=(20, 3))
 
                 for i in range(3):
-                    roi = Roi(_entarchy=ent, _id=f'roi_{i}', _parent=layer)
-                    ent.add_entity(roi)
+                    roi = layer.add_child(Roi, f'roi_{i}')
                     roi['index'] = i
                     roi['good'] = (i != 1)
                     roi['dff'] = rng.normal(size=100).astype(np.float32)
@@ -569,8 +565,7 @@ class TestReadOnly:
 
         with pytest.raises(ArchiveReadOnlyError):
             with ent:
-                recording = Recording(_entarchy=ent, _id='rec_new', _parent=animal)
-                ent.add_entity(recording)
+                recording = animal.add_child(Recording, 'rec_new')
 
     def test_delete_raises(self, archived):
         ent, _ = archived

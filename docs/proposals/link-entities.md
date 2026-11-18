@@ -351,8 +351,7 @@ belong to several at once.
 ```python
 # cluster nodes are ordinary entities; AnalysisEntity already exists for this
 with ent:
-    cluster = AnalysisEntity(_entarchy=ent, _id='cmn_cluster_03', _parent=ent.root)
-    ent.add_entity(cluster)
+    cluster = ent.add_child(AnalysisEntity, 'cmn_cluster_03')
     cluster['method'] = 'ward'
     cluster['centroid_eta'] = centroid
 

@@ -25,22 +25,18 @@ def sortable(tmp_path):
     ent = DeepArchy.create(base, SQLiteBackend(base, dbname='sortable.db'))
 
     with ent:
-        animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
-        ent.add_entity(animal)
+        animal = ent.add_child(Animal, 'animal_1')
         animal['strain'] = 'wildtype'
 
-        recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
-        ent.add_entity(recording)
+        recording = animal.add_child(Recording, 'rec_0')
         recording['rate'] = 10.0
 
         for layer_index in range(2):
-            layer = Layer(_entarchy=ent, _id=f'plane{layer_index}', _parent=recording)
-            ent.add_entity(layer)
+            layer = recording.add_child(Layer, f'plane{layer_index}')
             layer['depth'] = float(layer_index * 15)
 
             for roi_index in range(12):
-                roi = Roi(_entarchy=ent, _id=f'Roi_{roi_index}', _parent=layer)
-                ent.add_entity(roi)
+                roi = layer.add_child(Roi, f'Roi_{roi_index}')
                 roi['index'] = roi_index
                 roi['score'] = float((roi_index * 5) % 12)
                 # Only some ROIs have this one, for the missing= tests

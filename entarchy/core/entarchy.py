@@ -539,7 +539,7 @@ class Entarchy(object):
         # Create entarchy entity
         with ent:
             ent_entity = EntarchyEntity('Entarchy', _entarchy=ent)
-            ent.add_entity(ent_entity)
+            ent._add_entity(ent_entity)
 
         # Update config to include entarchy entity uuid
         _config.update({'entarchy_uuid': ent_entity.uuid})
@@ -565,19 +565,29 @@ class Entarchy(object):
         if entity.uuid not in self._entities_to_update:
             self._entities_to_update.append(entity.uuid)
 
-    def add_entity(self, entity: Entity) -> None:
-        """Store a new entity.
+    def add_child(self, child: Type[EntityT] | EntityT, _id: str | None = None, /,
+                  **attributes: Any) -> EntityT:
+        """Add an entity of a root type, and return it.
+
+            subject = ent.add_child(Subject, 'subject01', strain='wt')
 
             subject = Subject('subject01')
             subject['strain'] = 'wt'
-            ent.add_entity(subject)
+            ent.add_child(subject)
 
-        binds the entity to this entarchy and writes it with the attributes set
-        so far; outside a `with ent:` block at once, inside it on exit. An
-        entity of a root type goes under `ent.root`, which is where
-        `ent.root.add_child(Subject, 'subject01')` puts it too. A child type
-        has to come through its parent, `parent.add_child(entity)`, which sets
-        the parent and calls this.
+        Entities of the root types are the children of the root entity, so this
+        is `ent.root.add_child(...)`: the same call at every level of the tree,
+        with the same type check. See `Entity.add_child`.
+        """
+        return self.root.add_child(child, _id, **attributes)
+
+    def _add_entity(self, entity: Entity) -> None:
+        """Store a new entity, bound to this entarchy.
+
+        What `add_child` calls once the parent is set and the type checked.
+        Outside a `with ent:` block the entity is written at once, with the
+        attributes set on it so far; inside, on exit. The built-in types come
+        through here parentless.
         """
 
         if not isinstance(entity, Entity):
@@ -586,7 +596,7 @@ class Entarchy(object):
                 hint = (f' {entity!r} is a deferred query; .get_from(ent) evaluates it, '
                         f'and parent.add_child({entity._entity_type.__name__}, "id") '
                         f'creates an entity.')
-            raise TypeError(f'add_entity takes an Entity, not '
+            raise TypeError(f'_add_entity takes an Entity, not '
                             f'{type(entity).__name__}.{hint}')
 
         if not entity.is_bound:
@@ -1092,7 +1102,7 @@ class Entarchy(object):
 
         link_entity = LinkEntity(f'{spec.name}@{linked_uuid}', _entarchy=self,
                                  _parent=self.get_entity_by_uuid(linker_uuid))
-        self.add_entity(link_entity)
+        self._add_entity(link_entity)
 
         self._links_to_add.append({'link_uuid': link_entity.uuid,
                                    'link_type': spec.name,
@@ -1583,7 +1593,7 @@ class Entarchy(object):
 
             if len(existing_data) == 0:
                 _analysis_entity = AnalysisEntity(_analysis, _entarchy=self)
-                self.add_entity(_analysis_entity)
+                self._add_entity(_analysis_entity)
                 self.commit()
             else:
                 # Reuse the persisted UUID. Creating a fresh entity object here would

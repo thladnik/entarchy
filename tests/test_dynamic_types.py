@@ -276,12 +276,12 @@ class TestAddChildByName:
 class TestUnboundEntities:
     """An entity is built by id alone and bound by the entarchy that takes it."""
 
-    def test_add_entity_binds_a_root_type_under_the_root(self, bare):
+    def test_add_child_on_the_entarchy_binds_a_root_type_under_the_root(self, bare):
         Subject_ = bare.add_entity_type('Subject')
         subject = Subject_('subject01')
         assert not subject.is_bound and subject.parent is None
 
-        bare.add_entity(subject)
+        bare.add_child(subject)
 
         assert subject.is_bound and subject.entarchy is bare
         assert subject.parent.uuid == bare.root.uuid
@@ -297,7 +297,7 @@ class TestUnboundEntities:
         assert sorted(subject.keys()) == ['age', 'strain']
         assert subject[['strain', 'age']] == ('wt', 27)
 
-        ent.add_entity(subject)
+        ent.add_child(subject)
         ent.backend.close()
 
         reopened = entarchy.Entarchy(tmp_path.joinpath('plain').as_posix())
@@ -311,7 +311,7 @@ class TestUnboundEntities:
             for i in range(3):
                 subject = Subject_(f's{i}')
                 subject['index'] = i
-                bare.add_entity(subject)
+                bare.add_child(subject)
             assert len(bare.get('Subject')) == 0
 
         assert sorted(s['index'] for s in bare.get('Subject')) == [0, 1, 2]
@@ -332,8 +332,8 @@ class TestUnboundEntities:
         Subject_ = bare.add_entity_type('Subject')
         Session_ = bare.add_entity_type('Session', parent=Subject_)
 
-        with pytest.raises(ValueError, match='Session is a child type of Subject.*add_child'):
-            bare.add_entity(Session_('sess_1'))
+        with pytest.raises(TypeError, match='Session cannot be a child of'):
+            bare.add_child(Session_('sess_1'))
 
         assert len(bare.get('Session')) == 0
 
@@ -353,10 +353,10 @@ class TestUnboundEntities:
     def test_bound_elsewhere(self, bare, ent):
         subject = Subject('subject01')
         bare.add_entity_type('Subject')
-        bare.add_entity(subject)
+        bare.add_child(subject)
 
         with pytest.raises(ValueError, match='different entarchy'):
-            ent.add_entity(subject)
+            ent.add_child(subject)
 
     def test_the_first_argument_is_the_id(self, bare):
         Subject_ = bare.add_entity_type('Subject')
@@ -367,14 +367,14 @@ class TestUnboundEntities:
         with pytest.raises(TypeError):
             Subject_('subject01', bare)   # the entarchy is keyword-only
 
-    def test_a_deferred_query_handed_to_add_entity(self, bare):
+    def test_a_deferred_query_handed_to_add_child(self, bare):
         Experiment = bare.add_entity_type('Experiment')
 
         with pytest.raises(TypeError, match='deferred query.*get_from'):
-            bare.add_entity(Experiment.where('id == "Exp_01"'))
+            bare.add_child(Experiment.where('id == "Exp_01"'))
 
-        with pytest.raises(TypeError, match='takes an Entity, not str'):
-            bare.add_entity('Exp_01')
+        with pytest.raises(TypeError, match='Entity subclass or an Entity instance, not str'):
+            bare.add_child('Exp_01')
 
 
 class TestWhereEverywhere:

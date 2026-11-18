@@ -21,11 +21,9 @@ def _release_pool():
 @pytest.fixture()
 def many(ent):
     with ent:
-        subject = Subject(_entarchy=ent, _id='subject', _parent=ent.root)
-        ent.add_entity(subject)
+        subject = ent.add_child(Subject, 'subject')
         for i in range(8):
-            session = Session(_entarchy=ent, _id=f'sess_{i}', _parent=subject)
-            ent.add_entity(session)
+            session = subject.add_child(Session, f'sess_{i}')
             session['index'] = i
             session['score'] = float(i)
     return ent
@@ -155,8 +153,7 @@ class TestEntityHtmlRepr:
 
     def test_escapes_html(self, ent):
         with ent:
-            subject = Subject(_entarchy=ent, _id='<script>alert(1)</script>', _parent=ent.root)
-            ent.add_entity(subject)
+            subject = ent.add_child(Subject, '<script>alert(1)</script>')
 
         rendered = subject._repr_html_()
         assert '<script>' not in rendered

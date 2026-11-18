@@ -37,15 +37,12 @@ def wide(tmp_path_factory):
     ent = DeepArchy.create(base, SQLiteBackend(base, dbname='wide.db'))
 
     with ent:
-        animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
-        ent.add_entity(animal)
-        recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
-        ent.add_entity(recording)
-        layer = Layer(_entarchy=ent, _id='plane0', _parent=recording)
-        ent.add_entity(layer)
+        animal = ent.add_child(Animal, 'animal_1')
+        recording = animal.add_child(Recording, 'rec_0')
+        layer = recording.add_child(Layer, 'plane0')
 
         for index in range(LARGE):
-            ent.add_entity(Roi(_entarchy=ent, _id=f'roi_{index}', _parent=layer))
+            layer.add_child(Roi, f'roi_{index}')
 
     yield ent
     ent.backend.close()

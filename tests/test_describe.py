@@ -19,22 +19,18 @@ def described(tmp_path):
     video.write_bytes(b'FAKE-AVI' + bytes(range(256)) * 200)
 
     with ent:
-        animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
-        ent.add_entity(animal)
+        animal = ent.add_child(Animal, 'animal_1')
         animal['strain'] = 'wildtype'
 
-        recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
-        ent.add_entity(recording)
+        recording = animal.add_child(Recording, 'rec_0')
         recording['rate'] = 10.0
         recording['times'] = np.linspace(0, 1, 5000)
 
-        layer = Layer(_entarchy=ent, _id='plane0', _parent=recording)
-        ent.add_entity(layer)
+        layer = recording.add_child(Layer, 'plane0')
         layer['depth'] = 0.0
 
         for index in range(6):
-            roi = Roi(_entarchy=ent, _id=f'Roi_{index}', _parent=layer)
-            ent.add_entity(roi)
+            roi = layer.add_child(Roi, f'Roi_{index}')
             roi['index'] = index
             roi['good'] = (index % 2 == 0)
             roi['dff'] = np.random.rand(500)
@@ -392,12 +388,9 @@ def special_floats(tmp_path):
     ent = DeepArchy.create(base, SQLiteBackend(base, dbname='floats.db'))
 
     with ent:
-        animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
-        ent.add_entity(animal)
-        recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
-        ent.add_entity(recording)
-        layer = Layer(_entarchy=ent, _id='plane0', _parent=recording)
-        ent.add_entity(layer)
+        animal = ent.add_child(Animal, 'animal_1')
+        recording = animal.add_child(Recording, 'rec_0')
+        layer = recording.add_child(Layer, 'plane0')
 
         #        snr: three finite values and a NaN
         #       gain: three finite values and both infinities
@@ -405,8 +398,7 @@ def special_floats(tmp_path):
         gain = [1.0, 2.0, float('inf'), float('-inf'), 5.0]
 
         for index in range(len(snr)):
-            roi = Roi(_entarchy=ent, _id=f'Roi_{index}', _parent=layer)
-            ent.add_entity(roi)
+            roi = layer.add_child(Roi, f'Roi_{index}')
             roi['index'] = index
             roi['snr'] = snr[index]
             roi['gain'] = gain[index]
