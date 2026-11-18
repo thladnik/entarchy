@@ -82,7 +82,7 @@ class Entity(object):
 
             subject = Subject('subject01')
             subject['strain'] = 'wt'
-            ent.add_new_entity(subject)        # or parent.add_child(subject)
+            ent.add_entity(subject)        # or parent.add_child(subject)
 
         It is built without an entarchy and bound to one when it is added;
         attributes written before that are kept and go in with it. The keyword
@@ -104,7 +104,7 @@ class Entity(object):
         if _id is not None and not isinstance(_id, str):
             raise TypeError(
                 f'{type(self).__name__}({_id!r}): the first argument is the id, a string. '
-                f'The entarchy is bound by ent.add_new_entity(entity) or '
+                f'The entarchy is bound by ent.add_entity(entity) or '
                 f'parent.add_child(entity), or passed as _entarchy=.')
 
         self._entarchy = _entarchy
@@ -127,7 +127,7 @@ class Entity(object):
         # An entity built with an entarchy is in its registry at once; one built
         #  without is registered when it is added
         if _entarchy is not None:
-            _entarchy.add_existing_entity(self)
+            _entarchy._register_entity(self)
 
         # Initialize cache if provided
         if _init_cache is not None:
@@ -160,7 +160,7 @@ class Entity(object):
         if len(args) > 0 and not isinstance(args[0], str):
             raise TypeError(
                 f'{cls.__name__}({args[0]!r}, ...): the first argument is the id, a string. '
-                f'The entarchy is bound by ent.add_new_entity(entity) or '
+                f'The entarchy is bound by ent.add_entity(entity) or '
                 f'parent.add_child(entity), or passed as _entarchy=.')
 
         # Identity map: a stored entity materialized twice in one entarchy is
@@ -569,11 +569,11 @@ class Entity(object):
             if k not in self._attributes_to_update:
                 self._attributes_to_update.append(k)
 
-        # Unbound, the writes wait in the cache; add_new_entity takes them along
+        # Unbound, the writes wait in the cache; add_entity takes them along
         if not self.is_bound:
             return
 
-        self.entarchy.add_entity_for_update(self)
+        self.entarchy._add_entity_for_update(self)
 
         # If not in context, update immediately
         #  (commit() defers entities that are still queued for insertion)
@@ -632,7 +632,7 @@ class Entity(object):
         The child's type must be one the entarchy's stored hierarchy puts under
         this entity's type; under the root entity, a root type. This is the only
         place the hierarchy is checked when an entity is written:
-        `Entarchy.add_new_entity` stores whatever parent the entity was
+        `Entarchy.add_entity` stores whatever parent the entity was
         constructed with, and a wrong one is found only by the queries that then
         fail to see the entity.
 
@@ -668,7 +668,7 @@ class Entity(object):
                 raise ValueError(f'{instance} has already been added.')
             instance._parent = self
 
-        self.entarchy.add_new_entity(instance)
+        self.entarchy.add_entity(instance)
 
         if attributes:
             instance[list(attributes)] = list(attributes.values())
@@ -703,13 +703,13 @@ class Entity(object):
     def entarchy(self) -> Entarchy:
         if self._entarchy is None:
             raise RuntimeError(f'{self} is not bound to an entarchy yet: add it with '
-                               f'ent.add_new_entity(entity) or parent.add_child(entity).')
+                               f'ent.add_entity(entity) or parent.add_child(entity).')
         return self._entarchy
 
     @property
     def is_bound(self) -> bool:
         """Whether this entity belongs to an entarchy yet. A new entity is
-        unbound until add_new_entity or add_child takes it."""
+        unbound until add_entity or add_child takes it."""
         return self._entarchy is not None
 
     @property
@@ -766,7 +766,7 @@ class Entity(object):
 
         if not self.is_bound:
             raise RuntimeError(f'{self} is not bound to an entarchy; nothing to commit to. '
-                               f'ent.add_new_entity(entity) stores it with its attributes.')
+                               f'ent.add_entity(entity) stores it with its attributes.')
 
         # Attributes cannot be written before the entity row exists. Entities that
         #  are still queued for insertion stay on the update list; Entarchy.commit()
@@ -775,7 +775,7 @@ class Entity(object):
             return
 
         # Remove entity from entarchy update list
-        self.entarchy.remove_entity_from_update(self)
+        self.entarchy._remove_entity_from_update(self)
 
         # Update attributes in backend if updates are pending
         if len(self._attributes_to_update) > 0:

@@ -98,7 +98,7 @@ attributes written in between:
 ```python
 session = Session('01')
 session['duration'] = 42.0
-participant_a.add_child(session)      # or ent.add_new_entity(session), which
+participant_a.add_child(session)      # or ent.add_entity(session), which
                                       #  puts a root type under ent.root
 ```
 
@@ -117,7 +117,7 @@ Stimulus = ent.add_entity_type('Stimulus')              # a second root
 ent.root.add_child(Subject, 'A').add_child(Session, '01')
 
 subject_b = Subject('B')                                 # built by id alone,
-ent.add_new_entity(subject_b)                            #  bound when added
+ent.add_entity(subject_b)                            #  bound when added
 ```
 
 A type added by name gets a plain `Entity` subclass of that name, which is what

@@ -19,10 +19,10 @@ def many(ent):
     """A collection large enough to spread over several workers."""
     with ent:
         subject = Subject(_entarchy=ent, _id='subject', _parent=ent.root)
-        ent.add_new_entity(subject)
+        ent.add_entity(subject)
         for i in range(12):
             session = Session(_entarchy=ent, _id=f'sess_{i}', _parent=subject)
-            ent.add_new_entity(session)
+            ent.add_entity(session)
             session['index'] = i
             session['score'] = float(i)
     return ent
@@ -34,12 +34,12 @@ def grouped(ent):
     with ent:
         for s in range(3):
             subject = Subject(_entarchy=ent, _id=f'subject_{s}', _parent=ent.root)
-            ent.add_new_entity(subject)
+            ent.add_entity(subject)
             subject['label'] = f'label_{s}'
 
             for i in range(6):
                 session = Session(_entarchy=ent, _id=f'sess_{s}_{i}', _parent=subject)
-                ent.add_new_entity(session)
+                ent.add_entity(session)
                 session['index'] = i
                 session['score'] = float(i)
     return ent
@@ -344,11 +344,11 @@ class TestLocality:
         """A single huge group must still spread over the workers."""
         with ent:
             subject = Subject(_entarchy=ent, _id='only', _parent=ent.root)
-            ent.add_new_entity(subject)
+            ent.add_entity(subject)
             subject['label'] = 'x'
             for i in range(20):
                 session = Session(_entarchy=ent, _id=f's{i}', _parent=subject)
-                ent.add_new_entity(session)
+                ent.add_entity(session)
                 session['index'] = i
 
         ent.get(Session).map_async(_mp_worker.record_locality, _worker_num=2,

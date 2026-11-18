@@ -22,10 +22,10 @@ def _release_pool():
 def many(ent):
     with ent:
         subject = Subject(_entarchy=ent, _id='subject', _parent=ent.root)
-        ent.add_new_entity(subject)
+        ent.add_entity(subject)
         for i in range(8):
             session = Session(_entarchy=ent, _id=f'sess_{i}', _parent=subject)
-            ent.add_new_entity(session)
+            ent.add_entity(session)
             session['index'] = i
             session['score'] = float(i)
     return ent
@@ -156,7 +156,7 @@ class TestEntityHtmlRepr:
     def test_escapes_html(self, ent):
         with ent:
             subject = Subject(_entarchy=ent, _id='<script>alert(1)</script>', _parent=ent.root)
-            ent.add_new_entity(subject)
+            ent.add_entity(subject)
 
         rendered = subject._repr_html_()
         assert '<script>' not in rendered

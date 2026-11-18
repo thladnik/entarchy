@@ -352,7 +352,7 @@ belong to several at once.
 # cluster nodes are ordinary entities; AnalysisEntity already exists for this
 with ent:
     cluster = AnalysisEntity(_entarchy=ent, _id='cmn_cluster_03', _parent=ent.root)
-    ent.add_new_entity(cluster)
+    ent.add_entity(cluster)
     cluster['method'] = 'ward'
     cluster['centroid_eta'] = centroid
 
@@ -639,7 +639,7 @@ path achieves ~0.4 ms per value.
 
 Profiling showed the diagnosis was wrong. `add_entities` was already 0.14 ms per
 entity; the cost was in the per-entity attribute commit that follows it, since
-`add_new_entity` writes `id` and `uuid`. Of that, `sqlite3.Connection.commit`
+`add_entity` writes `id` and `uuid`. Of that, `sqlite3.Connection.commit`
 alone was 2.98 s of 5.35 s — a commit is an fsync, measured at 5.91 ms against
 0.028 ms for the same insert inside a transaction. `Entarchy.commit()` now runs
 as one batch, which brings entity creation to about 3 ms and makes a block

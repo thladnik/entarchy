@@ -26,21 +26,21 @@ def sortable(tmp_path):
 
     with ent:
         animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
-        ent.add_new_entity(animal)
+        ent.add_entity(animal)
         animal['strain'] = 'wildtype'
 
         recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
-        ent.add_new_entity(recording)
+        ent.add_entity(recording)
         recording['rate'] = 10.0
 
         for layer_index in range(2):
             layer = Layer(_entarchy=ent, _id=f'plane{layer_index}', _parent=recording)
-            ent.add_new_entity(layer)
+            ent.add_entity(layer)
             layer['depth'] = float(layer_index * 15)
 
             for roi_index in range(12):
                 roi = Roi(_entarchy=ent, _id=f'Roi_{roi_index}', _parent=layer)
-                ent.add_new_entity(roi)
+                ent.add_entity(roi)
                 roi['index'] = roi_index
                 roi['score'] = float((roi_index * 5) % 12)
                 # Only some ROIs have this one, for the missing= tests

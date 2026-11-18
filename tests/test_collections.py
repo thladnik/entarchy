@@ -174,11 +174,11 @@ class TestNumericLiteralTypes:
     def typed(self, ent):
         with ent:
             subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
-            ent.add_new_entity(subject)
+            ent.add_entity(subject)
 
             for index in range(4):
                 session = Session(_entarchy=ent, _id=f'sess_{index}', _parent=subject)
-                ent.add_new_entity(session)
+                ent.add_entity(session)
                 session['count'] = index * 10          # int -> value_int
                 session['depth'] = float(index) * 15.0  # float -> value_float
                 session['label'] = f'row_{index}'

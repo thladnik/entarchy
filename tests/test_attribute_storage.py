@@ -111,7 +111,7 @@ class TestPlannerStatistics:
         with ent:
             from conftest import Animal
             animal = Animal(_entarchy=ent, _id='a', _parent=ent.root)
-            ent.add_new_entity(animal)
+            ent.add_entity(animal)
             animal['strain'] = 'wildtype'
 
         # Touch the tables, since PRAGMA optimize only analyses what a session used

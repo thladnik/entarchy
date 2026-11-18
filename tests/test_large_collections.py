@@ -38,14 +38,14 @@ def wide(tmp_path_factory):
 
     with ent:
         animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
-        ent.add_new_entity(animal)
+        ent.add_entity(animal)
         recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
-        ent.add_new_entity(recording)
+        ent.add_entity(recording)
         layer = Layer(_entarchy=ent, _id='plane0', _parent=recording)
-        ent.add_new_entity(layer)
+        ent.add_entity(layer)
 
         for index in range(LARGE):
-            ent.add_new_entity(Roi(_entarchy=ent, _id=f'roi_{index}', _parent=layer))
+            ent.add_entity(Roi(_entarchy=ent, _id=f'roi_{index}', _parent=layer))
 
     yield ent
     ent.backend.close()

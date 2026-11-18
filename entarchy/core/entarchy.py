@@ -539,7 +539,7 @@ class Entarchy(object):
         # Create entarchy entity
         with ent:
             ent_entity = EntarchyEntity('Entarchy', _entarchy=ent)
-            ent.add_new_entity(ent_entity)
+            ent.add_entity(ent_entity)
 
         # Update config to include entarchy entity uuid
         _config.update({'entarchy_uuid': ent_entity.uuid})
@@ -552,7 +552,7 @@ class Entarchy(object):
 
         return ent
 
-    def add_entity_for_update(self, entity: Entity) -> None:
+    def _add_entity_for_update(self, entity: Entity) -> None:
         """Mark an entity for update in the backend.
 
         Args:
@@ -565,14 +565,19 @@ class Entarchy(object):
         if entity.uuid not in self._entities_to_update:
             self._entities_to_update.append(entity.uuid)
 
-    def add_new_entity(self, entity: Entity) -> None:
-        """Add an entity to the entarchy system.
+    def add_entity(self, entity: Entity) -> None:
+        """Store a new entity.
 
-        Args:
-            entity (Entity): The entity to add.
+            subject = Subject('subject01')
+            subject['strain'] = 'wt'
+            ent.add_entity(subject)
 
-        Returns:
-            None
+        binds the entity to this entarchy and writes it with the attributes set
+        so far; outside a `with ent:` block at once, inside it on exit. An
+        entity of a root type goes under `ent.root`, which is where
+        `ent.root.add_child(Subject, 'subject01')` puts it too. A child type
+        has to come through its parent, `parent.add_child(entity)`, which sets
+        the parent and calls this.
         """
 
         if not isinstance(entity, Entity):
@@ -581,7 +586,7 @@ class Entarchy(object):
                 hint = (f' {entity!r} is a deferred query; .get_from(ent) evaluates it, '
                         f'and parent.add_child({entity._entity_type.__name__}, "id") '
                         f'creates an entity.')
-            raise TypeError(f'add_new_entity takes an Entity, not '
+            raise TypeError(f'add_entity takes an Entity, not '
                             f'{type(entity).__name__}.{hint}')
 
         if not entity.is_bound:
@@ -603,12 +608,12 @@ class Entarchy(object):
 
         # Queue the entity first, so attribute writes below are deferred and
         #  the entity row is guaranteed to exist before its attribute rows
-        self.add_existing_entity(entity)
+        self._register_entity(entity)
         self._entities_to_add.append(entity.uuid)
 
         # Attributes written while the entity was unbound go in with it
         if len(entity._attributes_to_update) > 0:
-            self.add_entity_for_update(entity)
+            self._add_entity_for_update(entity)
 
         # Add immutable id attributes
         entity['id'] = entity.id
@@ -622,15 +627,9 @@ class Entarchy(object):
         """Check whether an entity is queued for insertion but not yet committed."""
         return entity.uuid in self._entities_to_add
 
-    def add_existing_entity(self, entity: Entity) -> None:
-        """Add an entity to the entarchy system.
-
-        Args:
-            entity (Entity): The entity to add.
-
-        Returns:
-            None
-        """
+    def _register_entity(self, entity: Entity) -> None:
+        """Put an entity in the identity map, so that materializing its uuid
+        again gives this same object."""
         self._entities[entity.uuid] = entity
 
     def commit(self) -> None:
@@ -1093,7 +1092,7 @@ class Entarchy(object):
 
         link_entity = LinkEntity(f'{spec.name}@{linked_uuid}', _entarchy=self,
                                  _parent=self.get_entity_by_uuid(linker_uuid))
-        self.add_new_entity(link_entity)
+        self.add_entity(link_entity)
 
         self._links_to_add.append({'link_uuid': link_entity.uuid,
                                    'link_type': spec.name,
@@ -1104,7 +1103,7 @@ class Entarchy(object):
         if attributes:
             link_entity.update(attributes)
 
-        # Outside a context the entity was already committed by add_new_entity,
+        # Outside a context the entity was already committed by add_entity,
         #  so the link row has to follow immediately
         if not self.is_in_context:
             self.commit()
@@ -1553,7 +1552,7 @@ class Entarchy(object):
 
         self._entities.pop(_uuid, None)
 
-    def remove_entity_from_update(self, entity: Entity) -> None:
+    def _remove_entity_from_update(self, entity: Entity) -> None:
         """Unmark an entity for update in the backend.
 
         Args:
@@ -1584,7 +1583,7 @@ class Entarchy(object):
 
             if len(existing_data) == 0:
                 _analysis_entity = AnalysisEntity(_analysis, _entarchy=self)
-                self.add_new_entity(_analysis_entity)
+                self.add_entity(_analysis_entity)
                 self.commit()
             else:
                 # Reuse the persisted UUID. Creating a fresh entity object here would

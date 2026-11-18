@@ -69,12 +69,12 @@ def ent(tmp_path, schema_name):
 def populated(ent):
     with ent:
         subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
-        ent.add_new_entity(subject)
+        ent.add_entity(subject)
         subject['strain'] = 'wildtype'
 
         for i in range(6):
             session = Session(_entarchy=ent, _id=f'sess_{i}', _parent=subject)
-            ent.add_new_entity(session)
+            ent.add_entity(session)
             session['index'] = i
             session['score'] = float(i) * 1.5
             session['flag'] = (i % 2 == 0)
@@ -367,7 +367,7 @@ class TestDigestMode:
         def ingest(entarchy_obj):
             with entarchy_obj:
                 subject = Subject(_entarchy=entarchy_obj, _id='ingested', _parent=entarchy_obj.root)
-                entarchy_obj.add_new_entity(subject)
+                entarchy_obj.add_entity(subject)
                 subject['raw'] = 1
             return subject
 
@@ -460,10 +460,10 @@ class TestAttributeStorage:
         """The pivot's name restriction must not drop them (it is an outer join)."""
         with ent:
             subject = Subject(_entarchy=ent, _id='subject', _parent=ent.root)
-            ent.add_new_entity(subject)
+            ent.add_entity(subject)
             for i in range(6):
                 session_entity = Session(_entarchy=ent, _id=f's_{i}', _parent=subject)
-                ent.add_new_entity(session_entity)
+                ent.add_entity(session_entity)
                 session_entity['index'] = i
                 if i < 2:
                     session_entity['sparse'] = float(i)
@@ -753,11 +753,11 @@ class TestSortingAgreesAcrossBackends:
     def _fill(self, entarchy):
         with entarchy:
             subject = Subject(_entarchy=entarchy, _id='subject_a', _parent=entarchy.root)
-            entarchy.add_new_entity(subject)
+            entarchy.add_entity(subject)
 
             for index, label in enumerate(self.LABELS):
                 session = Session(_entarchy=entarchy, _id=f'sess_{index}', _parent=subject)
-                entarchy.add_new_entity(session)
+                entarchy.add_entity(session)
                 session['index'] = index
                 session['label'] = label
                 session['score'] = float(index % 3)
@@ -850,11 +850,11 @@ class TestDescribeAgreesAcrossBackends:
     def _fill(self, entarchy):
         with entarchy:
             subject = Subject(_entarchy=entarchy, _id='subject_a', _parent=entarchy.root)
-            entarchy.add_new_entity(subject)
+            entarchy.add_entity(subject)
 
             for index, label in enumerate(self.LABELS):
                 session = Session(_entarchy=entarchy, _id=f'sess_{index}', _parent=subject)
-                entarchy.add_new_entity(session)
+                entarchy.add_entity(session)
                 session['index'] = index
                 session['label'] = label
                 session['score'] = self.SCORES[index]
@@ -975,11 +975,11 @@ class TestMatrixAgreesAcrossBackends:
     def _fill(self, entarchy, values):
         with entarchy:
             subject = Subject(_entarchy=entarchy, _id='subject_a', _parent=entarchy.root)
-            entarchy.add_new_entity(subject)
+            entarchy.add_entity(subject)
 
             for index in range(2 * self.SIZE):
                 session = Session(_entarchy=entarchy, _id=f'sess_{index}', _parent=subject)
-                entarchy.add_new_entity(session)
+                entarchy.add_entity(session)
                 session['index'] = index
                 session['side'] = 'left' if index < self.SIZE else 'right'
 
