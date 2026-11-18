@@ -110,7 +110,7 @@ class TestPlannerStatistics:
         ent = DeepArchy.create(base, SQLiteBackend(base, dbname='stats.db'))
         with ent:
             from conftest import Animal
-            animal = Animal(ent, _id='a', _parent=ent.root)
+            animal = Animal(_entarchy=ent, _id='a', _parent=ent.root)
             ent.add_new_entity(animal)
             animal['strain'] = 'wildtype'
 

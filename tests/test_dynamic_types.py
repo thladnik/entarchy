@@ -273,15 +273,99 @@ class TestAddChildByName:
         ent.backend.close()
 
 
-class TestTheIdForTheEntarchyMistake:
+class TestUnboundEntities:
+    """An entity is built by id alone and bound by the entarchy that takes it."""
 
-    def test_a_string_where_the_entarchy_goes_is_named(self, bare):
-        """Experiment('Exp_01') used to build a deferred query; now the
-        constructor says what the first argument is and where to go."""
-        Experiment = bare.add_entity_type('Experiment')
+    def test_add_new_entity_binds_a_root_type_under_the_root(self, bare):
+        Subject_ = bare.add_entity_type('Subject')
+        subject = Subject_('subject01')
+        assert not subject.is_bound and subject.parent is None
 
-        with pytest.raises(TypeError, match=r"add_child\(Experiment, 'Exp_01'\).*Experiment.where\('Exp_01'\)"):
-            Experiment('Exp_01')
+        bare.add_new_entity(subject)
+
+        assert subject.is_bound and subject.entarchy is bare
+        assert subject.parent.uuid == bare.root.uuid
+        assert [s.id for s in bare.get('Subject')] == ['subject01']
+
+    def test_attributes_written_before_binding_go_in_with_it(self, tmp_path):
+        ent = plain(tmp_path)
+        Subject_ = ent.add_entity_type('Subject')
+        subject = Subject_('subject01')
+        subject['strain'] = 'wt'
+        subject['age'] = 27
+        assert 'strain' in subject and 'weight' not in subject
+        assert sorted(subject.keys()) == ['age', 'strain']
+        assert subject[['strain', 'age']] == ('wt', 27)
+
+        ent.add_new_entity(subject)
+        ent.backend.close()
+
+        reopened = entarchy.Entarchy(tmp_path.joinpath('plain').as_posix())
+        stored = reopened.get('Subject')[0]
+        assert stored[['strain', 'age', 'id']] == ('wt', 27, 'subject01')
+        reopened.backend.close()
+
+    def test_inside_a_context(self, bare):
+        Subject_ = bare.add_entity_type('Subject')
+        with bare:
+            for i in range(3):
+                subject = Subject_(f's{i}')
+                subject['index'] = i
+                bare.add_new_entity(subject)
+            assert len(bare.get('Subject')) == 0
+
+        assert sorted(s['index'] for s in bare.get('Subject')) == [0, 1, 2]
+
+    def test_add_child_binds_too(self, bare):
+        Subject_ = bare.add_entity_type('Subject')
+        Session_ = bare.add_entity_type('Session', parent=Subject_)
+        subject = bare.root.add_child(Subject_, 'subj_1')
+
+        session = Session_('sess_1')
+        session['rate'] = 10.0
+        subject.add_child(session)
+
+        assert session.entarchy is bare and session.parent is subject
+        assert bare.get('Session')[0]['rate'] == 10.0
+
+    def test_a_child_type_needs_its_parent(self, bare):
+        Subject_ = bare.add_entity_type('Subject')
+        Session_ = bare.add_entity_type('Session', parent=Subject_)
+
+        with pytest.raises(ValueError, match='Session is a child type of Subject.*add_child'):
+            bare.add_new_entity(Session_('sess_1'))
+
+        assert len(bare.get('Session')) == 0
+
+    def test_what_an_unbound_entity_cannot_do(self, bare):
+        Subject_ = bare.add_entity_type('Subject')
+        subject = Subject_('subject01')
+
+        with pytest.raises(RuntimeError, match='not bound to an entarchy yet'):
+            subject.entarchy
+        with pytest.raises(RuntimeError, match='nothing to commit'):
+            subject.commit()
+        with pytest.raises(KeyError, match='not written'):
+            subject['strain']
+        with pytest.raises(RuntimeError, match='entity identity'):
+            subject['id'] = 'other'
+
+    def test_bound_elsewhere(self, bare, ent):
+        subject = Subject('subject01')
+        bare.add_entity_type('Subject')
+        bare.add_new_entity(subject)
+
+        with pytest.raises(ValueError, match='different entarchy'):
+            ent.add_new_entity(subject)
+
+    def test_the_first_argument_is_the_id(self, bare):
+        Subject_ = bare.add_entity_type('Subject')
+
+        with pytest.raises(TypeError, match='the first argument is the id'):
+            Subject_(bare, _id='subject01')
+
+        with pytest.raises(TypeError):
+            Subject_('subject01', bare)   # the entarchy is keyword-only
 
     def test_a_deferred_query_handed_to_add_new_entity(self, bare):
         Experiment = bare.add_entity_type('Experiment')

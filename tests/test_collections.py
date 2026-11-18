@@ -173,11 +173,11 @@ class TestNumericLiteralTypes:
     @pytest.fixture()
     def typed(self, ent):
         with ent:
-            subject = Subject(ent, _id='subject_a', _parent=ent.root)
+            subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
             ent.add_new_entity(subject)
 
             for index in range(4):
-                session = Session(ent, _id=f'sess_{index}', _parent=subject)
+                session = Session(_entarchy=ent, _id=f'sess_{index}', _parent=subject)
                 ent.add_new_entity(session)
                 session['count'] = index * 10          # int -> value_int
                 session['depth'] = float(index) * 15.0  # float -> value_float

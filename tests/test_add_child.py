@@ -31,7 +31,7 @@ class TestCreatesTheChild:
 
     def test_from_an_instance(self, ent):
         subject = ent.root.add_child(Subject, 'subj_1')
-        session = Session(ent, _id='sess_1')
+        session = Session('sess_1')
 
         returned = subject.add_child(session)
 
@@ -41,7 +41,7 @@ class TestCreatesTheChild:
 
     def test_an_instance_built_with_this_parent_is_fine(self, ent):
         subject = ent.root.add_child(Subject, 'subj_1')
-        session = Session(ent, _id='sess_1', _parent=subject)
+        session = Session(_entarchy=ent, _id='sess_1', _parent=subject)
 
         subject.add_child(session)
 
@@ -95,7 +95,7 @@ class TestTheTypeCheck:
 
     def test_the_instance_form_is_checked_too(self, ent):
         subject = ent.root.add_child(Subject, 'subj_1')
-        another = Subject(ent, _id='subj_2')
+        another = Subject('subj_2')
 
         with pytest.raises(TypeError, match='cannot be a child'):
             subject.add_child(another)
@@ -143,12 +143,12 @@ class TestArguments:
 
     def test_an_instance_takes_no_id(self, ent):
         with pytest.raises(ValueError, match='has its id already'):
-            ent.root.add_child(Subject(ent, _id='subj_1'), 'subj_2')
+            ent.root.add_child(Subject('subj_1'), 'subj_2')
 
     def test_an_instance_with_another_parent(self, ent):
         a = ent.root.add_child(Subject, 'a')
         b = ent.root.add_child(Subject, 'b')
-        session = Session(ent, _id='sess_1', _parent=a)
+        session = Session(_entarchy=ent, _id='sess_1', _parent=a)
 
         with pytest.raises(ValueError, match='is a child of .*a.*, not of'):
             b.add_child(session)
@@ -163,7 +163,7 @@ class TestArguments:
 
     def test_an_instance_from_another_entarchy(self, ent, deep):
         subject = ent.root.add_child(Subject, 'subj_1')
-        foreign = Session(deep, _id='sess_1')
+        foreign = Session(_entarchy=deep, _id='sess_1')
 
         with pytest.raises(ValueError, match='different entarchy'):
             subject.add_child(foreign)

@@ -538,7 +538,7 @@ class Entarchy(object):
 
         # Create entarchy entity
         with ent:
-            ent_entity = EntarchyEntity(ent, _id='Entarchy', _parent=None)
+            ent_entity = EntarchyEntity('Entarchy', _entarchy=ent)
             ent.add_new_entity(ent_entity)
 
         # Update config to include entarchy entity uuid
@@ -584,10 +584,31 @@ class Entarchy(object):
             raise TypeError(f'add_new_entity takes an Entity, not '
                             f'{type(entity).__name__}.{hint}')
 
+        if not entity.is_bound:
+            entity._entarchy = self
+        elif entity.entarchy is not self:
+            raise ValueError(f'{entity} belongs to a different entarchy.')
+
+        # An entity of a root type with no parent goes under the root entity,
+        #  which is where add_child puts them; a child type has to say whose
+        #  child it is. The built-in types stay parentless.
+        type_name = type(entity).__name__
+        if entity._parent is None and type_name not in BUILTIN_TYPES:
+            parent_type = self._parents().get(type_name)
+            if parent_type is None:
+                entity._parent = self.root
+            else:
+                raise ValueError(f'{entity} needs a parent: {type_name} is a child type of '
+                                 f'{parent_type}. parent.add_child(entity) sets it.')
+
         # Queue the entity first, so attribute writes below are deferred and
         #  the entity row is guaranteed to exist before its attribute rows
         self.add_existing_entity(entity)
         self._entities_to_add.append(entity.uuid)
+
+        # Attributes written while the entity was unbound go in with it
+        if len(entity._attributes_to_update) > 0:
+            self.add_entity_for_update(entity)
 
         # Add immutable id attributes
         entity['id'] = entity.id
@@ -863,7 +884,7 @@ class Entarchy(object):
 
     def get_entity(self, entity_type_name: str, _uuid: str, _id: str) -> Entity:
 
-        return self.get_entity_type(entity_type_name)(self, _uuid=_uuid, _id=_id)
+        return self.get_entity_type(entity_type_name)(_entarchy=self, _uuid=_uuid, _id=_id)
 
     def get_entity_by_uuid(self, _uuid: str) -> Entity:
 
@@ -1070,8 +1091,7 @@ class Entarchy(object):
                     f'"{spec.name}" is declared one_per_linker and {linker_uuid} already '
                     f'has one. Remove it first, or declare the kind sparse.')
 
-        link_entity = LinkEntity(self,
-                                 _id=f'{spec.name}@{linked_uuid}',
+        link_entity = LinkEntity(f'{spec.name}@{linked_uuid}', _entarchy=self,
                                  _parent=self.get_entity_by_uuid(linker_uuid))
         self.add_new_entity(link_entity)
 
@@ -1563,14 +1583,14 @@ class Entarchy(object):
             existing_data = [r for r in res if r[1] == _analysis]
 
             if len(existing_data) == 0:
-                _analysis_entity = AnalysisEntity(self, _id=_analysis)
+                _analysis_entity = AnalysisEntity(_analysis, _entarchy=self)
                 self.add_new_entity(_analysis_entity)
                 self.commit()
             else:
                 # Reuse the persisted UUID. Creating a fresh entity object here would
                 #  generate a new random UUID each session, and attributes written on
                 #  the analysis in an earlier session would no longer be reachable.
-                _analysis_entity = AnalysisEntity(self, _uuid=existing_data[0][0], _id=_analysis)
+                _analysis_entity = AnalysisEntity(_analysis, _entarchy=self, _uuid=existing_data[0][0])
         elif isinstance(_analysis, AnalysisEntity):
             _analysis_entity = _analysis
         else:

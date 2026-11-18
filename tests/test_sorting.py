@@ -25,21 +25,21 @@ def sortable(tmp_path):
     ent = DeepArchy.create(base, SQLiteBackend(base, dbname='sortable.db'))
 
     with ent:
-        animal = Animal(ent, _id='animal_1', _parent=ent.root)
+        animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
         ent.add_new_entity(animal)
         animal['strain'] = 'wildtype'
 
-        recording = Recording(ent, _id='rec_0', _parent=animal)
+        recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
         ent.add_new_entity(recording)
         recording['rate'] = 10.0
 
         for layer_index in range(2):
-            layer = Layer(ent, _id=f'plane{layer_index}', _parent=recording)
+            layer = Layer(_entarchy=ent, _id=f'plane{layer_index}', _parent=recording)
             ent.add_new_entity(layer)
             layer['depth'] = float(layer_index * 15)
 
             for roi_index in range(12):
-                roi = Roi(ent, _id=f'Roi_{roi_index}', _parent=layer)
+                roi = Roi(_entarchy=ent, _id=f'Roi_{roi_index}', _parent=layer)
                 ent.add_new_entity(roi)
                 roi['index'] = roi_index
                 roi['score'] = float((roi_index * 5) % 12)

@@ -10,7 +10,7 @@ class TestIdentityMap:
 
     def test_same_uuid_returns_same_object(self, populated):
         first = populated.get(Session)[0]
-        again = Session(populated, _uuid=first.uuid, _id=first.id)
+        again = Session(_entarchy=populated, _uuid=first.uuid, _id=first.id)
         assert again is first
 
     def test_reconstruction_preserves_pending_updates(self, populated):
@@ -23,7 +23,7 @@ class TestIdentityMap:
 
             # Fetching the same entity again (e.g. via a collection) re-enters
             # __init__ with a stale init cache
-            same = Session(populated, _uuid=entity.uuid, _id=entity.id,
+            same = Session(_entarchy=populated, _uuid=entity.uuid, _id=entity.id,
                            _init_cache={'pending': 999, 'other': 5})
 
             assert same is entity

@@ -13,17 +13,17 @@ def filled(tmp_path):
     ent = DeepArchy.create(base, SQLiteBackend(base, dbname='completing.db'))
 
     with ent:
-        animal = Animal(ent, _id='animal_1', _parent=ent.root)
+        animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
         ent.add_new_entity(animal)
 
-        recording = Recording(ent, _id='rec_0', _parent=animal)
+        recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
         ent.add_new_entity(recording)
 
-        layer = Layer(ent, _id='plane0', _parent=recording)
+        layer = Layer(_entarchy=ent, _id='plane0', _parent=recording)
         ent.add_new_entity(layer)
 
         for index in range(3):
-            roi = Roi(ent, _id=f'Roi_{index}', _parent=layer)
+            roi = Roi(_entarchy=ent, _id=f'Roi_{index}', _parent=layer)
             ent.add_new_entity(roi)
             roi['index'] = index
             roi['s2p/npix'] = 10 + index

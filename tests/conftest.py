@@ -74,23 +74,23 @@ def deep(tmp_path):
     e = DeepArchy.create(base, SQLiteBackend(base, dbname='deep.db'))
 
     with e:
-        animal = Animal(e, _id='animal_1', _parent=e.root)
+        animal = Animal(_entarchy=e, _id='animal_1', _parent=e.root)
         e.add_new_entity(animal)
         animal['strain'] = 'wildtype'
         animal['age'] = 12
 
         for r in range(2):
-            recording = Recording(e, _id=f'rec_{r}', _parent=animal)
+            recording = Recording(_entarchy=e, _id=f'rec_{r}', _parent=animal)
             e.add_new_entity(recording)
             recording['rate'] = 10.0 + r
 
             for l in range(2):
-                layer = Layer(e, _id=f'plane{l}', _parent=recording)
+                layer = Layer(_entarchy=e, _id=f'plane{l}', _parent=recording)
                 e.add_new_entity(layer)
                 layer['depth'] = float(l * 15)
 
                 for i in range(3):
-                    roi = Roi(e, _id=f'roi_{i}', _parent=layer)
+                    roi = Roi(_entarchy=e, _id=f'roi_{i}', _parent=layer)
                     e.add_new_entity(roi)
                     roi['index'] = i
 
@@ -128,12 +128,12 @@ def make_link_row(ent, link_type, linker_uuid, linked_uuid, link_uuid=None):
 @pytest.fixture()
 def populated(ent):
     with ent:
-        subject = Subject(ent, _id='subject_a', _parent=ent.root)
+        subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
         ent.add_new_entity(subject)
         subject['strain'] = 'wildtype'
 
         for i in range(6):
-            sess = Session(ent, _id=f'sess_{i}', _parent=subject)
+            sess = Session(_entarchy=ent, _id=f'sess_{i}', _parent=subject)
             ent.add_new_entity(sess)
             sess['index'] = i
             sess['score'] = float(i) * 1.5

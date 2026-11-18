@@ -19,21 +19,21 @@ def described(tmp_path):
     video.write_bytes(b'FAKE-AVI' + bytes(range(256)) * 200)
 
     with ent:
-        animal = Animal(ent, _id='animal_1', _parent=ent.root)
+        animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
         ent.add_new_entity(animal)
         animal['strain'] = 'wildtype'
 
-        recording = Recording(ent, _id='rec_0', _parent=animal)
+        recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
         ent.add_new_entity(recording)
         recording['rate'] = 10.0
         recording['times'] = np.linspace(0, 1, 5000)
 
-        layer = Layer(ent, _id='plane0', _parent=recording)
+        layer = Layer(_entarchy=ent, _id='plane0', _parent=recording)
         ent.add_new_entity(layer)
         layer['depth'] = 0.0
 
         for index in range(6):
-            roi = Roi(ent, _id=f'Roi_{index}', _parent=layer)
+            roi = Roi(_entarchy=ent, _id=f'Roi_{index}', _parent=layer)
             ent.add_new_entity(roi)
             roi['index'] = index
             roi['good'] = (index % 2 == 0)
@@ -392,11 +392,11 @@ def special_floats(tmp_path):
     ent = DeepArchy.create(base, SQLiteBackend(base, dbname='floats.db'))
 
     with ent:
-        animal = Animal(ent, _id='animal_1', _parent=ent.root)
+        animal = Animal(_entarchy=ent, _id='animal_1', _parent=ent.root)
         ent.add_new_entity(animal)
-        recording = Recording(ent, _id='rec_0', _parent=animal)
+        recording = Recording(_entarchy=ent, _id='rec_0', _parent=animal)
         ent.add_new_entity(recording)
-        layer = Layer(ent, _id='plane0', _parent=recording)
+        layer = Layer(_entarchy=ent, _id='plane0', _parent=recording)
         ent.add_new_entity(layer)
 
         #        snr: three finite values and a NaN
@@ -405,7 +405,7 @@ def special_floats(tmp_path):
         gain = [1.0, 2.0, float('inf'), float('-inf'), 5.0]
 
         for index in range(len(snr)):
-            roi = Roi(ent, _id=f'Roi_{index}', _parent=layer)
+            roi = Roi(_entarchy=ent, _id=f'Roi_{index}', _parent=layer)
             ent.add_new_entity(roi)
             roi['index'] = index
             roi['snr'] = snr[index]

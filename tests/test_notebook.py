@@ -21,10 +21,10 @@ def _release_pool():
 @pytest.fixture()
 def many(ent):
     with ent:
-        subject = Subject(ent, _id='subject', _parent=ent.root)
+        subject = Subject(_entarchy=ent, _id='subject', _parent=ent.root)
         ent.add_new_entity(subject)
         for i in range(8):
-            session = Session(ent, _id=f'sess_{i}', _parent=subject)
+            session = Session(_entarchy=ent, _id=f'sess_{i}', _parent=subject)
             ent.add_new_entity(session)
             session['index'] = i
             session['score'] = float(i)
@@ -155,7 +155,7 @@ class TestEntityHtmlRepr:
 
     def test_escapes_html(self, ent):
         with ent:
-            subject = Subject(ent, _id='<script>alert(1)</script>', _parent=ent.root)
+            subject = Subject(_entarchy=ent, _id='<script>alert(1)</script>', _parent=ent.root)
             ent.add_new_entity(subject)
 
         rendered = subject._repr_html_()

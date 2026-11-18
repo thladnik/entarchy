@@ -72,11 +72,22 @@ class Entity(object):
     _is_in_context: bool = False
 
     def __init__(self,
-                 _entarchy: Entarchy,
-                 _uuid: str | None = None,
                  _id: str | None = None,
+                 *,
+                 _entarchy: Entarchy | None = None,
+                 _uuid: str | None = None,
                  _parent: Entity | None = None,
                  _init_cache: dict[str, Any] | None = None):
+        """An entity, by id.
+
+            subject = Subject('subject01')
+            subject['strain'] = 'wt'
+            ent.add_new_entity(subject)        # or parent.add_child(subject)
+
+        It is built without an entarchy and bound to one when it is added;
+        attributes written before that are kept and go in with it. The keyword
+        arguments are what the library uses to materialize stored entities.
+        """
 
         # __new__ may have returned an already-registered instance (identity map).
         #  In that case, __init__ runs again on that instance and must NOT reset its
@@ -90,12 +101,11 @@ class Entity(object):
                     self._attribute_cache.setdefault(k, v)
             return
 
-        if isinstance(_entarchy, str):
+        if _id is not None and not isinstance(_id, str):
             raise TypeError(
-                f'{type(self).__name__}({_entarchy!r}): the first argument is the entarchy, '
-                f'not an id or a query. Create an entity under its parent, '
-                f'parent.add_child({type(self).__name__}, {_entarchy!r}); query with '
-                f'{type(self).__name__}.where({_entarchy!r}).')
+                f'{type(self).__name__}({_id!r}): the first argument is the id, a string. '
+                f'The entarchy is bound by ent.add_new_entity(entity) or '
+                f'parent.add_child(entity), or passed as _entarchy=.')
 
         self._entarchy = _entarchy
         self._uuid = _uuid
@@ -114,8 +124,10 @@ class Entity(object):
         self._attribute_cache: dict[str, Any] = {}
         self._attributes_to_update: list[str] = []
 
-        # Add entity to entarchy object
-        self.entarchy.add_existing_entity(self)
+        # An entity built with an entarchy is in its registry at once; one built
+        #  without is registered when it is added
+        if _entarchy is not None:
+            _entarchy.add_existing_entity(self)
 
         # Initialize cache if provided
         if _init_cache is not None:
@@ -143,27 +155,23 @@ class Entity(object):
         return DeferredEntityCollection(cls, compose_expression(_string_expressions, _equalities))
 
     def __new__(cls, *args, **kwargs):
-        _entarchy = args[0] if len(args) > 0 else kwargs.get('_entarchy', None)
-        if _entarchy is None:
-            # Pickle reconstruction calls __new__ without constructor args.
-            # In that case, create a blank instance and let pickle restore state.
-            #  (Only applies during multiprocessing map calls, where the entity is reconstructed in a new process)
-            if len(args) == 0 and len(kwargs) == 0:
-                return super().__new__(cls)
+        # Subject(ent, _id='x') was the constructor once; Python's own error
+        #  for it, "multiple values for argument '_id'", says nothing useful
+        if len(args) > 0 and not isinstance(args[0], str):
+            raise TypeError(
+                f'{cls.__name__}({args[0]!r}, ...): the first argument is the id, a string. '
+                f'The entarchy is bound by ent.add_new_entity(entity) or '
+                f'parent.add_child(entity), or passed as _entarchy=.')
 
-            raise ValueError('_entarchy argument is required')
+        # Identity map: a stored entity materialized twice in one entarchy is
+        #  the same object, so pending writes on it are never lost
+        _entarchy = kwargs.get('_entarchy', None)
+        _uuid = kwargs.get('_uuid', None)
+        if _entarchy is not None and _uuid is not None and _uuid in _entarchy:
+            return _entarchy.get_entity_by_uuid(_uuid)
 
-        _uuid = args[1] if len(args) > 1 else kwargs.get('_uuid', None)
-        if _uuid is not None and _uuid in _entarchy:
-            obj = _entarchy.get_entity_by_uuid(_uuid)
-
-            # Update cache if provided
-            # _init_cache = kwargs.get('_init_cache', None)
-            # if _init_cache is not None:
-            #     obj.update_cache(_init_cache)
-
-            return obj
-
+        # Pickle reconstruction calls __new__ without arguments and restores
+        #  the state itself
         return super().__new__(cls)
 
     def __contains__(self, item: str) -> bool:
@@ -188,6 +196,10 @@ class Entity(object):
         # Cached attributes exist by definition; saves a database query
         if item in self._attribute_cache:
             return True
+
+        # Unbound, the cache is all there is
+        if not self.is_bound:
+            return False
 
         return self.entarchy.backend.has_entity_attribute(self, item)
 
@@ -259,6 +271,9 @@ class Entity(object):
         # Load missing attributes from backend
         keys_to_load = list(set(key) - set(self._attribute_cache.keys()))
         if len(keys_to_load) > 0:
+            if not self.is_bound:
+                raise KeyError(f'{sorted(keys_to_load)} not written on {self}, which is not '
+                               f'bound to an entarchy yet, so there is nowhere else to look.')
             if len(keys_to_load) == 1:
                 values = [
                     self.entarchy.backend.get_entity_attribute(self, keys_to_load[0])]
@@ -542,7 +557,7 @@ class Entity(object):
         # Reject identity rewrites up front, before any cache state is touched
         #  (they are only written once, while the entity is queued for insertion)
         for k in key:
-            if k in ('id', 'uuid') and not self.entarchy.is_pending_add(self):
+            if k in ('id', 'uuid') and not (self.is_bound and self.entarchy.is_pending_add(self)):
                 raise RuntimeError(f'Attribute "{k}" is the entity identity '
                                    f'and cannot be modified on {self}.')
 
@@ -553,6 +568,10 @@ class Entity(object):
 
             if k not in self._attributes_to_update:
                 self._attributes_to_update.append(k)
+
+        # Unbound, the writes wait in the cache; add_new_entity takes them along
+        if not self.is_bound:
+            return
 
         self.entarchy.add_entity_for_update(self)
 
@@ -606,9 +625,9 @@ class Entity(object):
             roi = layer.add_child(Roi, 'roi_0', index=0)
 
         constructs the Roi with this entity as its parent, persists it and writes
-        the attributes. An instance built beforehand with `Roi(ent, _id='roi_0')`
-        can be passed in place of the class; its parent must be this entity or
-        not set yet.
+        the attributes. An instance built beforehand, `Roi('roi_0')`, can be
+        passed in place of the class; its parent must be this entity or not set
+        yet, and attributes already written on it go in with it.
 
         The child's type must be one the entarchy's stored hierarchy puts under
         this entity's type; under the root entity, a root type. This is the only
@@ -637,9 +656,9 @@ class Entity(object):
         self._check_child_type(child_type)
 
         if instance is None:
-            instance = child_type(self.entarchy, _id=_id, _parent=self)
+            instance = child_type(_id, _entarchy=self.entarchy, _parent=self)
         else:
-            if instance.entarchy is not self.entarchy:
+            if instance.is_bound and instance.entarchy is not self.entarchy:
                 raise ValueError(f'{instance} belongs to a different entarchy than {self}.')
             # _parent is None until it is known; False once the backend said there is none
             if instance._parent is not None and instance._parent is not self:
@@ -682,7 +701,16 @@ class Entity(object):
 
     @property
     def entarchy(self) -> Entarchy:
+        if self._entarchy is None:
+            raise RuntimeError(f'{self} is not bound to an entarchy yet: add it with '
+                               f'ent.add_new_entity(entity) or parent.add_child(entity).')
         return self._entarchy
+
+    @property
+    def is_bound(self) -> bool:
+        """Whether this entity belongs to an entarchy yet. A new entity is
+        unbound until add_new_entity or add_child takes it."""
+        return self._entarchy is not None
 
     @property
     def id(self) -> str:
@@ -718,7 +746,7 @@ class Entity(object):
         Returns:
             Entity: The parent entity or None.
         """
-        if self._parent is None:
+        if self._parent is None and self.is_bound:
             res = self.entarchy.backend.get_entity_parent(self)
             if res is None:
                 self._parent = False
@@ -735,6 +763,10 @@ class Entity(object):
         return self.id
 
     def commit(self):
+
+        if not self.is_bound:
+            raise RuntimeError(f'{self} is not bound to an entarchy; nothing to commit to. '
+                               f'ent.add_new_entity(entity) stores it with its attributes.')
 
         # Attributes cannot be written before the entity row exists. Entities that
         #  are still queued for insertion stay on the update list; Entarchy.commit()
@@ -781,6 +813,8 @@ class Entity(object):
     def keys(self):
         """Return a list of all dynamic attribute keys for this entity.
         """
+        if not self.is_bound:
+            return list(self._attribute_cache.keys())
         return self.entarchy.backend.get_entity_attribute_names(self)
 
     def _ipython_key_completions_(self) -> list[str]:
@@ -2191,7 +2225,7 @@ class Collection(Generic[EntityT]):
         #  in-process run does not accumulate the whole collection in memory
         was_registered = _uuid in self.entarchy
 
-        entity = self.entity_type(self.entarchy, _uuid=_uuid, _id=_id)
+        entity = self.entity_type(_entarchy=self.entarchy, _uuid=_uuid, _id=_id)
         try:
             with entity:
                 fun(entity, **kwargs)
@@ -2557,7 +2591,7 @@ def _run_map_worker(task: tuple) -> tuple:
         kwargs['_use_gpu_device'] = (f'cuda:{_WORKER_CONTEXT["worker_index"] % gpu_device_count}'
                                      if gpu_device_count > 0 else 'cpu')
 
-    entity = entity_type(_entarchy, _uuid=_uuid, _id=_id)
+    entity = entity_type(_entarchy=_entarchy, _uuid=_uuid, _id=_id)
     error = None
     try:
         with entity:

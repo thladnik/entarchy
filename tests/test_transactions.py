@@ -60,7 +60,7 @@ class TestBatchDepth:
                 raise ValueError('boom')
 
         with ent:
-            subject = Subject(ent, _id='afterwards', _parent=ent.root)
+            subject = Subject(_entarchy=ent, _id='afterwards', _parent=ent.root)
             ent.add_new_entity(subject)
 
         assert len(ent.get(Subject, 'id == "afterwards"')) == 1
@@ -85,10 +85,10 @@ class TestAllOrNothing:
 
         with pytest.raises(RuntimeError, match='deliberate failure'):
             with ent:
-                subject = Subject(ent, _id='subject_a', _parent=ent.root)
+                subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
                 ent.add_new_entity(subject)
                 for index in range(5):
-                    ent.add_new_entity(Session(ent, _id=f'sess_{index}', _parent=subject))
+                    ent.add_new_entity(Session(_entarchy=ent, _id=f'sess_{index}', _parent=subject))
 
         # Nothing from the failed block survived, not even the entity rows that
         #  were inserted before the attribute write failed
@@ -98,10 +98,10 @@ class TestAllOrNothing:
         entities_before = _row_count(ent, EntityTable)
 
         with ent:
-            subject = Subject(ent, _id='subject_a', _parent=ent.root)
+            subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
             ent.add_new_entity(subject)
             for index in range(5):
-                ent.add_new_entity(Session(ent, _id=f'sess_{index}', _parent=subject))
+                ent.add_new_entity(Session(_entarchy=ent, _id=f'sess_{index}', _parent=subject))
 
         assert _row_count(ent, EntityTable) == entities_before + 6
         assert len(ent.get(Session)) == 5
@@ -111,7 +111,7 @@ class TestBatchingPreservesBehaviour:
 
     def test_attributes_written_in_a_batch_are_readable(self, ent):
         with ent:
-            subject = Subject(ent, _id='subject_a', _parent=ent.root)
+            subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
             ent.add_new_entity(subject)
             subject['strain'] = 'wildtype'
             subject['age'] = 12
@@ -122,10 +122,10 @@ class TestBatchingPreservesBehaviour:
     def test_later_writes_in_a_batch_see_earlier_ones(self, ent):
         """The batch flushes between statements, so reads inside it stay correct."""
         with ent:
-            subject = Subject(ent, _id='subject_a', _parent=ent.root)
+            subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
             ent.add_new_entity(subject)
             for index in range(3):
-                ent.add_new_entity(Session(ent, _id=f'sess_{index}', _parent=subject))
+                ent.add_new_entity(Session(_entarchy=ent, _id=f'sess_{index}', _parent=subject))
 
         # The child rows carry a foreign key to the parent, which only resolves
         #  if the parent row was visible when they were written
@@ -134,7 +134,7 @@ class TestBatchingPreservesBehaviour:
 
     def test_immutability_is_still_enforced(self, ent):
         with ent:
-            subject = Subject(ent, _id='subject_a', _parent=ent.root)
+            subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
             ent.add_new_entity(subject)
 
         with pytest.raises(RuntimeError, match='identity'):
@@ -143,7 +143,7 @@ class TestBatchingPreservesBehaviour:
 
     def test_writes_outside_a_batch_still_commit(self, ent):
         """Without an entarchy context each write commits on its own."""
-        subject = Subject(ent, _id='subject_a', _parent=ent.root)
+        subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
         ent.add_new_entity(subject)
         subject['strain'] = 'wildtype'
 
@@ -155,7 +155,7 @@ class TestBatchingPreservesBehaviour:
         before = _row_count(ent, AttributeTable)
 
         with ent:
-            subject = Subject(ent, _id='subject_a', _parent=ent.root)
+            subject = Subject(_entarchy=ent, _id='subject_a', _parent=ent.root)
             ent.add_new_entity(subject)
             subject['strain'] = 'wildtype'
 

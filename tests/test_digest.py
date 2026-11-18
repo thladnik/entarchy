@@ -9,7 +9,7 @@ from conftest import Session, Subject
 @entarchy.digest_method
 def ingest(ent, value=1):
     with ent:
-        subject = Subject(ent, _id='ingested', _parent=ent.root)
+        subject = Subject(_entarchy=ent, _id='ingested', _parent=ent.root)
         ent.add_new_entity(subject)
         subject['raw'] = value
     return subject
@@ -77,7 +77,7 @@ class TestCachePurging:
 
     def test_cache_is_purged_on_commit_in_digest_mode(self, ent):
         with ent:
-            subject = Subject(ent, _id='s', _parent=ent.root)
+            subject = Subject(_entarchy=ent, _id='s', _parent=ent.root)
             ent.add_new_entity(subject)
             subject['big'] = np.zeros(100)
 

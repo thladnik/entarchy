@@ -1275,7 +1275,7 @@ class SQLBackend(Backend):
             entity_id = entity_row.id
             entity_type = _entarchy.get_entity_type(entity_row.entity_type.name)
 
-        return entity_type(_entarchy, _uuid=entity_uuid, _id=entity_id)
+        return entity_type(_entarchy=_entarchy, _uuid=entity_uuid, _id=entity_id)
 
     @_retry_on_operational_failure
     def get_entity_modified_time(self, _entity: Entity) -> datetime.datetime:
