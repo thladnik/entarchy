@@ -614,6 +614,31 @@ class Entity(object):
                      for name in self.entarchy.child_type_names(parent))
 
     @overload
+    def get(self, entity_type: Type[EntityT], *_string_expressions: str,
+            **_equalities) -> Collection[EntityT]: ...
+
+    @overload
+    def get(self, entity_type: str, *_string_expressions: str,
+            **_equalities) -> Collection[Entity]: ...
+
+    def get(self, entity_type, *_string_expressions, **_equalities):
+        """The entities of a type below this one, filtered.
+
+            subject.get(Session)
+            subject.get(Session, 'rate > 5', quality='good')
+            animal.get(Roi)                   # any depth down, not only children
+
+        `Entarchy.get` scoped to this entity's subtree: the same type, filter
+        expressions and keyword equalities, and the same typed collection back.
+        On the root entity it is the whole store, `ent.get(...)`.
+        """
+        if isinstance(self, EntarchyEntity):
+            return self.entarchy.get(entity_type, *_string_expressions, **_equalities)
+
+        return self.entarchy.get(entity_type, f'[{type(self).__name__}]uuid == "{self.uuid}"',
+                                 *_string_expressions, **_equalities)
+
+    @overload
     def add_child(self, child: Type[EntityT], _id: str, /, **attributes: Any) -> EntityT: ...
 
     @overload

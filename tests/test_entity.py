@@ -2,8 +2,44 @@ import sys
 
 import pytest
 
-from conftest import Session, Subject
+from conftest import Animal, Layer, Recording, Roi, Session, Subject
 from entarchy.core import console
+
+
+class TestGet:
+    """entity.get(Type, ...) is ent.get(Type, ...) within the entity's subtree."""
+
+    def test_children(self, populated):
+        subject = populated.get(Subject)[0]
+        sessions = subject.get(Session)
+
+        assert sorted(s.id for s in sessions) == [f'sess_{i}' for i in range(6)]
+        assert all(s.parent.uuid == subject.uuid for s in sessions)
+
+    def test_filters_and_equalities(self, populated):
+        subject = populated.get(Subject)[0]
+
+        assert sorted(s['index'] for s in subject.get(Session, 'index > 2')) == [3, 4, 5]
+        assert sorted(s['index'] for s in subject.get(Session, 'index > 2', flag=True)) == [4]
+        assert len(subject.get('Session', score=0.0)) == 1
+
+    def test_any_depth_down_and_only_this_subtree(self, deep):
+        animal = deep.get(Animal)[0]
+        rec_0, rec_1 = sorted(animal.get(Recording), key=lambda r: r.id)
+
+        assert len(animal.get(Roi)) == 12
+        assert len(rec_0.get(Roi)) == 6
+        assert len(rec_0.get(Layer, depth=0.0)) == 1
+        assert {r.parent.parent.uuid for r in rec_1.get(Roi)} == {rec_1.uuid}
+
+    def test_the_typed_collection_comes_back(self, deep):
+        rois = deep.get(Animal)[0].get(Roi)
+
+        assert type(rois) is type(deep.get(Roi))
+        assert rois.sort('index').dataframe_of(['index']).shape == (12, 1)
+
+    def test_the_root_entity_is_the_whole_store(self, populated):
+        assert len(populated.root.get(Session, 'index > 2')) == 3
 
 
 class TestIdentityMap:

@@ -157,7 +157,15 @@ Roi.where('index > 3') & Layer.where('depth == 0.0')   # a deferred query, not y
                                                        #  bound: .get_from(ent)
 ```
 
-`ent.get(Roi)` stays for fetching a type whole. The deferred form combines
+`ent.get(Roi)` stays for fetching a type whole, and an entity scopes it to its
+own subtree, children or deeper:
+
+```python
+animal.get(Roi)                                   # the animal's ROIs, all layers
+animal.get(Roi, 'index > 3', quality='good')
+```
+
+The deferred form combines
 expressions on several types with `&`, `|`, `~` and `-` before any entarchy is
 involved, and prefixes the other type's expression with `[Layer]` by itself.
 
