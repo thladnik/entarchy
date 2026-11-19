@@ -254,6 +254,21 @@ class Entarchy(object):
         return [name for name, parent_name in self._parents().items()
                 if parent_name == parent and name not in BUILTIN_TYPES]
 
+    def add_child_entity_type(self, entity_type: Type[Entity] | str) -> Type[Entity]:
+        """Add a root entity type, and return its class.
+
+            Subject = ent.add_child_entity_type('Subject')
+            ent.add_child_entity_type(Experiment)    # a class, with the children
+                                                     #  declared on it
+
+        The root types are the children of the root entity, so this is the
+        entarchy's side of `Entity.add_child_entity_type`: on a class that
+        declares a child type, here it is written into the store. It is
+        `add_entity_type(entity_type)` with no parent; `add_entity_type` with
+        `parent=` puts a type under a stored type by name.
+        """
+        return self.add_entity_type(entity_type, parent=None)
+
     def add_entity_type(self, entity_type: Type[Entity] | str,
                         parent: Type[Entity] | str | None = None) -> Type[Entity]:
         """Add an entity type to the store, under `parent` or as a root, and return

@@ -109,9 +109,9 @@ types as the work needs them, each as a root or under a type already there:
 ```python
 ent = entarchy.Entarchy.create('path/to/folder/')
 
-Subject = ent.add_entity_type('Subject')
+Subject = ent.add_child_entity_type('Subject')
 Session = ent.add_entity_type('Session', parent=Subject)
-Stimulus = ent.add_entity_type('Stimulus')              # a second root
+Stimulus = ent.add_child_entity_type('Stimulus')        # a second root
 
 ent.root.add_child(Subject, 'A').add_child(Session, '01')
 
@@ -119,8 +119,10 @@ subject_b = Subject('B')                                 # built by id alone,
 ent.add_child(subject_b)                             #  bound when added
 ```
 
-A type added by name gets a plain `Entity` subclass of that name, which is what
-`add_entity_type` returns and what `ent.get('Session')` produces. Types are only
+`add_child_entity_type` on the entarchy adds a root type, as it declares a child
+type on a class; `add_entity_type` takes the parent by name. A type added by
+name gets a plain `Entity` subclass of that name, which is what both return and
+what `ent.get('Session')` produces. Types are only
 ever added: there is no renaming, moving or removing a type once entities of it
 exist, and `add_entity_type` refuses to put an existing type under a different
 parent.

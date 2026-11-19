@@ -54,6 +54,19 @@ class TestAPlainEntarchy:
         assert bare.get('Session')[0]['rate'] == 10.0
         assert session.parent.uuid == subject.uuid
 
+    def test_add_child_entity_type_adds_a_root_type(self, bare):
+        Subject_ = bare.add_child_entity_type('Subject')
+        assert bare.child_type_names(None) == ['Subject']
+        assert bare.add_entity_type('Subject') is Subject_
+
+        # The real class binds in place of the generated one and brings its
+        #  declared child along, as add_entity_type does
+        assert bare.add_child_entity_type(Subject) is Subject
+        assert bare.hierarchy['Subject'] == {'Session': {}}
+
+        with pytest.raises(ValueError, match='built-in'):
+            bare.add_child_entity_type('LinkEntity')
+
     def test_grows_by_class(self, bare):
         bare.add_entity_type(Subject)   # brings its declared child Session along
 
