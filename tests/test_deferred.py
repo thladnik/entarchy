@@ -74,6 +74,41 @@ class TestCrossTypeExpressions:
         result = combined.get_from(deep)
         assert len(result) == 2  # one per recording
 
+    def test_every_attribute_of_a_compound_expression_is_prefixed(self):
+        """Prefixing the string once scoped `depth == 0.0` and left `depth < 30`
+        on the Roi, where there is no depth."""
+        combined = Roi.where('index == 0') & Layer.where('depth == 0.0', 'depth < 30')
+        assert '[Layer]depth == 0.0' in combined.expression
+        assert '[Layer]depth < 30' in combined.expression
+
+        combined = Roi.where('index == 0') & Layer.where('depth == 0.0 OR NOT EXIST(depth)')
+        assert combined.expression.count('[Layer]depth') == 2
+
+    def test_compound_cross_type_queries_run(self, deep):
+        rois = (Roi.where('index == 0') & Layer.where('depth >= 0.0', 'depth < 30')).get_from(deep)
+        assert len(rois) == 4                      # both layers, both recordings
+
+        rois = (Roi.where('index == 0') & Layer.where('depth == 0.0 OR depth > 1000')).get_from(deep)
+        assert len(rois) == 2
+
+        rois = (Roi.where('index == 0') & Layer.where('depth IN (15.0, 1000.0)')).get_from(deep)
+        assert {r.parent.id for r in rois} == {'plane1'}
+
+        rois = (Roi.where('index == 0') & Layer.where('depth > 0', rate=10.0)).get_from(deep)
+        assert len(rois) == 0                      # a Layer has no rate
+
+    def test_an_ancestor_named_in_the_other_expression_stays(self, deep):
+        combined = Roi.where('index == 0') & Layer.where('[Recording]rate == 10.0', 'depth == 0.0')
+        assert '[Recording]rate == 10.0' in combined.expression
+        assert len(combined.get_from(deep)) == 1
+
+    def test_relative_paths_and_endpoints_are_refused(self):
+        from entarchy.core.query import QueryParseError
+        with pytest.raises(QueryParseError, match='relative path'):
+            Roi.where('index == 0') & Layer.where('../rate == 10.0')
+        with pytest.raises(QueryParseError, match='link endpoint'):
+            Roi.where('index == 0') & Layer.where('@linker.index == 0')
+
 
 class TestCollectionSetOperationGuards:
     """Set operations need a bounded operand - the universal set is rejected."""

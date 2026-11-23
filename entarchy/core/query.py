@@ -298,6 +298,83 @@ def parse_boolean_expression(expression: str) -> Union[dict[str, Any], None]:
     return parse_expression(tokenize(expression))
 
 
+def _format_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return 'True' if value else 'False'
+    if isinstance(value, datetime.datetime):
+        return value.strftime('%Y-%m-%dT%H:%M:%S')
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, str):
+        return f"'{value}'" if '"' in value else f'"{value}"'
+    return repr(value)
+
+
+def unparse(tree: Union[dict[str, Any], None]) -> str:
+    """The expression string of an AST, as parse_boolean_expression reads it.
+
+    Every operand of AND, OR, XOR and NOT is parenthesized, so the result
+    parses back to the same tree whatever the precedence of its parts.
+    Bare-word values come back quoted; they were strings all along.
+    """
+    if tree is None:
+        return ''
+
+    operator = tree['operator']
+    if operator == 'EXIST':
+        return f'EXIST({tree["right_operand"]})'
+    if operator == 'NOT':
+        return f'NOT ({unparse(tree["right_operand"])})'
+    if operator in ('AND', 'OR', 'XOR'):
+        return f'({unparse(tree["left_operand"])}) {operator} ({unparse(tree["right_operand"])})'
+    if operator == 'IN':
+        values = ', '.join(_format_value(v) for v in tree['right_operand'])
+        return f'{tree["left_operand"]} IN ({values})'
+    return f'{tree["left_operand"]} {operator} {_format_value(tree["right_operand"])}'
+
+
+def scope_to_ancestor(expression: str, entity_type_name: str) -> str:
+    """Rewrite an expression on an ancestor type so that a descendant type can
+    evaluate it: every attribute name gets the `[AncestorType]` prefix.
+
+        scope_to_ancestor('depth == 0.0 OR depth > 30', 'Layer')
+        -> '([Layer]depth == 0.0) OR ([Layer]depth > 30)'
+
+    An attribute that already names an ancestor, `[Recording]rate`, is left
+    as it is: an ancestor of the ancestor is an ancestor of the descendant
+    too. A relative path (`../rate`) or a link endpoint (`@linker.index`)
+    has no meaning from the descendant, so it is refused.
+    """
+    prefix = f'[{entity_type_name}]'
+
+    def scoped_name(name: str) -> str:
+        if name.startswith('['):
+            return name
+        if name.startswith('.'):
+            raise QueryParseError(
+                f'{name!r}: a relative path cannot be combined across entity types. '
+                f'Name the ancestor instead, as in [Recording]rate.')
+        if name.startswith('@'):
+            raise QueryParseError(
+                f'{name!r}: a link endpoint cannot be combined across entity types.')
+        return prefix + name
+
+    def walk(node):
+        operator = node['operator']
+        if operator == 'EXIST':
+            return {'operator': 'EXIST', 'right_operand': scoped_name(node['right_operand'])}
+        if operator == 'NOT':
+            return {'operator': 'NOT', 'right_operand': walk(node['right_operand'])}
+        if operator in ('AND', 'OR', 'XOR'):
+            return {'left_operand': walk(node['left_operand']), 'operator': operator,
+                    'right_operand': walk(node['right_operand'])}
+        return {'left_operand': scoped_name(node['left_operand']), 'operator': operator,
+                'right_operand': node['right_operand']}
+
+    tree = parse_boolean_expression(expression)
+    return '' if tree is None else unparse(walk(tree))
+
+
 def combine_trees(_set_operation: str,
                   left_tree: dict[str, Any],
                   right_tree: Union[dict[str, Any], None] = None):

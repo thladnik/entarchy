@@ -10,6 +10,58 @@ def cmp(name, op, value):
     return {'left_operand': name, 'operator': op, 'right_operand': value}
 
 
+class TestUnparse:
+    """unparse(parse(e)) parses to the same tree as e."""
+
+    @pytest.mark.parametrize('expression', [
+        'a == 1',
+        'a == 1 AND b == 2 OR c == 3',
+        'a == 1 OR b == 2 AND c == 3',
+        'NOT a == 1 AND b == 2',
+        'NOT (a == 1 AND b == 2)',
+        'a == 1 XOR b == 2',
+        'EXIST(a) AND NOT EXIST b',
+        'a IN (1, 2.5, "x", True)',
+        'strain == wildtype',
+        'name == "it\'s"',
+        'd == 2024-01-31 AND t == 2024-01-31T12:30:00',
+        'x == -1.5e-3 AND y == 1e5',
+        '../rate > 5 AND [Recording]rate <= 10',
+        '@linker.index == 3 AND @linked.[Recording]rate > 8',
+        's2p/attrs/x == 1',
+    ])
+    def test_round_trip(self, expression):
+        tree = parse_boolean_expression(expression)
+        assert parse_boolean_expression(query.unparse(tree)) == tree
+
+    def test_empty(self):
+        assert query.unparse(None) == ''
+
+
+class TestScopeToAncestor:
+
+    def test_every_attribute_is_prefixed(self):
+        scoped = query.scope_to_ancestor('depth == 0.0 OR (depth > 30 AND NOT EXIST(quality))', 'Layer')
+        assert parse_boolean_expression(scoped) == parse_boolean_expression(
+            '[Layer]depth == 0.0 OR ([Layer]depth > 30 AND NOT EXIST([Layer]quality))')
+
+    def test_in_lists(self):
+        assert parse_boolean_expression(query.scope_to_ancestor('depth IN (0, 15)', 'Layer')) == \
+            parse_boolean_expression('[Layer]depth IN (0, 15)')
+
+    def test_an_ancestor_prefix_stays(self):
+        assert query.scope_to_ancestor('[Recording]rate > 5', 'Layer') == '[Recording]rate > 5'
+
+    def test_relative_and_endpoint_names_are_refused(self):
+        with pytest.raises(QueryParseError, match='relative path'):
+            query.scope_to_ancestor('../rate > 5', 'Layer')
+        with pytest.raises(QueryParseError, match='link endpoint'):
+            query.scope_to_ancestor('@linker.rate > 5', 'Layer')
+
+    def test_empty(self):
+        assert query.scope_to_ancestor('', 'Layer') == ''
+
+
 class TestPrecedence:
 
     def test_and_binds_tighter_than_or(self):

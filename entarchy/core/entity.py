@@ -2823,13 +2823,16 @@ class DeferredEntityCollection(Generic[EntityT]):
         return self._expression
 
     def _get_relexpr(self, other: str | DeferredEntityCollection):
-        """Return expression string based on this object's entity_type"""
+        """The other operand's expression, as evaluated on this entity type.
+
+        A query on another type is on an ancestor of this one, so each of its
+        attribute names gets the `[Ancestor]` prefix. Prefixing the string
+        once would scope only the first of `depth == 0.0 AND depth < 30`.
+        """
         if isinstance(other, DeferredEntityCollection):
             if other.entity_type == self.entity_type:
-                expr = other.expression
-            else:
-                expr = f'[{other.entity_type.__name__}]{other.expression}'
-            return expr
+                return other.expression
+            return query.scope_to_ancestor(other.expression, other.entity_type.__name__)
 
         return other
 

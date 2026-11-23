@@ -604,18 +604,6 @@ class Entarchy(object):
         elif entity.entarchy is not self:
             raise ValueError(f'{entity} belongs to a different entarchy.')
 
-        # An entity of a root type with no parent goes under the root entity,
-        #  which is where add_child puts them; a child type has to say whose
-        #  child it is. The built-in types stay parentless.
-        type_name = type(entity).__name__
-        if entity._parent is None and type_name not in BUILTIN_TYPES:
-            parent_type = self._parents().get(type_name)
-            if parent_type is None:
-                entity._parent = self.root
-            else:
-                raise ValueError(f'{entity} needs a parent: {type_name} is a child type of '
-                                 f'{parent_type}. parent.add_child(entity) sets it.')
-
         # Queue the entity first, so attribute writes below are deferred and
         #  the entity row is guaranteed to exist before its attribute rows
         self._register_entity(entity)
