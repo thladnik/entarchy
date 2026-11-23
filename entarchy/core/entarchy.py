@@ -84,10 +84,6 @@ class Entarchy(object):
     #  inside a value read.
     _base_version: str = '0.2'
     _base_compat_version_list: list[str] = ['0.2']
-    # A subclass stamps its own schema version; a plain Entarchy, whose schema is
-    #  whatever was added to it, has none to speak of
-    _implementation_version: str = '0.0'
-    _implementation_compat_version_list: list[str] = ['0.0']
     # The entity classes this entarchy binds to the stored type hierarchy, by
     #  name. Children declared on them with add_child_entity_type are followed,
     #  so naming the roots is enough. The hierarchy itself lives in the store:
@@ -128,12 +124,6 @@ class Entarchy(object):
                 f'{self._config["base_version"]}; this is {self._base_version}, which '
                 f'reads {", ".join(self._base_compat_version_list)}. The storage format '
                 f'changed between them, so the data has to be regenerated.')
-
-        if self._config['implementation_version'] not in self._implementation_compat_version_list:
-            raise RuntimeError(f'Implementation version in configuration '
-                               f'("{self._config["implementation_version"]}") '
-                               f'is not compatible with current implementation version '
-                               f'("{self._implementation_version}"). ')
 
         # Set up entities objects
         self._entities: dict[str, Entity] = {}
@@ -384,10 +374,6 @@ class Entarchy(object):
         self._entity_map = type_map
 
     @property
-    def implementation_version(self):
-        return self._implementation_version
-
-    @property
     def is_in_context(self) -> bool:
         """Check if the entarchy is in a context manager.
 
@@ -521,7 +507,6 @@ class Entarchy(object):
         # Save configuration so entarchy object can be created
         _config = {
             'base_version': cls._base_version,
-            'implementation_version': cls._implementation_version,
             'backend': f'{_backend.__module__}.{_backend.__class__.__name__}',
             'backend_config': _backend.get_config(),
         }

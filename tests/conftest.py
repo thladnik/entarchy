@@ -24,8 +24,6 @@ Subject.add_child_entity_type(Session)
 
 
 class LabArchy(entarchy.Entarchy):
-    _implementation_version = '0.1'
-    _implementation_compat_version_list = ['0.1']
     _entity_types = (Subject,)
 
 
@@ -53,8 +51,6 @@ Layer.add_child_entity_type(Roi)
 
 
 class DeepArchy(entarchy.Entarchy):
-    _implementation_version = '0.1'
-    _implementation_compat_version_list = ['0.1']
     _entity_types = (Animal,)
 
 

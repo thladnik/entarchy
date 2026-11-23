@@ -37,7 +37,6 @@ Layer.add_child_entity_type(Roi)
 
 
 class Archy(entarchy.Entarchy):
-    _implementation_version = '0.1'
     _entity_types = (Layer,)
 
 

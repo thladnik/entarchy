@@ -43,10 +43,11 @@ class TestConfigValidation:
 
         assert config['base_version'] == LabArchy._base_version
 
-    def test_incompatible_implementation_version_raises(self, ent):
-        rewrite_config(ent.path, implementation_version='99.9')
-        with pytest.raises(RuntimeError, match='Implementation version'):
-            LabArchy(ent.path)
+    def test_the_config_carries_no_implementation_version(self, ent):
+        """A schema class is checked against the stored tree, not a number."""
+        config = yaml.safe_load(open(os.path.join(ent.path, 'entarchy.yaml')))
+
+        assert 'implementation_version' not in config
 
     def test_a_declared_type_the_store_lacks_raises(self, ent):
         """The hierarchy lives in the store; a class the store has no type for
@@ -111,8 +112,6 @@ class TestEntityTypes:
         Dup.add_child_entity_type(Dup)  # self-reference -> duplicate name
 
         class BadArchy(entarchy.Entarchy):
-            _implementation_version = '0.1'
-            _implementation_compat_version_list = ['0.1']
             _entity_types = (Dup,)
 
         with pytest.raises(ValueError, match='already in the hierarchy'):

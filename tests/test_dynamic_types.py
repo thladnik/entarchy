@@ -12,13 +12,6 @@ from conftest import LabArchy, Session, Subject
 import _mp_worker
 
 
-class BareArchy(entarchy.Entarchy):
-    """LabArchy's implementation version with no types declared: a store this
-    creates is one LabArchy may open, once it has grown LabArchy's types."""
-    _implementation_version = '0.1'
-    _implementation_compat_version_list = ['0.1']
-
-
 def plain(tmp_path, name='plain', cls=entarchy.Entarchy):
     base = (tmp_path / name).as_posix()
     return cls.create(base, SQLiteBackend(base, dbname='plain.db'))
@@ -145,7 +138,7 @@ class TestBinding:
         reopened.backend.close()
 
     def test_a_class_binds_to_a_stored_type_of_its_name(self, tmp_path):
-        ent = plain(tmp_path, cls=BareArchy)
+        ent = plain(tmp_path)
         ent.add_entity_type('Subject')
         ent.add_entity_type('Session', parent='Subject')
         ent.root.add_child(ent.get_entity_type('Subject'), 'subj_1')
@@ -188,19 +181,35 @@ class TestBinding:
 
     def test_a_declared_schema_is_added_to_a_store_that_grew_without_it(self, tmp_path):
         """What a schema package does when its hierarchy grows a level."""
-        ent = plain(tmp_path, cls=BareArchy)
+        ent = plain(tmp_path)
         ent.add_entity_type('Subject')
         ent.backend.close()
 
         with pytest.raises(RuntimeError, match='Session'):
             LabArchy(tmp_path.joinpath('plain').as_posix())
 
-        ent = BareArchy(tmp_path.joinpath('plain').as_posix())
+        ent = entarchy.Entarchy(tmp_path.joinpath('plain').as_posix())
         ent.add_entity_type(Subject)   # Session follows
         ent.backend.close()
 
         bound = LabArchy(tmp_path.joinpath('plain').as_posix())
         assert bound.hierarchy['Subject'] == {'Session': {}}
+        bound.backend.close()
+
+    def test_a_store_with_more_than_the_class_declares_opens(self, tmp_path):
+        """Compatibility is the declared tree being there, under the declared
+        parents; whatever else grew on the store comes along, generated."""
+        ent = plain(tmp_path)
+        ent.add_entity_type(Subject)                    # Subject > Session
+        ent.add_entity_type('Trial', parent='Session')
+        ent.add_entity_type('Stimulus')
+        ent.backend.close()
+
+        bound = LabArchy(tmp_path.joinpath('plain').as_posix())
+        assert bound.hierarchy['Subject'] == {'Session': {'Trial': {}}}
+        assert bound.child_type_names(None) == ['Subject', 'Stimulus']
+        assert bound.get_entity_type('Session') is Session
+        assert getattr(bound.get_entity_type('Trial'), '_generated', False)
         bound.backend.close()
 
     def test_create_stores_the_declared_tree(self, ent):
