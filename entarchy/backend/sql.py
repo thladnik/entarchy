@@ -659,6 +659,11 @@ def _get_entity_type_ancestor_distance(session: sqlalchemy.orm.Session,
 #  keeps it clear of max_allowed_packet as well.
 MAX_BOUND_PARAMETERS = 30_000
 
+# A blob row that points at a file - in `ext/` or `media/` - holds a header of
+#  a path and a little metadata, never a payload. Rows longer than this hold
+#  their value and own no file, so they need not be read to find out.
+POINTER_MAX_BYTES = 4096
+
 
 def _chunk_by_bound_parameters(records: list[dict], columns: int):
     """Split rows so that no single statement exceeds the bound parameter limit."""
@@ -1027,12 +1032,41 @@ class SQLBackend(Backend):
             if self._batch_depth == 0:
                 self.sql_session.rollback()
                 self.sql_session.close()
+                # The rows those files belong to are still there
+                self._files_after_commit = []
             raise
 
         self._batch_depth -= 1
         if self._batch_depth == 0:
             self.sql_session.commit()
             self.sql_session.close()
+            self._remove_files_now(self._files_after_commit)
+            self._files_after_commit = []
+
+    # Files a removal leaves behind are taken off the disk only once the rows
+    #  that pointed at them are committed gone. A transaction that fails must
+    #  not have deleted files; a file left behind after a commit is a leak, not
+    #  a corrupt store.
+    _files_after_commit: list = []
+
+    def _remove_files_after_commit(self, files: list[str]) -> None:
+        if len(files) == 0:
+            return
+        if self._batch_depth > 0:
+            if '_files_after_commit' not in self.__dict__:
+                self._files_after_commit = []
+            self._files_after_commit.extend(files)
+        else:
+            self._remove_files_now(files)
+
+    @staticmethod
+    def _remove_files_now(files: list[str]) -> None:
+        for path in files:
+            try:
+                os.remove(path)
+            except OSError:
+                # Never fail a committed removal because a file could not be cleaned up
+                pass
 
     @contextlib.contextmanager
     def _write_session(self):
@@ -1781,6 +1815,197 @@ class SQLBackend(Backend):
             if row is not None:
                 session.delete(row)
             self._commit(session)
+
+    # Removal of attributes and entities (docs/proposals/removing-things.md)
+
+    @staticmethod
+    def _owned_files_of(session, uuids: list[str], root_path: str,
+                        name: str = None) -> list[str]:
+        """The files kept outside the rows by these entities' blob attributes.
+
+        Only a pointer row - a value in `ext/` or a media file - names a file,
+        and a pointer is a few hundred bytes, so the rows that could be one are
+        told apart by length before any payload is read.
+        """
+        files = []
+        for start in range(0, len(uuids), MAX_BOUND_PARAMETERS):
+            batch = uuids[start:start + MAX_BOUND_PARAMETERS]
+            query = (session.query(AttributeTable.value_blob)
+                     .filter(AttributeTable.entity_uuid.in_(batch),
+                             AttributeTable.data_type == 'blob',
+                             sqlalchemy.func.length(AttributeTable.value_blob) < POINTER_MAX_BYTES))
+            if name is not None:
+                query = query.filter(AttributeTable.name == name)
+            for (raw,) in query.all():
+                path = _owned_file_of(raw, root_path)
+                if path is not None:
+                    files.append(path)
+
+        return files
+
+    @_retry_on_operational_failure
+    def delete_entity_attributes(self, _entity: Entity, names: list[str]) -> None:
+        """Delete attribute rows of one entity, and the files they owned."""
+        root_path = _entity.entarchy.path
+
+        with self._write_session() as session:
+            rows = (session.query(AttributeTable)
+                    .filter(AttributeTable.entity_uuid == _entity.uuid,
+                            AttributeTable.name.in_(names)).all())
+
+            missing = sorted(set(names) - {row.name for row in rows})
+            if len(missing) > 0:
+                raise KeyError(f'{missing} not on {_entity}.')
+
+            for row in rows:
+                if row.name in ('id', 'uuid'):
+                    raise RuntimeError(f'Attribute "{row.name}" is the entity identity '
+                                       f'and cannot be removed from {_entity}.')
+                if not (row.mutable or _entity.entarchy.is_in_digest_mode):
+                    raise RuntimeError(f'Attribute "{row.name}" is immutable and cannot be '
+                                       f'removed from {_entity} outside digest mode.')
+
+            files = [path for row in rows if row.data_type == 'blob'
+                     for path in [_owned_file_of(row.value_blob, root_path)] if path is not None]
+
+            for row in rows:
+                session.delete(row)
+            self._commit(session)
+
+        self._remove_files_after_commit(files)
+
+    @_retry_on_operational_failure
+    def delete_collection_attribute(self, _collection: Collection, name: str) -> int:
+        """Delete one attribute from every entity of a collection.
+
+        Returns how many rows went. Refused as a whole if any of them is
+        immutable outside digest mode, so a collection is never left half done.
+        """
+        ent = _collection.entarchy
+
+        with self._write_session() as session:
+            entity_query = _build_query_from_collection(_collection, session)
+            uuids = [row[0] for row in entity_query.with_entities(EntityTable.uuid).all()]
+
+            present, immutable = 0, 0
+            for start in range(0, len(uuids), MAX_BOUND_PARAMETERS):
+                batch = uuids[start:start + MAX_BOUND_PARAMETERS]
+                rows = session.query(AttributeTable).filter(
+                    AttributeTable.entity_uuid.in_(batch), AttributeTable.name == name)
+                present += rows.count()
+                immutable += rows.filter(AttributeTable.mutable.is_(False)).count()
+
+            if present == 0:
+                raise KeyError(f'No entity in {_collection} has "{name}".')
+            if immutable > 0 and not ent.is_in_digest_mode:
+                raise RuntimeError(f'"{name}" is immutable on {immutable} of the '
+                                   f'{present} entities that have it, and cannot be removed '
+                                   f'outside digest mode.')
+
+            files = self._owned_files_of(session, uuids, ent.path, name)
+
+            for start in range(0, len(uuids), MAX_BOUND_PARAMETERS):
+                batch = uuids[start:start + MAX_BOUND_PARAMETERS]
+                session.query(AttributeTable).filter(
+                    AttributeTable.entity_uuid.in_(batch),
+                    AttributeTable.name == name).delete(synchronize_session=False)
+            self._commit(session)
+
+        self._remove_files_after_commit(files)
+
+        return present
+
+    @_retry_on_operational_failure
+    def collect_subtree(self, entity_uuid: str) -> list[tuple[str, str, int]]:
+        """(uuid, type name, depth) of an entity and everything below it.
+
+        Breadth first, so the list is ordered by depth; depth 0 is the entity.
+        """
+        with self.sql_session as session:
+            row = (session.query(EntityTypeTable.name).select_from(EntityTable)
+                   .join(EntityTypeTable, EntityTable.entity_type_pk == EntityTypeTable.pk)
+                   .filter(EntityTable.uuid == entity_uuid).one_or_none())
+            if row is None:
+                raise KeyError(f'No entity {entity_uuid} in the store.')
+
+            result = [(entity_uuid, row[0], 0)]
+            frontier, depth = [entity_uuid], 0
+            while len(frontier) > 0:
+                depth += 1
+                found = []
+                for start in range(0, len(frontier), MAX_BOUND_PARAMETERS):
+                    batch = frontier[start:start + MAX_BOUND_PARAMETERS]
+                    found.extend(
+                        (session.query(EntityTable.uuid, EntityTypeTable.name)
+                         .join(EntityTypeTable, EntityTable.entity_type_pk == EntityTypeTable.pk)
+                         .filter(EntityTable.parent_uuid.in_(batch)).all()))
+                result.extend((uuid_, type_name, depth) for uuid_, type_name in found)
+                frontier = [uuid_ for uuid_, _ in found]
+
+        return result
+
+    @_retry_on_operational_failure
+    def link_rows_touching(self, uuids: list[str]) -> list[tuple[str, str, str, str]]:
+        """(link uuid, kind, linker uuid, linked uuid) of every link with an end
+        in `uuids`, or carried by one of them."""
+        rows = {}
+        with self.sql_session as session:
+            for start in range(0, len(uuids), MAX_BOUND_PARAMETERS):
+                batch = uuids[start:start + MAX_BOUND_PARAMETERS]
+                found = (session.query(Link.link_uuid, Link.link_type, Link.linker_uuid, Link.linked_uuid)
+                         .filter(sqlalchemy.or_(Link.linker_uuid.in_(batch),
+                                                Link.linked_uuid.in_(batch),
+                                                Link.link_uuid.in_(batch))).all())
+                rows.update({row[0]: tuple(row) for row in found})
+
+        return list(rows.values())
+
+    @_retry_on_operational_failure
+    def attribute_totals(self, uuids: list[str], root_path: str) -> tuple[int, int, int, list[str]]:
+        """(attribute rows, bytes in rows, immutable rows, owned files) of these entities."""
+        count, size, immutable, files = 0, 0, 0, []
+        with self.sql_session as session:
+            for start in range(0, len(uuids), MAX_BOUND_PARAMETERS):
+                batch = uuids[start:start + MAX_BOUND_PARAMETERS]
+                rows = session.query(AttributeTable).filter(AttributeTable.entity_uuid.in_(batch))
+                found, total = rows.with_entities(
+                    sqlalchemy.func.count(), sqlalchemy.func.coalesce(
+                        sqlalchemy.func.sum(AttributeTable.data_size), 0)).one()
+                count += int(found)
+                size += int(total)
+                immutable += rows.filter(AttributeTable.mutable.is_(False)).count()
+            files = self._owned_files_of(session, uuids, root_path)
+
+        return count, size, immutable, files
+
+    @_retry_on_operational_failure
+    def remove_entities(self, levels: list[list[str]], files: list[str]) -> None:
+        """Delete the rows of these entities, one transaction.
+
+        `levels` is deepest first: every entity's children come in a level
+        before it, which is the order the foreign keys want. The links touching
+        any of them go too, so a carrier's row is gone before its entity row.
+        """
+        with self._write_session() as session:
+            every = [uuid_ for level in levels for uuid_ in level]
+
+            for start in range(0, len(every), MAX_BOUND_PARAMETERS):
+                batch = every[start:start + MAX_BOUND_PARAMETERS]
+                session.query(AttributeTable).filter(
+                    AttributeTable.entity_uuid.in_(batch)).delete(synchronize_session=False)
+                session.query(Link).filter(
+                    sqlalchemy.or_(Link.link_uuid.in_(batch), Link.linker_uuid.in_(batch),
+                                   Link.linked_uuid.in_(batch))).delete(synchronize_session=False)
+
+            for level in levels:
+                for start in range(0, len(level), MAX_BOUND_PARAMETERS):
+                    batch = level[start:start + MAX_BOUND_PARAMETERS]
+                    session.query(EntityTable).filter(
+                        EntityTable.uuid.in_(batch)).delete(synchronize_session=False)
+
+            self._commit(session)
+
+        self._remove_files_after_commit(files)
 
     # Collection related methods
 

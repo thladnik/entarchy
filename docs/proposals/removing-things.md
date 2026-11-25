@@ -1,6 +1,12 @@
 # Proposal: removing attributes and entities
 
-Status: **proposed**. Nothing implemented.
+Status: **implemented** 2026-11-25, as written, with the open questions decided
+as the text proposes. Deviations: a committed deletion reads back as any missing
+attribute does, with `AttributeError`, while a deletion still queued raises
+`KeyError`; `Entity.is_removed` says whether a handle is dead; a removal inside
+`with ent:` is not deferred, and drops what the context had queued for the
+removed entities. The MySQL backend's foreign keys are exercised in
+`tests/test_mysql_integration.py`.
 
 Written 2026-11-25 against entarchy `895e5d7`, with the vxpy entarchy at
 `Z:/cluster/data/zfish-egomotion` (MySQL) as the case at hand.

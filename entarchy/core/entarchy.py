@@ -18,7 +18,7 @@ from . import links
 from . import query
 from .entity import (AnalysisEntity, Collection, DeferredEntityCollection,
                      EntarchyEntity, Entity, EntityT, compose_expression,
-                     LinkCollection, LinkEntity)
+                     LinkCollection, LinkEntity, RemovalReport)
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -183,6 +183,7 @@ class Entarchy(object):
                 for name in entity._attributes_to_update:
                     entity._attribute_cache.pop(name, None)
                 entity._attributes_to_update = []
+                entity._attributes_to_delete = []
         self._entities_to_update = []
 
         self._links_to_add = []
@@ -610,6 +611,49 @@ class Entarchy(object):
         with the same type check. See `Entity.add_child`.
         """
         return self.root.add_child(child, _id, **attributes)
+
+    def remove_child(self, child: Entity, recursive: bool = False,
+                     dry_run: bool = False) -> RemovalReport:
+        """Remove a root-level entity: `self.root.remove_child(...)`.
+
+            ent.remove_child(experiment, recursive=True)
+
+        See `Entity.remove_child` for what goes with it and the report.
+        """
+        return self.root.remove_child(child, recursive=recursive, dry_run=dry_run)
+
+    def _queued_descendants(self, entity: Entity) -> list[Entity]:
+        """The entity itself if it is queued for insertion, and every queued
+        entity whose parent chain reaches it: a subtree built inside an open
+        context has rows for none of them yet."""
+        found = []
+        for _uuid in self._entities_to_add:
+            queued = self._entities.get(_uuid)
+            if queued is None:
+                continue
+            cursor = queued
+            while isinstance(cursor, Entity):
+                if cursor.uuid == entity.uuid:
+                    found.append(queued)
+                    break
+                cursor = cursor._parent
+
+        return found
+
+    def _forget_entities(self, uuids: set[str], link_uuids: set[str]) -> None:
+        """Drop removed entities from the identity map and every queue, and
+        mark their objects dead."""
+        self._entities_to_add = [u for u in self._entities_to_add if u not in uuids]
+        self._entities_to_update = [u for u in self._entities_to_update if u not in uuids]
+        self._links_to_add = [row for row in self._links_to_add
+                              if row['link_uuid'] not in link_uuids]
+        self._pending_link_index = {key: link_uuid for key, link_uuid in self._pending_link_index.items()
+                                    if link_uuid not in link_uuids}
+
+        for _uuid in uuids:
+            entity = self._entities.pop(_uuid, None)
+            if entity is not None:
+                entity._mark_removed()
 
     def _add_entity(self, entity: Entity) -> None:
         """Store a new entity, bound to this entarchy.

@@ -1016,3 +1016,34 @@ class TestMatrixAgreesAcrossBackends:
 
         endpoints = ent.backend.get_link_endpoints(pairs)
         assert len(endpoints) == len(pairs) == int((values > 0.3).sum())
+
+
+class TestRemoval:
+    """InnoDB enforces the foreign keys SQLite ignores, so the delete order -
+    attributes, links, children before parents - is tested where it matters."""
+
+    def test_a_subtree_with_links_goes_in_one_transaction(self, populated):
+        from entarchy.backend.sql import AttributeTable, EntityTable, Link
+        import sqlalchemy
+
+        populated.define_link_type('follows', Session, Session, symmetric=True)
+        sessions = sorted(populated.get(Session), key=lambda s: s['index'])
+        populated.link(sessions[0], sessions[1], 'follows', gap=1.5)
+        subject = populated.get(Subject)[0]
+
+        report = populated.remove_child(subject, recursive=True)
+
+        assert report.entities == {'Subject': 1, 'Session': 6, 'LinkEntity': 1}
+        assert report.links == {'follows': 1}
+        with sqlalchemy.orm.Session(populated.backend.sql_engine) as session:
+            assert session.query(EntityTable).count() == 1          # the root
+            assert session.query(Link).count() == 0
+            assert session.query(AttributeTable).filter(
+                AttributeTable.entity_uuid != populated.root.uuid).count() == 0
+
+    def test_a_collection_attribute_goes(self, populated):
+        del populated.get(Session, 'index > 2')['flag']
+
+        assert sorted(s['index'] for s in populated.get(Session, 'flag == True')) == [0, 2]
+        with pytest.raises(RuntimeError, match='identity'):
+            del populated.get(Session)['uuid']

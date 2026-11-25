@@ -4,6 +4,7 @@ import atexit
 import datetime
 import functools
 import html
+import os
 import re
 import sys
 import time
@@ -123,6 +124,8 @@ class Entity(object):
         self._attribute_cache_start_time = datetime.datetime.now()
         self._attribute_cache: dict[str, Any] = {}
         self._attributes_to_update: list[str] = []
+        self._attributes_to_delete: list[str] = []
+        self._removed: bool = False
 
         # An entity built with an entarchy is in its registry at once; one built
         #  without is registered when it is added
@@ -193,6 +196,12 @@ class Entity(object):
         if not isinstance(item, str):
             raise TypeError('Item must be a string')
 
+        self._check_alive()
+
+        # Deleted, committed or not
+        if item in self._attributes_to_delete:
+            return False
+
         # Cached attributes exist by definition; saves a database query
         if item in self._attribute_cache:
             return True
@@ -202,6 +211,83 @@ class Entity(object):
             return False
 
         return self.entarchy.backend.has_entity_attribute(self, item)
+
+    def __delitem__(self, key: str) -> None:
+        """Remove an attribute.
+
+            del roi['cmn_rf/dff']
+
+        Follows the rules a write follows: outside a context the row goes at
+        once, inside `with ent:` the delete waits for the commit, and a write
+        of the same name in between cancels it. Reads see the deletion either
+        way. An attribute written in digest mode is immutable and is removed
+        only in digest mode, as it is overwritten only there; `id` and `uuid`
+        never go. Missing is a KeyError, as for a dict.
+        """
+        self._check_alive()
+
+        if not isinstance(key, str):
+            raise TypeError('Key must be a string.')
+
+        if key in ('id', 'uuid'):
+            raise RuntimeError(f'Attribute "{key}" is the entity identity and cannot '
+                               f'be removed from {self}.')
+
+        if key not in self:
+            raise KeyError(f'"{key}" not on {self}.')
+
+        # A value that was never stored is forgotten, nothing more: written on
+        #  an unbound entity, or on one still queued for insertion
+        stored = self.is_bound and not self.entarchy.is_pending_add(self)
+        queued_write = key in self._attributes_to_update
+
+        self._attribute_cache.pop(key, None)
+        if queued_write:
+            self._attributes_to_update.remove(key)
+
+        if not stored:
+            return
+
+        if key not in self._attributes_to_delete:
+            self._attributes_to_delete.append(key)
+        self.entarchy._add_entity_for_update(self)
+
+        if not self.is_in_context and not self.entarchy.is_in_context:
+            self.commit()
+
+    def pop(self, key: str, *default: Any) -> Any:
+        """Remove an attribute and return its value; `pop(key, default)` for
+        one that may be missing."""
+        if len(default) > 1:
+            raise TypeError(f'pop expected at most 2 arguments, got {1 + len(default)}')
+
+        if key not in self:
+            if len(default) == 1:
+                return default[0]
+            raise KeyError(f'"{key}" not on {self}.')
+
+        value = self[key]
+        del self[key]
+
+        return value
+
+    @property
+    def is_removed(self) -> bool:
+        """Whether `remove_child` took this entity out of its entarchy."""
+        return self._removed
+
+    def _check_alive(self) -> None:
+        if self._removed:
+            raise RuntimeError(f'{self} was removed from its entarchy.')
+
+    def _mark_removed(self) -> None:
+        """Detach the object once its rows are gone, so that a stale handle
+        cannot read a cache or write the entity back."""
+        self._removed = True
+        self._entarchy = None
+        self._attribute_cache = {}
+        self._attributes_to_update = []
+        self._attributes_to_delete = []
 
     def __enter__(self):
         # Set context flag
@@ -257,6 +343,12 @@ class Entity(object):
                 raise TypeError('List of keys must contain only strings.')
         else:
             key = [key]
+
+        self._check_alive()
+
+        deleted = [k for k in key if k in self._attributes_to_delete]
+        if len(deleted) > 0:
+            raise KeyError(f'{deleted} deleted from {self}.')
 
         # TODO: As expected this causes massive performance issues. Nice idea. Optimize later.
         #  Better idea: use a time-to-live cache with fixed (configurable) expiration time
@@ -537,6 +629,8 @@ class Entity(object):
 
         """
 
+        self._check_alive()
+
         if not isinstance(key, (str, list, tuple)):
             raise TypeError('Key must be a string or list or tuple of strings.')
 
@@ -561,8 +655,12 @@ class Entity(object):
                 raise RuntimeError(f'Attribute "{k}" is the entity identity '
                                    f'and cannot be modified on {self}.')
 
-        # Update attribute(s) in cache and mark for update
+        # Update attribute(s) in cache and mark for update. A write after a
+        #  queued delete cancels the delete
         for k, v in zip(key, value):
+
+            if k in self._attributes_to_delete:
+                self._attributes_to_delete.remove(k)
 
             self._attribute_cache[k] = v
 
@@ -613,6 +711,128 @@ class Entity(object):
         return tuple(self.entarchy.get_entity_type(name)
                      for name in self.entarchy.child_type_names(parent))
 
+    def remove_child(self, child: Entity, recursive: bool = False,
+                     dry_run: bool = False) -> RemovalReport:
+        """Remove a child entity, and what it carries, from the entarchy.
+
+            recording.remove_child(imaging)                      # no children
+            animal.remove_child(recording, recursive=True)       # a subtree
+            report = animal.remove_child(recording, recursive=True, dry_run=True)
+
+        What goes: the entity's rows, the files its values kept outside the
+        rows, and the links touching it from either side, since a link with one
+        end gone means nothing. Links never count as children. An entity with
+        children of its own is refused unless `recursive` says they go too; the
+        refusal names what is below.
+
+        The report says what will go - entities per type, attributes, bytes in
+        rows and in files, links per kind - and is printed before anything is
+        deleted. With `dry_run` it is returned and nothing is deleted.
+
+        An entity with attributes written in digest mode is an ingested fact and
+        is removed in digest mode only, as its attributes are rewritten only
+        there. An entity still queued for insertion is dequeued, which costs
+        nothing. The removal is one transaction and is not deferred by an open
+        `with ent:`; what the context queued for the removed entities is
+        dropped. Afterwards the Python objects are dead: any read or write on
+        them raises. Collections built before the removal may still hold cached
+        values of what went.
+        """
+        from .entarchy import BUILTIN_TYPES
+
+        self._check_alive()
+
+        if not isinstance(child, Entity):
+            raise TypeError(f'remove_child takes an Entity, not {type(child).__name__}.')
+        child._check_alive()
+        if not child.is_bound:
+            raise ValueError(f'{child} is not in an entarchy.')
+        if child.entarchy is not self.entarchy:
+            raise ValueError(f'{child} belongs to a different entarchy than {self}.')
+        if type(child).__name__ in BUILTIN_TYPES and not isinstance(child, LinkEntity):
+            raise ValueError(f'{child} is a built-in entity and cannot be removed.')
+
+        parent = child.parent
+        if parent is None or parent.uuid != self.uuid:
+            raise ValueError(f'{child} is a child of {parent if parent is not None else "nothing"}, '
+                             f'not of {self}.')
+
+        ent = self.entarchy
+        queued = ent._queued_descendants(child)
+        pending = ent.is_pending_add(child)
+
+        stored = [] if pending else ent.backend.collect_subtree(child.uuid)
+        stored_uuids = [uuid_ for uuid_, _, _ in stored]
+
+        links = ent.backend.link_rows_touching(stored_uuids) if len(stored_uuids) > 0 else []
+        carriers = [link_uuid for link_uuid, _, _, _ in links if link_uuid not in set(stored_uuids)]
+        queued_links = [row for row in ent._links_to_add
+                        if {row['linker_uuid'], row['linked_uuid'], row['link_uuid']}
+                        & ({child.uuid} | {e.uuid for e in queued} | set(stored_uuids))]
+
+        # Children, as the refusal counts them: everything below but the carriers
+        children = {}
+        for _, type_name, depth in stored:
+            if depth > 0 and type_name != LinkEntity.__name__:
+                children[type_name] = children.get(type_name, 0) + 1
+        for entity in queued:
+            if entity is not child and not isinstance(entity, LinkEntity):
+                name = type(entity).__name__
+                children[name] = children.get(name, 0) + 1
+
+        if len(children) > 0 and not recursive:
+            below = ', '.join(f'{count} {name}' for name, count in sorted(children.items()))
+            raise ValueError(f'{child} has {below} below it; pass recursive=True to '
+                             f'remove them with it.')
+
+        every_stored = stored_uuids + carriers
+        attributes, bytes_in_rows, immutable, files = (
+            ent.backend.attribute_totals(every_stored, ent.path) if len(every_stored) > 0
+            else (0, 0, 0, []))
+
+        entities = {}
+        for _, type_name, _ in stored:
+            entities[type_name] = entities.get(type_name, 0) + 1
+        for entity in queued:
+            name = type(entity).__name__
+            entities[name] = entities.get(name, 0) + 1
+            attributes += len(entity._attribute_cache)
+        if len(carriers) > 0:
+            entities[LinkEntity.__name__] = entities.get(LinkEntity.__name__, 0) + len(carriers)
+
+        link_counts = {}
+        for _, kind, _, _ in links:
+            link_counts[kind] = link_counts.get(kind, 0) + 1
+        for row in queued_links:
+            link_counts[row['link_type']] = link_counts.get(row['link_type'], 0) + 1
+
+        report = RemovalReport(child, entities, attributes, bytes_in_rows, files,
+                               link_counts, immutable)
+        if dry_run:
+            return report
+
+        if immutable > 0 and not ent.is_in_digest_mode:
+            raise RuntimeError(
+                f'{child} carries {immutable} attributes written in digest mode, so it is '
+                f'an ingested fact; remove it in digest mode (ent.start_digest()), as its '
+                f'attributes are rewritten only there.')
+
+        print(report)
+
+        if len(every_stored) > 0:
+            # Deepest first, carriers under other linkers before anything else
+            by_depth = {}
+            for uuid_, _, depth in stored:
+                by_depth.setdefault(depth, []).append(uuid_)
+            levels = ([carriers] if len(carriers) > 0 else []) + [
+                by_depth[depth] for depth in sorted(by_depth, reverse=True)]
+            ent.backend.remove_entities(levels, files)
+
+        ent._forget_entities(set(every_stored) | {e.uuid for e in queued},
+                             {row['link_uuid'] for row in queued_links})
+
+        return report
+
     @overload
     def get(self, entity_type: Type[EntityT], *_string_expressions: str,
             **_equalities) -> Collection[EntityT]: ...
@@ -662,6 +882,8 @@ class Entity(object):
         attributes right after, in a second commit. Inside, both go out at the
         end of the block with everything else.
         """
+        self._check_alive()
+
         if isinstance(child, type):
             if _id is None:
                 raise ValueError('An id is needed to create the child entity: '
@@ -803,6 +1025,12 @@ class Entity(object):
         # Remove entity from entarchy update list
         self.entarchy._remove_entity_from_update(self)
 
+        # Queued deletes go first; a name deleted and written again is only
+        #  on the update list by then
+        if len(self._attributes_to_delete) > 0:
+            names, self._attributes_to_delete = self._attributes_to_delete, []
+            self.entarchy.backend.delete_entity_attributes(self, names)
+
         # Update attributes in backend if updates are pending
         if len(self._attributes_to_update) > 0:
 
@@ -839,9 +1067,17 @@ class Entity(object):
     def keys(self):
         """Return a list of all dynamic attribute keys for this entity.
         """
+        self._check_alive()
+
         if not self.is_bound:
-            return list(self._attribute_cache.keys())
-        return self.entarchy.backend.get_entity_attribute_names(self)
+            names = list(self._attribute_cache.keys())
+        else:
+            names = self.entarchy.backend.get_entity_attribute_names(self)
+
+        if len(self._attributes_to_delete) > 0:
+            names = [name for name in names if name not in self._attributes_to_delete]
+
+        return names
 
     def _ipython_key_completions_(self) -> list[str]:
         """The stored names, for tab completion inside the brackets.
@@ -1622,6 +1858,35 @@ class Collection(Generic[EntityT]):
             raise RuntimeError('Invalid key/value pair')
 
         self.update(df)
+
+    def __delitem__(self, name: str) -> None:
+        """Remove an attribute from every entity in the collection.
+
+            del rois['cmn_rf/dff']
+
+        One statement, not a loop, and not deferred by a context: the
+        collection's writes are not either. Refused as a whole when any of the
+        rows is immutable outside digest mode. A name no entity here has is a
+        KeyError.
+        """
+        if not isinstance(name, str):
+            raise TypeError('Attribute name must be a string.')
+        if name in ('id', 'uuid'):
+            raise RuntimeError(f'Attribute "{name}" is the entity identity and cannot '
+                               f'be removed through a collection.')
+
+        count = self.entarchy.backend.delete_collection_attribute(self, name)
+        print(f'Removed "{name}" from {count} {self.entity_type.__name__} entities')
+
+        self._cache.drop(columns=[name], inplace=True, errors='ignore')
+        self._pending_changes.pop(name, None)
+
+        # Loaded entities of this type may hold the value in their caches
+        for entity in list(self.entarchy._entities.values()):
+            if isinstance(entity, self.entity_type):
+                entity._attribute_cache.pop(name, None)
+                if name in entity._attributes_to_update:
+                    entity._attributes_to_update.remove(name)
 
     # Set operations
 
@@ -2783,6 +3048,59 @@ def get_ancestor_distance_from_nested(hierarchy: dict[str, Any],
     if descendant_path[: len(ancestor_path)] == ancestor_path:
         return len(descendant_path) - len(ancestor_path)
     return None
+
+
+class RemovalReport:
+    """What a removal takes, or with `dry_run` would take.
+
+    `entities` and `links` count per type name and link kind, `attributes` is
+    rows, `bytes_in_rows` their stored size, `files` the paths values kept
+    outside the rows. `immutable` counts attributes written in digest mode,
+    which is what decides whether the removal needs digest mode.
+    """
+
+    def __init__(self, entity: Entity, entities: dict[str, int], attributes: int,
+                 bytes_in_rows: int, files: list[str], links: dict[str, int],
+                 immutable: int):
+        self.entity = entity
+        self.entities = entities
+        self.attributes = attributes
+        self.bytes_in_rows = bytes_in_rows
+        self.files = files
+        self.links = links
+        self.immutable = immutable
+
+    @property
+    def bytes_in_files(self) -> int:
+        total = 0
+        for path in self.files:
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                pass
+        return total
+
+    @property
+    def entity_count(self) -> int:
+        return sum(self.entities.values())
+
+    def __repr__(self):
+        return (f'RemovalReport({self.entity}, entities={self.entities}, '
+                f'attributes={self.attributes}, links={self.links})')
+
+    def __str__(self):
+        entities = ', '.join(f'{count} {name}' for name, count in sorted(self.entities.items()))
+        lines = [f'Remove {self.entity}:',
+                 f'  entities    {entities or "none"}',
+                 f'  attributes  {self.attributes} ({self.bytes_in_rows:,} bytes in rows'
+                 + (f', {len(self.files)} files, {self.bytes_in_files:,} bytes' if self.files else '')
+                 + ')']
+        if len(self.links) > 0:
+            links = ', '.join(f'{count} {kind}' for kind, count in sorted(self.links.items()))
+            lines.append(f'  links       {links}')
+        if self.immutable > 0:
+            lines.append(f'  {self.immutable} attributes were written in digest mode')
+        return '\n'.join(lines)
 
 
 class DeferredEntityCollection(Generic[EntityT]):

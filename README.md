@@ -263,6 +263,32 @@ most of every possible pair unless told otherwise — see
 [the proposal](https://github.com/thladnik/entarchy/blob/main/docs/proposals/link-entities.md) for the reasoning and the
 measurements.
 
+### Removing attributes and entities
+
+Both sit where things are added:
+
+```python
+del roi['cmn_rf/dff']                          # one attribute; waits for the commit inside `with ent:`
+roi.pop('cmn_rf/dff', None)
+del rois['cmn_rf/dff']                         # from every entity of a collection, at once
+
+recording.remove_child(imaging)                # an entity without children
+animal.remove_child(recording, recursive=True) # a subtree
+ent.remove_child(experiment, recursive=True)   # root level, forwards to the root entity
+report = animal.remove_child(recording, recursive=True, dry_run=True)
+```
+
+An entity with children is refused unless `recursive=True`, and the refusal
+names what is below. Links go with either of their ends and never count as
+children. The report - entities per type, attributes, bytes in rows and in
+files, links per kind - is printed before anything is deleted; `dry_run`
+returns it instead. Files a value kept outside its row are removed once the
+transaction has committed. An attribute written in digest mode is immutable
+and is removed only in digest mode, as it is overwritten only there, and an
+entity carrying such attributes - an ingested fact - is removed only there too.
+Afterwards the Python objects are dead and say so on any access. See
+[the proposal](https://github.com/thladnik/entarchy/blob/main/docs/proposals/removing-things.md).
+
 ### Query planner statistics (SQLite)
 
 Attributes are stored one row per attribute, with a typed value column per kind.
