@@ -153,3 +153,64 @@ class TestBatchingPreservesBehaviour:
 
         # id and uuid are written for every new entity, plus strain
         assert _row_count(ent, AttributeTable) == before + 3
+
+
+class TestFailedContext:
+    """An exception inside `with ent:` discards what was queued in it.
+
+    The queue used to survive the exception, and the next commit - from the
+    next `with` block, or from a method that commits on its own - wrote the
+    half-processed state as if it were whole. An ingest that failed on one
+    recording left that recording in the store without the part that failed.
+    """
+
+    def test_queued_entities_are_discarded(self, ent):
+        with pytest.raises(ValueError):
+            with ent:
+                subject = ent.add_child(Subject, 'half')
+                subject['strain'] = 'wt'
+                raise ValueError('boom')
+
+        ent.commit()
+
+        assert len(ent.get(Subject, 'id == "half"')) == 0
+        assert not subject.is_bound
+        assert subject not in ent
+        assert ent._entities_to_add == [] and ent._entities_to_update == []
+
+    def test_queued_attribute_writes_are_discarded(self, ent):
+        subject = ent.add_child(Subject, 'whole')
+        subject['strain'] = 'wt'
+
+        with pytest.raises(ValueError):
+            with ent:
+                subject['strain'] = 'mutant'
+                subject['age'] = 3
+                raise ValueError('boom')
+
+        ent.commit()
+
+        assert subject['strain'] == 'wt'
+        assert 'age' not in subject
+        assert ent._entities_to_update == []
+
+    def test_what_was_committed_inside_stays(self, ent):
+        with pytest.raises(ValueError):
+            with ent:
+                ent.add_child(Subject, 'first')
+                ent.commit()
+                ent.add_child(Subject, 'second')
+                raise ValueError('boom')
+
+        assert [s.id for s in ent.get(Subject)] == ['first']
+
+    def test_the_next_context_starts_clean(self, ent):
+        with pytest.raises(ValueError):
+            with ent:
+                ent.add_child(Subject, 'half')
+                raise ValueError('boom')
+
+        with ent:
+            ent.add_child(Subject, 'whole')
+
+        assert [s.id for s in ent.get(Subject)] == ['whole']

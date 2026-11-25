@@ -152,11 +152,41 @@ class Entarchy(object):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # Only commit if the context is left without an exception,
-        #  otherwise partially processed state would be persisted
+        # Commit only when the context is left without an exception. What was
+        #  queued in a context that failed is discarded: left on the queue, the
+        #  next commit from anywhere would write the half-processed state as
+        #  if it were whole
         if exc_type is None:
             self.commit()
+        else:
+            self.discard_pending()
         self._is_in_context = False
+
+    def discard_pending(self) -> None:
+        """Forget every write queued and not yet committed.
+
+        Entities queued for insertion are unbound again, as they were before
+        `add_child`; attribute writes queued on stored entities are dropped
+        from their caches, so the next read comes from the row; queued links
+        go with them. What an earlier `commit()` wrote stays written.
+        """
+        for _uuid in self._entities_to_add:
+            entity = self._entities.pop(_uuid, None)
+            if entity is not None:
+                entity._attributes_to_update = []
+                entity._entarchy = None
+        self._entities_to_add = []
+
+        for _uuid in self._entities_to_update:
+            entity = self._entities.get(_uuid)
+            if entity is not None:
+                for name in entity._attributes_to_update:
+                    entity._attribute_cache.pop(name, None)
+                entity._attributes_to_update = []
+        self._entities_to_update = []
+
+        self._links_to_add = []
+        self._pending_link_index = {}
 
     def __getstate__(self):
         state = self.__dict__.copy()
